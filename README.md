@@ -110,6 +110,10 @@ The generated web files are installed to `zig-out/web/`:
 - `zigfall.js`
 - `zigfall.wasm`
 
+The web build uses a custom Zigfall shell with a GitHub link and a
+keyboard handler that keeps Space and the arrow keys from scrolling the
+browser page while the game is active.
+
 To launch with Emscripten's `emrun` helper:
 
 ```sh
