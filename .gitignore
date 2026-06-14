@@ -1,0 +1,15 @@
+# Zig package/cache directories
+.zig-cache/
+zig-cache/
+zig-pkg/
+
+# Generated native and web build outputs
+zig-out/
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
