@@ -28,6 +28,15 @@ pub fn build(b: *std.Build) void {
             .{ .name = "game", .module = game_mod },
         },
     });
+    const match_mod = b.addModule("match", .{
+        .root_source_file = b.path("src/match.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "game", .module = game_mod },
+            .{ .name = "input", .module = input_mod },
+        },
+    });
 
     const app_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -102,8 +111,13 @@ pub fn build(b: *std.Build) void {
         .root_module = input_mod,
     });
     const run_input_tests = b.addRunArtifact(input_tests);
+    const match_tests = b.addTest(.{
+        .root_module = match_mod,
+    });
+    const run_match_tests = b.addRunArtifact(match_tests);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_game_tests.step);
     test_step.dependOn(&run_input_tests.step);
+    test_step.dependOn(&run_match_tests.step);
 }
