@@ -27,20 +27,14 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Cache Zig packages and build cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/zig
-            .zig-cache
-            zig-cache
-            zig-pkg
-          key: ${{ runner.os }}-zig-0.16.0-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**/*.zig') }}
-          restore-keys: |
-            ${{ runner.os }}-zig-0.16.0-
+      - name: Check formatting
+        run: zig fmt build.zig src/*.zig --check
 
       - name: Run tests
         run: zig build test
+
+      - name: Build native
+        run: zig build
 
       - name: Build web release
         run: zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseSmall
