@@ -9,6 +9,12 @@
 //! deterministic neutral input so the cursor can advance up to the delay while
 //! real inputs are in flight. Missing remote input stalls simulation rather than
 //! predicting or rolling back.
+//!
+//! `Peer.receiveBytes()` is the runtime lockstep-packet consumer. Match setup,
+//! acks, disconnects, and final results are session-manager lifecycle messages;
+//! if they are accidentally delivered here they are ignored rather than treated
+//! as simulation protocol failures. Desync packets remain runtime-owned and
+//! terminal for the peer.
 
 const std = @import("std");
 const controls = @import("input");
@@ -17,7 +23,7 @@ const protocol = @import("protocol");
 
 pub const MaxBufferedFrames: usize = 256;
 pub const MaxPendingStateHashFrames: usize = MaxBufferedFrames;
-pub const MaxPendingStateHashes: usize = 32;
+pub const MaxPendingStateHashes: usize = MaxPendingStateHashFrames;
 pub const MaxStateHashHistory: usize = MaxBufferedFrames;
 
 pub const LockstepError = match_mod.InvalidGarbageSettings ||
@@ -28,16 +34,15 @@ pub const LockstepError = match_mod.InvalidGarbageSettings ||
         InvalidPlayerSlot,
         InputDelayTooLarge,
         InputWindowExceeded,
+        InputWindowFull,
         StateHashWindowExceeded,
         FrameIndexOverflow,
         RestartInputUnsupported,
         ConflictingInputDuplicate,
         ConflictingStateHash,
-        UnsupportedPacket,
         PeerNotOk,
         StateHashMismatch,
         StateHashTooOld,
-        WrongMatchId,
         UnexpectedSenderSlot,
     };
 
@@ -49,10 +54,8 @@ pub const ProtocolError = enum {
     restart_input_unsupported,
     conflicting_input_duplicate,
     conflicting_state_hash,
-    unsupported_packet,
     malformed_packet,
     state_hash_too_old,
-    wrong_match_id,
     unexpected_sender_slot,
 };
 
@@ -127,6 +130,12 @@ pub const Peer = struct {
         };
     }
 
+    pub fn canSampleLocalInput(self: *const Peer) bool {
+        if (!self.isOk()) return false;
+        const target_frame = std.math.add(u64, self.local_app_tick, self.input_delay_frames) catch return false;
+        return self.inputs[self.local_slot.index()].canPut(target_frame, self.next_frame_to_simulate);
+    }
+
     pub fn sampleLocalInput(self: *Peer, frame_input: controls.FrameInput) LockstepError!EncodedPacket {
         try self.ensureOk();
         if (hasRestartInput(frame_input)) {
@@ -138,7 +147,15 @@ pub const Peer = struct {
             self.recordProtocolError(.frame_index_overflow);
             return error.FrameIndexOverflow;
         };
-        try self.putInput(self.local_slot.index(), target_frame, frame_input);
+        self.inputs[self.local_slot.index()].put(target_frame, frame_input, self.next_frame_to_simulate) catch |err| {
+            switch (err) {
+                error.InputWindowExceeded => return error.InputWindowFull,
+                error.ConflictingInputDuplicate => {
+                    self.recordProtocolError(.conflicting_input_duplicate);
+                    return error.ConflictingInputDuplicate;
+                },
+            }
+        };
         self.local_app_tick += 1;
 
         const batch = try protocol.InputBatch.init(self.match_id, protocolSlot(self.local_slot), target_frame, &[_]controls.FrameInput{frame_input});
@@ -156,6 +173,12 @@ pub const Peer = struct {
 
     pub fn receiveBytes(self: *Peer, bytes: []const u8) LockstepError!void {
         try self.ensureOk();
+        const packet_match_id = protocol.peekMatchId(bytes) catch |err| {
+            self.recordProtocolError(.malformed_packet);
+            return err;
+        };
+        if (packet_match_id != self.match_id) return;
+
         const packet = protocol.decode(bytes) catch |err| {
             self.recordProtocolError(.malformed_packet);
             return err;
@@ -192,10 +215,7 @@ pub const Peer = struct {
     }
 
     fn receivePacket(self: *Peer, packet: protocol.Packet) LockstepError!void {
-        if (protocol.packetMatchId(packet) != self.match_id) {
-            self.recordProtocolError(.wrong_match_id);
-            return error.WrongMatchId;
-        }
+        if (protocol.packetMatchId(packet) != self.match_id) return;
 
         switch (packet) {
             .input_batch => |batch| try self.receiveInputBatch(batch),
@@ -209,10 +229,7 @@ pub const Peer = struct {
                 } };
                 return error.StateHashMismatch;
             },
-            else => {
-                self.recordProtocolError(.unsupported_packet);
-                return error.UnsupportedPacket;
-            },
+            .setup, .ack, .disconnect, .result => {},
         }
     }
 
@@ -340,6 +357,16 @@ const InputSlot = struct {
 
 const InputStore = struct {
     slots: [MaxBufferedFrames]InputSlot = [_]InputSlot{.{}} ** MaxBufferedFrames,
+
+    fn canPut(self: *const InputStore, frame: u64, min_frame: u64) bool {
+        if (frame >= min_frame and frame - min_frame >= @as(u64, @intCast(MaxBufferedFrames))) return false;
+
+        const slot = self.slots[ringIndex(frame)];
+        if (slot.present and slot.frame == frame) return true;
+        if (frame < min_frame) return true;
+        if (slot.present and slot.frame >= min_frame) return false;
+        return true;
+    }
 
     fn put(self: *InputStore, frame: u64, frame_input: controls.FrameInput, min_frame: u64) InputStoreError!void {
         if (frame >= min_frame and frame - min_frame >= @as(u64, @intCast(MaxBufferedFrames))) return error.InputWindowExceeded;
@@ -606,6 +633,35 @@ test "conservative lockstep waits for missing remote input" {
     try std.testing.expect(peer.isOk());
 }
 
+test "local input backpressure is non-terminal and recovers after remote catch-up" {
+    var peer = try Peer.init(testSettings(), .p1, 0, TestMatchId);
+
+    for (0..MaxBufferedFrames) |index| {
+        try std.testing.expect(peer.canSampleLocalInput());
+        _ = try peer.sampleLocalInput(.{ .left_down = index % 2 == 0 });
+    }
+
+    try std.testing.expect(!peer.canSampleLocalInput());
+    try std.testing.expectError(error.InputWindowFull, peer.sampleLocalInput(.{}));
+    try std.testing.expect(peer.isOk());
+    try std.testing.expectEqual(@as(u64, 0), peer.frameCursor());
+    try std.testing.expectEqual(@as(u64, @intCast(MaxBufferedFrames)), peer.local_app_tick);
+    try std.testing.expect(peer.inputs[0].get(@intCast(MaxBufferedFrames)) == null);
+
+    const remote = try inputBatchPacket(1, 0, &[_]controls.FrameInput{.{}});
+    try peer.receiveBytes(remote.slice());
+    try std.testing.expectEqual(@as(usize, 1), try peer.stepAvailableMax(1));
+    try std.testing.expect(peer.isOk());
+    try std.testing.expect(peer.canSampleLocalInput());
+
+    const recovered = try peer.sampleLocalInput(.{ .right_down = true });
+    switch (try protocol.decode(recovered.slice())) {
+        .input_batch => |batch| try std.testing.expectEqual(@as(u64, @intCast(MaxBufferedFrames)), batch.first_frame),
+        else => try std.testing.expect(false),
+    }
+    try std.testing.expect(peer.isOk());
+}
+
 test "delayed and out-of-order packets eventually converge peers" {
     var p1 = try Peer.init(testSettings(), .p1, 2, TestMatchId);
     var p2 = try Peer.init(testSettings(), .p2, 2, TestMatchId);
@@ -703,21 +759,82 @@ test "local packets carry local slot and match id" {
     }
 }
 
-test "inbound packets with wrong match id are rejected" {
-    var input_peer = try Peer.init(testSettings(), .p1, 0, TestMatchId);
-    const wrong_input = try inputBatchPacketForMatch(OtherMatchId, 1, 0, &[_]controls.FrameInput{.{}});
-    try std.testing.expectError(error.WrongMatchId, input_peer.receiveBytes(wrong_input.slice()));
-    try expectProtocolError(input_peer.status, .wrong_match_id);
+test "lifecycle packets are session-manager owned and ignored by runtime lockstep" {
+    var peer = try Peer.init(testSettings(), .p1, 0, TestMatchId);
+    const initial_cursor = peer.frameCursor();
 
-    var hash_peer = try Peer.init(testSettings(), .p1, 0, TestMatchId);
-    const wrong_hash = try stateHashPacketForMatch(OtherMatchId, 1, 0, hash_peer.stateHash());
-    try std.testing.expectError(error.WrongMatchId, hash_peer.receiveBytes(wrong_hash.slice()));
-    try expectProtocolError(hash_peer.status, .wrong_match_id);
+    const setup = try encodePacket(.{ .setup = .{
+        .match_id = TestMatchId,
+        .sender_slot = 1,
+        .input_delay_frames = 0,
+        .p1_seed = 0x1111,
+        .p2_seed = 0x2222,
+        .garbage_seed = 0x3333,
+        .hole_num = 1,
+        .hole_den = 4,
+    } });
+    const ack = try encodePacket(.{ .ack = .{
+        .match_id = TestMatchId,
+        .sender_slot = 1,
+        .acked_slot = 0,
+        .next_needed_frame = 0,
+    } });
+    const disconnect = try encodePacket(.{ .disconnect = .{
+        .match_id = TestMatchId,
+        .sender_slot = 1,
+        .reason = 1,
+        .last_frame_cursor = 0,
+    } });
+    const result = try encodePacket(.{ .result = .{
+        .match_id = TestMatchId,
+        .sender_slot = 1,
+        .outcome = .draw,
+        .frame_cursor = 0,
+        .state_hash = peer.stateHash(),
+    } });
 
-    var desync_peer = try Peer.init(testSettings(), .p1, 0, TestMatchId);
+    inline for (.{ setup, ack, disconnect, result }) |packet| {
+        try peer.receiveBytes(packet.slice());
+        try std.testing.expect(peer.isOk());
+        try std.testing.expectEqual(initial_cursor, peer.frameCursor());
+    }
+
+    _ = try peer.sampleLocalInput(.{});
+    const valid_remote = try inputBatchPacket(1, 0, &[_]controls.FrameInput{.{}});
+    try peer.receiveBytes(valid_remote.slice());
+    try std.testing.expectEqual(@as(usize, 1), try peer.stepAvailable());
+    try std.testing.expect(peer.isOk());
+}
+
+test "wrong-match packets are stale transport noise and valid packets still work" {
+    var peer = try Peer.init(testSettings(), .p1, 0, TestMatchId);
+
+    const wrong_input = try inputBatchPacketForMatch(OtherMatchId, 1, 0, &[_]controls.FrameInput{.{ .left_down = true }});
+    try peer.receiveBytes(wrong_input.slice());
+    try std.testing.expect(peer.isOk());
+    try std.testing.expectEqual(@as(u64, 0), peer.frameCursor());
+    try std.testing.expect(peer.inputs[1].get(0) == null);
+
+    const wrong_match_invalid_slot = try inputBatchPacketForMatch(OtherMatchId, 2, 0, &[_]controls.FrameInput{.{}});
+    try peer.receiveBytes(wrong_match_invalid_slot.slice());
+    try std.testing.expect(peer.isOk());
+    try std.testing.expect(peer.inputs[1].get(0) == null);
+
+    const wrong_hash = try stateHashPacketForMatch(OtherMatchId, 1, 1, 0xaaaa_bbbb_cccc_dddd);
+    try peer.receiveBytes(wrong_hash.slice());
+    try std.testing.expect(peer.isOk());
+    try std.testing.expect(peer.pending_state_hashes.take(1) == null);
+
     const wrong_desync = try desyncPacketForMatch(OtherMatchId, 1);
-    try std.testing.expectError(error.WrongMatchId, desync_peer.receiveBytes(wrong_desync.slice()));
-    try expectProtocolError(desync_peer.status, .wrong_match_id);
+    try peer.receiveBytes(wrong_desync.slice());
+    try std.testing.expect(peer.isOk());
+    try std.testing.expectEqual(@as(u64, 0), peer.frameCursor());
+
+    _ = try peer.sampleLocalInput(.{});
+    const valid_remote = try inputBatchPacket(1, 0, &[_]controls.FrameInput{.{ .right_down = true }});
+    try peer.receiveBytes(valid_remote.slice());
+    try std.testing.expectEqual(@as(usize, 1), try peer.stepAvailable());
+    try std.testing.expect(peer.isOk());
 }
 
 test "inbound packets from non-remote slot are rejected" {
@@ -737,11 +854,11 @@ test "inbound packets from non-remote slot are rejected" {
     try expectProtocolError(desync_peer.status, .unexpected_sender_slot);
 }
 
-test "inbound invalid player slot is rejected" {
+test "same-match invalid player slot is malformed and terminal" {
     var peer = try Peer.init(testSettings(), .p1, 0, TestMatchId);
     const packet = try inputBatchPacket(2, 0, &[_]controls.FrameInput{.{}});
     try std.testing.expectError(error.InvalidPlayerSlot, peer.receiveBytes(packet.slice()));
-    try expectProtocolError(peer.status, .invalid_player_slot);
+    try expectProtocolError(peer.status, .malformed_packet);
 }
 
 test "duplicate same input is ignored" {
@@ -845,6 +962,26 @@ test "future state hash at window edge is accepted and stored" {
     try peer.receiveBytes(packet.slice());
     try std.testing.expect(peer.isOk());
     try std.testing.expectEqual(hash, peer.pending_state_hashes.take(frame_cursor).?);
+}
+
+test "more than thirty-two in-window future state hashes are accepted" {
+    var peer = try Peer.init(testSettings(), .p1, 0, TestMatchId);
+    const burst_count: usize = 33;
+
+    for (0..burst_count) |index| {
+        const frame_cursor: u64 = @intCast(index + 1);
+        const hash = 0x1000_0000_0000_0000 + frame_cursor;
+        const packet = try stateHashPacket(1, frame_cursor, hash);
+        try peer.receiveBytes(packet.slice());
+        try std.testing.expect(peer.isOk());
+    }
+
+    for (0..burst_count) |index| {
+        const frame_cursor: u64 = @intCast(index + 1);
+        const expected_hash = 0x1000_0000_0000_0000 + frame_cursor;
+        try std.testing.expectEqual(expected_hash, peer.pending_state_hashes.take(frame_cursor).?);
+    }
+    try std.testing.expect(peer.isOk());
 }
 
 test "future state hash at window limit is rejected" {

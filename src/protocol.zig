@@ -83,6 +83,7 @@ pub const DecodeError = error{
     InvalidInputMask,
     InvalidHoleChangeChance,
     InvalidInitialHole,
+    InvalidPlayerSlot,
 };
 
 pub const PacketType = enum(u8) {
@@ -279,6 +280,18 @@ pub fn decode(bytes: []const u8) DecodeError!Packet {
     };
 }
 
+/// Return the envelope match id without decoding the packet body. Runtime
+/// lockstep uses this to drop stale packets from previous/rematch epochs before
+/// body validation can turn transport noise into a terminal same-match error.
+pub fn peekMatchId(bytes: []const u8) DecodeError!u64 {
+    if (bytes.len < HeaderSize) return error.TruncatedPacket;
+    var value: u64 = 0;
+    inline for (0..8) |byte_index| {
+        value |= @as(u64, bytes[2 + byte_index]) << (8 * byte_index);
+    }
+    return value;
+}
+
 fn encodeSetup(setup: Setup, out: []u8) EncodeError!usize {
     try validateHoleChangeChance(setup.hole_num, setup.hole_den);
     const initial_hole_p1 = try encodeInitialHole(setup.initial_hole_p1);
@@ -358,7 +371,7 @@ fn encodeResult(result: Result, out: []u8) EncodeError!usize {
 fn decodeSetup(match_id: u64, reader: *Reader) DecodeError!Setup {
     const setup = Setup{
         .match_id = match_id,
-        .sender_slot = try reader.readU8(),
+        .sender_slot = try decodePlayerSlot(try reader.readU8()),
         .ruleset = try decodeRuleset(try reader.readU8()),
         .input_delay_frames = try reader.readU16(),
         .p1_seed = try reader.readU64(),
@@ -377,7 +390,7 @@ fn decodeSetup(match_id: u64, reader: *Reader) DecodeError!Setup {
 fn decodeInputBatch(match_id: u64, reader: *Reader) DecodeError!InputBatch {
     var batch = InputBatch{
         .match_id = match_id,
-        .player_slot = try reader.readU8(),
+        .player_slot = try decodePlayerSlot(try reader.readU8()),
         .first_frame = try reader.readU64(),
     };
     batch.count = try reader.readU8();
@@ -393,8 +406,8 @@ fn decodeInputBatch(match_id: u64, reader: *Reader) DecodeError!InputBatch {
 fn decodeAck(match_id: u64, reader: *Reader) DecodeError!Ack {
     const ack = Ack{
         .match_id = match_id,
-        .sender_slot = try reader.readU8(),
-        .acked_slot = try reader.readU8(),
+        .sender_slot = try decodePlayerSlot(try reader.readU8()),
+        .acked_slot = try decodePlayerSlot(try reader.readU8()),
         .next_needed_frame = try reader.readU64(),
     };
     try reader.expectEnd();
@@ -404,7 +417,7 @@ fn decodeAck(match_id: u64, reader: *Reader) DecodeError!Ack {
 fn decodeStateHash(match_id: u64, reader: *Reader) DecodeError!StateHash {
     const state_hash = StateHash{
         .match_id = match_id,
-        .sender_slot = try reader.readU8(),
+        .sender_slot = try decodePlayerSlot(try reader.readU8()),
         .frame_cursor = try reader.readU64(),
         .state_hash = try reader.readU64(),
     };
@@ -415,7 +428,7 @@ fn decodeStateHash(match_id: u64, reader: *Reader) DecodeError!StateHash {
 fn decodeDesync(match_id: u64, reader: *Reader) DecodeError!Desync {
     const desync = Desync{
         .match_id = match_id,
-        .sender_slot = try reader.readU8(),
+        .sender_slot = try decodePlayerSlot(try reader.readU8()),
         .reason = try reader.readU8(),
         .frame_cursor = try reader.readU64(),
         .local_hash = try reader.readU64(),
@@ -428,7 +441,7 @@ fn decodeDesync(match_id: u64, reader: *Reader) DecodeError!Desync {
 fn decodeDisconnect(match_id: u64, reader: *Reader) DecodeError!Disconnect {
     const disconnect = Disconnect{
         .match_id = match_id,
-        .sender_slot = try reader.readU8(),
+        .sender_slot = try decodePlayerSlot(try reader.readU8()),
         .reason = try reader.readU8(),
         .last_frame_cursor = try reader.readU64(),
     };
@@ -439,7 +452,7 @@ fn decodeDisconnect(match_id: u64, reader: *Reader) DecodeError!Disconnect {
 fn decodeResult(match_id: u64, reader: *Reader) DecodeError!Result {
     const result = Result{
         .match_id = match_id,
-        .sender_slot = try reader.readU8(),
+        .sender_slot = try decodePlayerSlot(try reader.readU8()),
         .outcome = try decodeResultOutcome(try reader.readU8()),
         .frame_cursor = try reader.readU64(),
         .state_hash = try reader.readU64(),
@@ -502,6 +515,13 @@ fn decodeResultOutcome(value: u8) DecodeError!ResultOutcome {
         @intFromEnum(ResultOutcome.p2_win) => .p2_win,
         @intFromEnum(ResultOutcome.draw) => .draw,
         else => error.UnknownResultOutcome,
+    };
+}
+
+fn decodePlayerSlot(value: u8) DecodeError!u8 {
+    return switch (value) {
+        0, 1 => value,
+        else => error.InvalidPlayerSlot,
     };
 }
 
@@ -1069,4 +1089,55 @@ test "input batch rejects invalid input mask" {
         0x10,
     };
     try std.testing.expectError(error.InvalidInputMask, decode(bytes[0..]));
+}
+
+fn expectInvalidSlotDecode(packet: Packet, slot_offset: usize) !void {
+    var bytes: [MaxPacketSize]u8 = undefined;
+    const len = try encode(packet, bytes[0..]);
+    bytes[slot_offset] = 2;
+    try std.testing.expectError(error.InvalidPlayerSlot, decode(bytes[0..len]));
+}
+
+test "decode rejects invalid player slots on every slot-bearing packet" {
+    try expectInvalidSlotDecode(setupFixture(), HeaderSize);
+    try expectInvalidSlotDecode(.{ .input_batch = try InputBatch.init(GoldenMatchId, 0, 0, &[_]input.FrameInput{.{}}) }, HeaderSize);
+    try expectInvalidSlotDecode(.{ .ack = .{
+        .match_id = GoldenMatchId,
+        .sender_slot = 0,
+        .acked_slot = 1,
+        .next_needed_frame = 1,
+    } }, HeaderSize);
+    try expectInvalidSlotDecode(.{ .ack = .{
+        .match_id = GoldenMatchId,
+        .sender_slot = 0,
+        .acked_slot = 1,
+        .next_needed_frame = 1,
+    } }, HeaderSize + 1);
+    try expectInvalidSlotDecode(.{ .state_hash = .{
+        .match_id = GoldenMatchId,
+        .sender_slot = 0,
+        .frame_cursor = 2,
+        .state_hash = 3,
+    } }, HeaderSize);
+    try expectInvalidSlotDecode(.{ .desync = .{
+        .match_id = GoldenMatchId,
+        .sender_slot = 0,
+        .reason = 1,
+        .frame_cursor = 2,
+        .local_hash = 3,
+        .peer_hash = 4,
+    } }, HeaderSize);
+    try expectInvalidSlotDecode(.{ .disconnect = .{
+        .match_id = GoldenMatchId,
+        .sender_slot = 0,
+        .reason = 1,
+        .last_frame_cursor = 2,
+    } }, HeaderSize);
+    try expectInvalidSlotDecode(.{ .result = .{
+        .match_id = GoldenMatchId,
+        .sender_slot = 0,
+        .outcome = .draw,
+        .frame_cursor = 2,
+        .state_hash = 3,
+    } }, HeaderSize);
 }
