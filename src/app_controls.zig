@@ -19,6 +19,11 @@ pub const ModeHotkeys = struct {
     two_pressed: bool = false,
 };
 
+pub const ModeTransition = union(enum) {
+    unchanged,
+    changed_mode: AppMode,
+};
+
 pub const KeyState = struct {
     down: bool = false,
     pressed: bool = false,
@@ -57,10 +62,17 @@ pub fn selectedModeForHotkey(hotkeys: ModeHotkeys) ?AppMode {
     return null;
 }
 
+pub fn modeTransitionForHotkey(current: AppMode, hotkeys: ModeHotkeys) ModeTransition {
+    const selected = selectedModeForHotkey(hotkeys) orelse return .unchanged;
+    if (selected == current) return .unchanged;
+    return .{ .changed_mode = selected };
+}
+
 pub fn selectedModeChangeForHotkey(current: AppMode, hotkeys: ModeHotkeys) ?AppMode {
-    const selected = selectedModeForHotkey(hotkeys) orelse return null;
-    if (selected == current) return null;
-    return selected;
+    return switch (modeTransitionForHotkey(current, hotkeys)) {
+        .unchanged => null,
+        .changed_mode => |selected| selected,
+    };
 }
 
 pub fn localVersusMatchInputFromKeys(keys: LocalVersusKeys) match_mod.MatchInput {
@@ -117,6 +129,14 @@ test "mode hotkeys only switch to a different mode" {
     try std.testing.expectEqual(AppMode.single, selectedModeChangeForHotkey(.local_versus, .{ .one_pressed = true }).?);
     try std.testing.expectEqual(@as(?AppMode, null), selectedModeChangeForHotkey(.local_versus, .{ .two_pressed = true }));
     try std.testing.expectEqual(@as(?AppMode, null), selectedModeChangeForHotkey(.single, .{}));
+}
+
+test "mode hotkeys report explicit changed-mode transitions" {
+    try std.testing.expectEqualDeep(ModeTransition{ .unchanged = {} }, modeTransitionForHotkey(.single, .{ .one_pressed = true }));
+    try std.testing.expectEqualDeep(ModeTransition{ .changed_mode = .local_versus }, modeTransitionForHotkey(.single, .{ .two_pressed = true }));
+    try std.testing.expectEqualDeep(ModeTransition{ .changed_mode = .single }, modeTransitionForHotkey(.local_versus, .{ .one_pressed = true }));
+    try std.testing.expectEqualDeep(ModeTransition{ .unchanged = {} }, modeTransitionForHotkey(.local_versus, .{ .two_pressed = true }));
+    try std.testing.expectEqualDeep(ModeTransition{ .unchanged = {} }, modeTransitionForHotkey(.single, .{}));
 }
 
 test "local versus P1 keys map one at a time to exact frame input fields" {

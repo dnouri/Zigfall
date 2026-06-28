@@ -165,13 +165,21 @@ const App = struct {
     }
 
     fn updateAndDraw(self: *App) void {
-        if (selectedModeHotkey(self.currentMode())) |selected_mode| {
-            self.startMode(selected_mode);
-        }
+        const changed_mode = switch (modeHotkeyTransition(self.currentMode())) {
+            .unchanged => false,
+            .changed_mode => |selected_mode| changed: {
+                self.startMode(selected_mode);
+                break :changed true;
+            },
+        };
 
-        switch (self.mode) {
-            .single => |*single| single.update(),
-            .local_versus => |*versus| versus.update(),
+        // Draw the new mode immediately, but do not let gameplay keys chorded
+        // with 1/2 step a freshly-created game on the transition frame.
+        if (!changed_mode) {
+            switch (self.mode) {
+                .single => |*single| single.update(),
+                .local_versus => |*versus| versus.update(),
+            }
         }
 
         rl.beginDrawing();
@@ -231,8 +239,8 @@ fn localVersusSettings() match_mod.MatchSettings {
     };
 }
 
-fn selectedModeHotkey(current_mode: AppMode) ?AppMode {
-    return app_controls.selectedModeChangeForHotkey(current_mode, .{
+fn modeHotkeyTransition(current_mode: AppMode) app_controls.ModeTransition {
+    return app_controls.modeTransitionForHotkey(current_mode, .{
         .one_pressed = rl.isKeyPressed(.one),
         .two_pressed = rl.isKeyPressed(.two),
     });
