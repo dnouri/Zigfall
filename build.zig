@@ -28,6 +28,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "game", .module = game_mod },
         },
     });
+    const protocol_mod = b.addModule("protocol", .{
+        .root_source_file = b.path("src/protocol.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "input", .module = input_mod },
+        },
+    });
     const match_mod = b.addModule("match", .{
         .root_source_file = b.path("src/match.zig"),
         .target = target,
@@ -35,6 +43,16 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "game", .module = game_mod },
             .{ .name = "input", .module = input_mod },
+        },
+    });
+    const lockstep_mod = b.addModule("lockstep", .{
+        .root_source_file = b.path("src/lockstep.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "input", .module = input_mod },
+            .{ .name = "match", .module = match_mod },
+            .{ .name = "protocol", .module = protocol_mod },
         },
     });
     const app_controls_mod = b.addModule("app_controls", .{
@@ -122,10 +140,18 @@ pub fn build(b: *std.Build) void {
         .root_module = input_mod,
     });
     const run_input_tests = b.addRunArtifact(input_tests);
+    const protocol_tests = b.addTest(.{
+        .root_module = protocol_mod,
+    });
+    const run_protocol_tests = b.addRunArtifact(protocol_tests);
     const match_tests = b.addTest(.{
         .root_module = match_mod,
     });
     const run_match_tests = b.addRunArtifact(match_tests);
+    const lockstep_tests = b.addTest(.{
+        .root_module = lockstep_mod,
+    });
+    const run_lockstep_tests = b.addRunArtifact(lockstep_tests);
     const app_controls_tests = b.addTest(.{
         .root_module = app_controls_mod,
     });
@@ -134,6 +160,8 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_game_tests.step);
     test_step.dependOn(&run_input_tests.step);
+    test_step.dependOn(&run_protocol_tests.step);
     test_step.dependOn(&run_match_tests.step);
+    test_step.dependOn(&run_lockstep_tests.step);
     test_step.dependOn(&run_app_controls_tests.step);
 }

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const rules = @import("game");
+const state_hash = rules.DeterministicHash;
 
 pub const FixedFps: u16 = 60;
 pub const DasDelayFrames: u8 = 10;
@@ -80,6 +81,15 @@ pub const Controller = struct {
         self.left.reset();
         self.right.reset();
         self.horizontal_preference = null;
+    }
+
+    /// Feed deterministic controller repeat/preference state into the match
+    /// state hash. Frame input itself is not stored here; only input-derived
+    /// DAS/ARR state that can affect future simulation is included.
+    pub fn feedDeterministicHash(self: *const Controller, hasher: *std.hash.XxHash64) void {
+        feedRepeatKeyHash(hasher, self.left);
+        feedRepeatKeyHash(hasher, self.right);
+        feedOptionalHorizontalDirectionHash(hasher, self.horizontal_preference);
     }
 
     pub fn horizontalMoveThisFrame(self: *Controller, frame: FrameInput) i32 {
@@ -200,6 +210,45 @@ pub const Controller = struct {
         }
     }
 };
+
+fn feedRepeatKeyHash(hasher: *std.hash.XxHash64, key: RepeatKey) void {
+    state_hash.feedBool(hasher, key.down);
+    state_hash.feedU8(hasher, key.frames_until_repeat);
+}
+
+fn feedOptionalHorizontalDirectionHash(hasher: *std.hash.XxHash64, direction: ?HorizontalDirection) void {
+    if (direction) |value| {
+        state_hash.feedBool(hasher, true);
+        feedHorizontalDirectionHash(hasher, value);
+    } else {
+        state_hash.feedBool(hasher, false);
+    }
+}
+
+fn feedHorizontalDirectionHash(hasher: *std.hash.XxHash64, direction: HorizontalDirection) void {
+    state_hash.feedU8(hasher, switch (direction) {
+        .left => 0,
+        .right => 1,
+    });
+}
+
+fn testControllerDeterministicHash(controller: *const Controller) u64 {
+    var hasher = std.hash.XxHash64.init(0);
+    controller.feedDeterministicHash(&hasher);
+    return hasher.final();
+}
+
+test "controller deterministic hash tracks repeat and preference state" {
+    var left = Controller{};
+    var right = Controller{};
+    try std.testing.expectEqual(testControllerDeterministicHash(&left), testControllerDeterministicHash(&right));
+
+    _ = left.horizontalMoveThisFrame(.{ .left_down = true, .left_pressed = true });
+    try std.testing.expect(testControllerDeterministicHash(&left) != testControllerDeterministicHash(&right));
+
+    _ = right.horizontalMoveThisFrame(.{ .left_down = true, .left_pressed = true });
+    try std.testing.expectEqual(testControllerDeterministicHash(&left), testControllerDeterministicHash(&right));
+}
 
 test "DAS/ARR emits initial move then delayed repeats" {
     var controller = Controller{};

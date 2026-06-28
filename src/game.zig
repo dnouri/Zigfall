@@ -2,6 +2,9 @@
 
 const std = @import("std");
 
+pub const DeterministicHash = @import("state_hash.zig");
+const state_hash = DeterministicHash;
+
 pub const BoardWidth: usize = 10;
 pub const BoardHeight: usize = 40;
 pub const VisibleHeight: usize = 20;
@@ -560,6 +563,35 @@ pub const Game = struct {
         return gravityIntervalFramesForLevel(self.level);
     }
 
+    /// Feed only deterministic gameplay state into a stable hash stream.
+    ///
+    /// This deliberately hashes fields one-by-one instead of hashing the raw
+    /// `Game` struct, so padding, enum layout, and native pointer details never
+    /// affect lockstep desync checks.
+    pub fn feedDeterministicHash(self: *const Game, hasher: *std.hash.XxHash64) void {
+        feedBoardHash(hasher, &self.board);
+        feedSevenBagHash(hasher, &self.randomizer);
+        feedPieceKindArrayHash(NextQueueLength, hasher, &self.next);
+        feedOptionalPieceKindHash(hasher, self.hold);
+        state_hash.feedBool(hasher, self.held_this_piece);
+        feedOptionalActivePieceHash(hasher, self.active);
+        state_hash.feedBool(hasher, self.game_over);
+        state_hash.feedU32(hasher, self.total_lines_cleared);
+        state_hash.feedU32(hasher, self.pieces_locked);
+        state_hash.feedU32(hasher, self.score);
+        state_hash.feedU8(hasher, self.level);
+        state_hash.feedI32(hasher, self.combo_counter);
+        state_hash.feedBool(hasher, self.back_to_back_active);
+        feedOptionalLockResultHash(hasher, self.last_lock_result);
+        state_hash.feedU16(hasher, self.lock_delay_frames);
+        state_hash.feedU8(hasher, self.max_lock_move_resets);
+        state_hash.feedU16(hasher, self.lock_delay_elapsed);
+        state_hash.feedU8(hasher, self.lock_move_resets_used);
+        state_hash.feedU32(hasher, self.soft_drop_points_pending);
+        feedLastPieceActionHash(hasher, self.last_piece_action);
+        feedOptionalRotationEventHash(hasher, self.last_successful_rotation);
+    }
+
     fn moveActive(self: *Game, dx: i32, dy: i32, action: LastPieceAction, soft_drop_scoring: bool) bool {
         if (self.game_over) return false;
         var moved = self.active orelse return false;
@@ -776,6 +808,169 @@ pub const Game = struct {
         return true;
     }
 };
+
+fn feedBoardHash(hasher: *std.hash.XxHash64, board: *const Board) void {
+    for (board.*) |row| {
+        for (row) |cell| {
+            feedOptionalCellHash(hasher, cell);
+        }
+    }
+}
+
+fn feedOptionalCellHash(hasher: *std.hash.XxHash64, cell: ?Cell) void {
+    if (cell) |filled| {
+        switch (filled) {
+            .piece => |kind| {
+                state_hash.feedU8(hasher, 1);
+                feedPieceKindHash(hasher, kind);
+            },
+            .garbage => state_hash.feedU8(hasher, 2),
+        }
+    } else {
+        state_hash.feedU8(hasher, 0);
+    }
+}
+
+fn feedSevenBagHash(hasher: *std.hash.XxHash64, bag: *const SevenBag) void {
+    state_hash.feedU64(hasher, bag.rng.state);
+    feedPieceKindArrayHash(PieceCount, hasher, &bag.bag);
+    std.debug.assert(bag.index <= PieceCount);
+    state_hash.feedU8(hasher, @intCast(bag.index));
+}
+
+fn feedPieceKindArrayHash(comptime len: usize, hasher: *std.hash.XxHash64, pieces: *const [len]PieceKind) void {
+    for (pieces.*) |kind| {
+        feedPieceKindHash(hasher, kind);
+    }
+}
+
+fn feedOptionalPieceKindHash(hasher: *std.hash.XxHash64, piece_kind: ?PieceKind) void {
+    if (piece_kind) |kind| {
+        state_hash.feedBool(hasher, true);
+        feedPieceKindHash(hasher, kind);
+    } else {
+        state_hash.feedBool(hasher, false);
+    }
+}
+
+fn feedOptionalActivePieceHash(hasher: *std.hash.XxHash64, active: ?ActivePiece) void {
+    if (active) |piece| {
+        state_hash.feedBool(hasher, true);
+        feedActivePieceHash(hasher, piece);
+    } else {
+        state_hash.feedBool(hasher, false);
+    }
+}
+
+fn feedActivePieceHash(hasher: *std.hash.XxHash64, piece: ActivePiece) void {
+    feedPieceKindHash(hasher, piece.kind);
+    feedRotationHash(hasher, piece.rotation);
+    feedPointHash(hasher, piece.pos);
+}
+
+fn feedPointHash(hasher: *std.hash.XxHash64, point: Point) void {
+    state_hash.feedI32(hasher, point.x);
+    state_hash.feedI32(hasher, point.y);
+}
+
+fn feedOptionalLockResultHash(hasher: *std.hash.XxHash64, result: ?LockResult) void {
+    if (result) |lock_result| {
+        state_hash.feedBool(hasher, true);
+        feedLockResultHash(hasher, lock_result);
+    } else {
+        state_hash.feedBool(hasher, false);
+    }
+}
+
+fn feedLockResultHash(hasher: *std.hash.XxHash64, result: LockResult) void {
+    feedPieceKindHash(hasher, result.piece_kind);
+    state_hash.feedU8(hasher, result.lines_cleared);
+    feedTSpinKindHash(hasher, result.t_spin_kind);
+    state_hash.feedBool(hasher, result.perfect_clear);
+    state_hash.feedI32(hasher, result.combo_after_lock);
+    state_hash.feedBool(hasher, result.back_to_back_active_after_lock);
+    state_hash.feedBool(hasher, result.back_to_back_bonus_applied);
+    state_hash.feedBool(hasher, result.difficult_clear);
+    state_hash.feedU32(hasher, result.base_score_points);
+    state_hash.feedU32(hasher, result.back_to_back_bonus_points);
+    state_hash.feedU32(hasher, result.combo_bonus_points);
+    state_hash.feedU32(hasher, result.perfect_clear_bonus_points);
+    state_hash.feedU32(hasher, result.hard_drop_cells);
+    state_hash.feedU32(hasher, result.hard_drop_points);
+    state_hash.feedU32(hasher, result.soft_drop_points);
+    state_hash.feedU32(hasher, result.score_delta);
+    state_hash.feedU32(hasher, result.total_score_after_lock);
+    state_hash.feedU8(hasher, result.attack_lines);
+}
+
+fn feedOptionalRotationEventHash(hasher: *std.hash.XxHash64, event: ?RotationEvent) void {
+    if (event) |rotation_event| {
+        state_hash.feedBool(hasher, true);
+        feedRotationEventHash(hasher, rotation_event);
+    } else {
+        state_hash.feedBool(hasher, false);
+    }
+}
+
+fn feedRotationEventHash(hasher: *std.hash.XxHash64, event: RotationEvent) void {
+    feedPieceKindHash(hasher, event.piece_kind);
+    feedRotationHash(hasher, event.from);
+    feedRotationHash(hasher, event.to);
+    feedRotationDirectionHash(hasher, event.direction);
+    state_hash.feedU8(hasher, event.kick_index);
+    feedPointHash(hasher, event.kick);
+}
+
+fn feedPieceKindHash(hasher: *std.hash.XxHash64, kind: PieceKind) void {
+    state_hash.feedU8(hasher, switch (kind) {
+        .i => 0,
+        .o => 1,
+        .t => 2,
+        .s => 3,
+        .z => 4,
+        .j => 5,
+        .l => 6,
+    });
+}
+
+fn feedRotationHash(hasher: *std.hash.XxHash64, rotation: Rotation) void {
+    state_hash.feedU8(hasher, switch (rotation) {
+        .spawn => 0,
+        .right => 1,
+        .reverse => 2,
+        .left => 3,
+    });
+}
+
+fn feedRotationDirectionHash(hasher: *std.hash.XxHash64, direction: RotationDirection) void {
+    state_hash.feedU8(hasher, switch (direction) {
+        .clockwise => 0,
+        .counter_clockwise => 1,
+        .half_turn => 2,
+    });
+}
+
+fn feedTSpinKindHash(hasher: *std.hash.XxHash64, kind: TSpinKind) void {
+    state_hash.feedU8(hasher, switch (kind) {
+        .none => 0,
+        .mini => 1,
+        .full => 2,
+    });
+}
+
+fn feedLastPieceActionHash(hasher: *std.hash.XxHash64, action: LastPieceAction) void {
+    state_hash.feedU8(hasher, switch (action) {
+        .none => 0,
+        .move => 1,
+        .rotate => 2,
+    });
+}
+
+fn testGameDeterministicHash(game: *const Game) u64 {
+    var hasher = std.hash.XxHash64.init(0);
+    game.feedDeterministicHash(&hasher);
+    return hasher.final();
+}
 
 pub fn levelForLines(total_lines_cleared: u32) u8 {
     const uncapped_level = 1 + total_lines_cleared / 10;
@@ -1105,6 +1300,26 @@ fn expectPieceCell(expected: PieceKind, cell: ?Cell) !void {
 fn expectGarbageCell(cell: ?Cell) !void {
     try std.testing.expect(cell != null);
     try std.testing.expect(cell.?.isGarbage());
+}
+
+test "game deterministic hash is stable for equal fresh games" {
+    const left = Game.init(0x1234_5678);
+    const right = Game.init(0x1234_5678);
+
+    try std.testing.expectEqual(testGameDeterministicHash(&left), testGameDeterministicHash(&right));
+}
+
+test "game deterministic hash changes for board and gameplay metadata" {
+    const base = Game.init(0x1234_5678);
+    const base_hash = testGameDeterministicHash(&base);
+
+    var board_changed = base;
+    board_changed.board[BoardHeight - 1][0] = Cell.fromPiece(.i);
+    try std.testing.expect(testGameDeterministicHash(&board_changed) != base_hash);
+
+    var lock_metadata_changed = base;
+    _ = lock_metadata_changed.hardDropAndLockDetailed();
+    try std.testing.expect(testGameDeterministicHash(&lock_metadata_changed) != base_hash);
 }
 
 test "seven bag produces one of each tetromino before repeat" {

@@ -8,9 +8,11 @@
 
 const std = @import("std");
 const rules = @import("game");
+const state_hash = rules.DeterministicHash;
 const controls = @import("input");
 
 pub const PlayerCount: usize = 2;
+pub const StateHashSchemaVersion: u16 = 1;
 
 pub const PlayerIndex = enum(u1) {
     p1 = 0,
@@ -330,6 +332,24 @@ pub const Match = struct {
         self.* = Match.initValidated(self.settings);
     }
 
+    /// Return a deterministic hash of simulation state suitable for lockstep
+    /// desync checks. The stream is schema-versioned and manually fed in stable
+    /// endian/order; it never hashes raw Zig structs or rendering/UI state.
+    pub fn stateHash(self: *const Match) u64 {
+        var hasher = std.hash.XxHash64.init(0);
+        state_hash.feedBytes(&hasher, "Zigfall.Match.State");
+        state_hash.feedU16(&hasher, StateHashSchemaVersion);
+        feedMatchSettingsHash(&hasher, self.settings);
+        for (self.players) |player_runtime| {
+            feedPlayerRuntimeHash(&hasher, &player_runtime);
+        }
+        state_hash.feedBool(&hasher, self.paused);
+        state_hash.feedU64(&hasher, self.input_frame_count);
+        state_hash.feedU64(&hasher, self.gameplay_frame_count);
+        feedMatchOutcomeHash(&hasher, self.outcome);
+        return hasher.final();
+    }
+
     /// Advance one match input frame. Restart resets the match and is not
     /// counted. Paused frames and frames after a final outcome increment
     /// `input_frame_count`, while only unpaused gameplay frames increment
@@ -523,6 +543,86 @@ pub const Match = struct {
     }
 };
 
+fn feedMatchSettingsHash(hasher: *std.hash.XxHash64, settings: MatchSettings) void {
+    for (settings.player_seeds) |seed| {
+        state_hash.feedU64(hasher, seed);
+    }
+    feedRulesetSettingsHash(hasher, settings.ruleset);
+}
+
+fn feedRulesetSettingsHash(hasher: *std.hash.XxHash64, settings: RulesetSettings) void {
+    switch (settings) {
+        .modern => |modern| {
+            feedRulesetHash(hasher, .modern);
+            state_hash.feedU64(hasher, modern.garbage_seed);
+            feedHoleChangeChanceHash(hasher, modern.garbage.hole_change_chance);
+            for (modern.garbage.initial_holes) |initial_hole| {
+                feedOptionalGarbageHoleIndexHash(hasher, initial_hole);
+            }
+        },
+    }
+}
+
+fn feedPlayerRuntimeHash(hasher: *std.hash.XxHash64, player_runtime: *const PlayerRuntime) void {
+    player_runtime.game.feedDeterministicHash(hasher);
+    player_runtime.controller.feedDeterministicHash(hasher);
+    state_hash.feedU16(hasher, player_runtime.gravity_counter);
+    state_hash.feedU32(hasher, player_runtime.pending_garbage);
+    feedGarbageHoleGeneratorHash(hasher, &player_runtime.garbage_holes);
+}
+
+fn feedGarbageHoleGeneratorHash(hasher: *std.hash.XxHash64, generator: *const GarbageHoleGenerator) void {
+    state_hash.feedU64(hasher, generator.rng.state);
+    feedGarbageHoleHash(hasher, generator.current_hole);
+    feedHoleChangeChanceHash(hasher, generator.change_chance);
+}
+
+fn feedHoleChangeChanceHash(hasher: *std.hash.XxHash64, chance: HoleChangeChance) void {
+    state_hash.feedU8(hasher, chance.numerator);
+    state_hash.feedU8(hasher, chance.denominator);
+}
+
+fn feedOptionalGarbageHoleIndexHash(hasher: *std.hash.XxHash64, hole_x: ?u8) void {
+    if (hole_x) |value| {
+        state_hash.feedBool(hasher, true);
+        state_hash.feedU8(hasher, value);
+    } else {
+        state_hash.feedBool(hasher, false);
+    }
+}
+
+fn feedGarbageHoleHash(hasher: *std.hash.XxHash64, hole: rules.GarbageHole) void {
+    std.debug.assert(hole.index() < rules.BoardWidth);
+    state_hash.feedU8(hasher, @intCast(hole.index()));
+}
+
+fn feedRulesetHash(hasher: *std.hash.XxHash64, ruleset: Ruleset) void {
+    state_hash.feedU8(hasher, switch (ruleset) {
+        .modern => 0,
+    });
+}
+
+fn feedPlayerIndexHash(hasher: *std.hash.XxHash64, player_index: PlayerIndex) void {
+    state_hash.feedU8(hasher, switch (player_index) {
+        .p1 => 0,
+        .p2 => 1,
+    });
+}
+
+fn feedMatchOutcomeHash(hasher: *std.hash.XxHash64, outcome: ?MatchOutcome) void {
+    if (outcome) |value| {
+        switch (value) {
+            .winner => |winner| {
+                state_hash.feedU8(hasher, 1);
+                feedPlayerIndexHash(hasher, winner);
+            },
+            .draw => state_hash.feedU8(hasher, 2),
+        }
+    } else {
+        state_hash.feedU8(hasher, 0);
+    }
+}
+
 pub fn advanceGravityCounter(counter: *u16, interval_frames: u16) bool {
     if (interval_frames <= 1) return true;
     counter.* += 1;
@@ -571,6 +671,10 @@ fn testInput(p1: controls.FrameInput, p2: controls.FrameInput) MatchInput {
 
 fn expectMatchesEqual(expected: *const Match, actual: *const Match) !void {
     try std.testing.expectEqualDeep(expected.*, actual.*);
+}
+
+fn expectStateHashesDiffer(left: *const Match, right: *const Match) !void {
+    try std.testing.expect(left.stateHash() != right.stateHash());
 }
 
 fn expectWinner(outcome: ?MatchOutcome, winner: PlayerIndex) !void {
@@ -972,6 +1076,86 @@ test "top-out quad queues before same-frame opponent non-clear inserts garbage" 
     try std.testing.expectEqual(@as(u32, 4), result.players[1].garbage.inserted);
     try std.testing.expectEqual(@as(u32, 0), match.players[1].pendingGarbageCount());
     try expectDraw(result.outcome);
+}
+
+test "fresh matches with same settings have equal state hashes" {
+    const left = try Match.init(testSettings());
+    const right = try Match.init(testSettings());
+
+    try std.testing.expectEqual(left.stateHash(), right.stateHash());
+}
+
+test "state hash includes deterministic match settings" {
+    const left = try Match.init(testSettings());
+    var changed_settings = testSettings();
+    changed_settings.player_seeds[0] +%= 1;
+    switch (changed_settings.ruleset) {
+        .modern => |*modern| modern.garbage.initial_holes[0] = 3,
+    }
+    const right = try Match.init(changed_settings);
+
+    try expectStateHashesDiffer(&left, &right);
+}
+
+test "same input sequence keeps state hashes equal" {
+    var left = try Match.init(testSettings());
+    var right = try Match.init(testSettings());
+
+    const sequence = [_]MatchInput{
+        testInput(.{ .left_down = true, .left_pressed = true }, .{}),
+        testInput(.{ .left_down = true }, .{ .right_down = true, .right_pressed = true }),
+        testInput(.{ .hard_drop_pressed = true }, .{}),
+        testInput(.{}, .{ .hard_drop_pressed = true }),
+        testInput(.{ .down_down = true }, .{ .down_down = true }),
+    };
+
+    for (sequence) |frame| {
+        _ = left.step(frame);
+        _ = right.step(frame);
+        try std.testing.expectEqual(left.stateHash(), right.stateHash());
+    }
+}
+
+test "different board state produces a different state hash" {
+    const left = try Match.init(testSettings());
+    var right = try Match.init(testSettings());
+
+    right.players[0].game.board[rules.BoardHeight - 1][0] = rules.Cell.fromPiece(.i);
+
+    try expectStateHashesDiffer(&left, &right);
+}
+
+test "state hash reflects match metadata pending garbage controllers and garbage rng" {
+    const base = try Match.init(testSettings());
+    const base_hash = base.stateHash();
+
+    var paused = base;
+    paused.paused = true;
+    try std.testing.expect(paused.stateHash() != base_hash);
+
+    var input_frame_changed = base;
+    input_frame_changed.input_frame_count = 1;
+    try std.testing.expect(input_frame_changed.stateHash() != base_hash);
+
+    var gameplay_frame_changed = base;
+    gameplay_frame_changed.gameplay_frame_count = 1;
+    try std.testing.expect(gameplay_frame_changed.stateHash() != base_hash);
+
+    var outcome_changed = base;
+    outcome_changed.outcome = .draw;
+    try std.testing.expect(outcome_changed.stateHash() != base_hash);
+
+    var pending_changed = base;
+    pending_changed.players[0].pending_garbage = 1;
+    try std.testing.expect(pending_changed.stateHash() != base_hash);
+
+    var controller_changed = base;
+    _ = controller_changed.players[0].controller.horizontalMoveThisFrame(.{ .left_down = true, .left_pressed = true });
+    try std.testing.expect(controller_changed.stateHash() != base_hash);
+
+    var garbage_rng_changed = base;
+    _ = garbage_rng_changed.players[0].garbage_holes.next();
+    try std.testing.expect(garbage_rng_changed.stateHash() != base_hash);
 }
 
 test "same seeds and inputs produce same deterministic runtime state" {
