@@ -124,12 +124,39 @@ The generated web files are installed to `zig-out/web/`:
 - `zigfall.html`
 - `zigfall.js`
 - `zigfall.wasm`
+- `zigfall_transport.mjs`
+- `vendor/trystero-nostr.bundle.mjs` plus concise vendor license/readme files
 
 The web build uses a custom Zigfall shell with a GitHub link and a
 keyboard handler that keeps Space, Enter, the arrow keys, and Slash (`/`,
 Player 2's 180-rotate key) from scrolling the browser page or opening
 quick-find while the game is active, without blocking focused links or form
 controls.
+
+The web artifact also includes an inactive Trystero/Nostr transport adapter for
+future online play. It is packaged as local static JavaScript copied by
+`build.zig`; production pages do not import Trystero from a runtime CDN, and
+native `zig build` does not require Node, npm, Trystero, browser APIs, or
+network access. Calling `connect()` still uses Trystero's default Nostr/public
+WebRTC signaling and ICE/STUN behavior at runtime, so browser network access is
+needed only for that manual/future online transport path. The adapter is
+observable in-game through the small web-only transport footer and manually from
+the browser console:
+
+```js
+ZigfallTransport.connect("zigfall-phase5-local")
+ZigfallTransport.peerCount()
+ZigfallTransport.send(Uint8Array.from([
+  0x01, 0x02, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01, 0x00, 0x78, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x09, 0x00, 0x22, 0x00, 0x04, 0x06,
+]))
+Array.from(ZigfallTransport.poll() ?? [])
+```
+
+Open two built web tabs, connect both to the same room, send the packet from one
+tab, and poll from the other. This is only a transport seam; online gameplay,
+invite links, matchmaking, setup handshakes, profiles, and native networking are
+not implemented.
 
 To launch with Emscripten's `emrun` helper:
 

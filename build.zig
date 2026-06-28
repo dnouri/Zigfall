@@ -64,6 +64,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "match", .module = match_mod },
         },
     });
+    const web_transport_mod = b.addModule("web_transport", .{
+        .root_source_file = b.path("src/web_transport.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "protocol", .module = protocol_mod },
+        },
+    });
 
     const app_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -75,6 +83,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "input", .module = input_mod },
             .{ .name = "match", .module = match_mod },
             .{ .name = "raylib", .module = raylib },
+            .{ .name = "web_transport", .module = web_transport_mod },
         },
     });
 
@@ -87,10 +96,17 @@ pub fn build(b: *std.Build) void {
         });
         const raylib_artifact = raylib_dep.artifact("raylib");
         const install_dir: std.Build.InstallDir = .{ .custom = "web" };
-        const emcc_flags = emsdk.emccDefaultFlags(b.allocator, .{
+        var emcc_flags = emsdk.emccDefaultFlags(b.allocator, .{
             .optimize = optimize,
             .asyncify = false,
         });
+        const transport_shim_path = "web/zigfall_transport_emscripten.js";
+        emcc_flags.put(b.fmt("--js-library={s}", .{b.path(transport_shim_path).getPath(b)}), {}) catch unreachable;
+        // zemscripten 0.2's StepOptions cannot add a JS-library LazyPath as a
+        // tracked input. Put a content hash on the emcc command line so shim
+        // edits invalidate the link step, while the --js-library path still
+        // makes a missing shim fail clearly.
+        emcc_flags.put(b.fmt("-DZF_TRANSPORT_SHIM_SHA256={s}", .{fileSha256Hex(b, transport_shim_path)}), {}) catch unreachable;
         const emcc_settings = emsdk.emccDefaultSettings(b.allocator, .{
             .optimize = optimize,
         });
@@ -102,13 +118,19 @@ pub fn build(b: *std.Build) void {
             .install_dir = install_dir,
         });
         b.getInstallStep().dependOn(emcc_step);
+        installWebTransportArtifact(b, install_dir, "web/zigfall_transport.mjs", "zigfall_transport.mjs");
+        installWebTransportArtifact(b, install_dir, "web/vendor/trystero-nostr.bundle.mjs", "vendor/trystero-nostr.bundle.mjs");
+        installWebTransportArtifact(b, install_dir, "web/vendor/README.md", "vendor/README.md");
+        installWebTransportArtifact(b, install_dir, "web/vendor/LICENSE-trystero.txt", "vendor/LICENSE-trystero.txt");
+        installWebTransportArtifact(b, install_dir, "web/vendor/LICENSE-noble-secp256k1.txt", "vendor/LICENSE-noble-secp256k1.txt");
+        installWebTransportArtifact(b, install_dir, "web/vendor/LICENSE-esbuild.txt", "vendor/LICENSE-esbuild.txt");
 
         const emrun_step = emsdk.emrunStep(
             b,
             b.getInstallPath(install_dir, "zigfall.html"),
             b.args orelse &.{},
         );
-        emrun_step.dependOn(emcc_step);
+        emrun_step.dependOn(b.getInstallStep());
         run_step.dependOn(emrun_step);
     } else {
         const exe = b.addExecutable(.{
@@ -156,6 +178,10 @@ pub fn build(b: *std.Build) void {
         .root_module = app_controls_mod,
     });
     const run_app_controls_tests = b.addRunArtifact(app_controls_tests);
+    const web_transport_tests = b.addTest(.{
+        .root_module = web_transport_mod,
+    });
+    const run_web_transport_tests = b.addRunArtifact(web_transport_tests);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_game_tests.step);
@@ -164,4 +190,25 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_match_tests.step);
     test_step.dependOn(&run_lockstep_tests.step);
     test_step.dependOn(&run_app_controls_tests.step);
+    test_step.dependOn(&run_web_transport_tests.step);
+}
+
+fn installWebTransportArtifact(
+    b: *std.Build,
+    install_dir: std.Build.InstallDir,
+    src_path: []const u8,
+    dest_path: []const u8,
+) void {
+    const install_file = b.addInstallFileWithDir(b.path(src_path), install_dir, dest_path);
+    b.getInstallStep().dependOn(&install_file.step);
+}
+
+fn fileSha256Hex(b: *std.Build, path: []const u8) []const u8 {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, path, b.allocator, .limited(1024 * 1024)) catch |err| {
+        std.debug.panic("failed to read {s}: {s}", .{ path, @errorName(err) });
+    };
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return b.allocator.dupe(u8, &hex) catch unreachable;
 }

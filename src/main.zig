@@ -7,6 +7,7 @@ const app_controls = @import("app_controls");
 const game = @import("game");
 const input = @import("input");
 const match_mod = @import("match");
+const web_transport = @import("web_transport");
 
 const emscripten = std.os.emscripten;
 
@@ -190,6 +191,7 @@ const App = struct {
             .single => |*single| single.draw(),
             .local_versus => |*versus| versus.draw(),
         }
+        drawWebTransportFooter();
 
         rl.endDrawing();
     }
@@ -809,6 +811,26 @@ fn drawScreenOverlay(title: [:0]const u8, subtitle: [:0]const u8, accent: rl.Col
     rl.drawRectangleRoundedLinesEx(rect(x, y, w, h), 0.09, 14, 2.0, accent);
     drawCenteredText(title, x + @divTrunc(w, 2), y + 28, 34, accent);
     drawCenteredText(subtitle, x + @divTrunc(w, 2), y + 86, 18, color_text);
+}
+
+fn drawWebTransportFooter() void {
+    if (comptime builtin.os.tag != .emscripten) return;
+
+    const status_text = web_transport.status().text();
+    const last_error = web_transport.lastError();
+    const error_text = if (last_error == .none) "none" else last_error.text();
+    rl.drawText(
+        rl.textFormat("Web transport: %s | peers %i | queued %i | last error %s", .{
+            status_text.ptr,
+            @as(i32, web_transport.peerCount()),
+            @as(i32, @intCast(web_transport.queuedPacketCount())),
+            error_text.ptr,
+        }),
+        32,
+        screen_height - 20,
+        12,
+        color_text_dim,
+    );
 }
 
 fn exitInstructionText() [:0]const u8 {
