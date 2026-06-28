@@ -15,18 +15,22 @@ Regeneration uses `esbuild@0.25.5`. The current lockfile was generated with Node
 
 ## Local Zigfall patch
 
-After esbuild writes the upstream bundle, `patch-trystero-bundle.mjs` applies a small Zigfall-local patch to Trystero's action reassembly path for the public `pkt` action used by `web/zigfall_transport.mjs`.
+After esbuild writes the upstream bundle, `patch-trystero-bundle.mjs` applies a Zigfall-local fail-closed patch to Trystero's action reassembly path used by `web/zigfall_transport.mjs`.
 
-The patch mirrors `src/protocol.zig` / `protocol.MaxPacketSize = 512`:
+The patch mirrors `src/protocol.zig` / `protocol.MaxPacketSize = 512` for public game traffic and keeps Trystero control traffic finite:
 
-- Tracks accumulated reassembled payload bytes per peer/type/nonce before appending a chunk to Trystero's pending `chunks` array.
-- Allows normal `pkt` payloads up to exactly 512 bytes.
-- Drops and clears the transmission as soon as the next chunk would exceed 512 bytes, and suppresses later tail delivery for that nonce.
+- Allows only the public `pkt` action plus the required Trystero room-control actions (`@_ping`, `@_pong`, `@_signal`, `@_leave`, `@_hsdata`, `@_hsready`). Unknown public actions and unused internals are dropped before any chunk target is allocated.
+- Tracks accumulated reassembled payload bytes and chunk counts per peer/type/nonce before appending a chunk to Trystero's pending `chunks` array.
+- Allows normal single-frame final binary `pkt` payloads up to exactly 512 bytes.
+- Rejects all non-final/chunked `pkt` frames before appending to Trystero's pending `chunks` array, retaining only bounded dropped markers to suppress later tails for the same nonce while unrelated single-frame final `pkt` payloads remain deliverable.
+- Drops and clears/marks any invalid `pkt` transmission before it can exceed 512 bytes, and suppresses later tail delivery for that nonce when tracked.
 - Rejects `pkt` metadata chunks and all non-binary `pkt` frames before Trystero JSON/string parsing. Zigfall only sends opaque binary packets on `pkt`.
+- Bounds dropped/unfinished `pkt` nonces to one per peer/eight globally. Required control actions have separate finite caps (64 KiB per transmission, a finite per-transmission chunk cap, four unfinished nonces per peer, sixteen globally), and zero-length non-final chunks are rejected before buffering for every allowed action.
+- Drops malformed non-binary payloads if Trystero JSON/string decoding fails at completion.
 
-Trystero's wire chunk header is 36 bytes (`payloadIndex` in the bundle), so an exact 512-byte Zigfall packet is a 548-byte Trystero data-channel message. The cap applies to accumulated action payload bytes, not to that per-chunk framing. This cannot stop the browser/WebRTC stack from delivering one already-received data-channel message to JavaScript, but it prevents Trystero from growing an unbounded pending reassembly buffer for oversize `pkt` payloads before Zigfall's adapter-level 512-byte check runs.
+Trystero's wire chunk header is 36 bytes (`payloadIndex` in the bundle), so an exact 512-byte Zigfall packet is a 548-byte Trystero data-channel message. The cap applies to accumulated action payload bytes, not to that per-chunk framing. This cannot stop the browser/WebRTC stack from delivering one already-received data-channel message to JavaScript, but it prevents Trystero from growing an unbounded pending reassembly buffer for hostile action/chunk streams before Zigfall's adapter-level 512-byte check runs. Because Zigfall packets are at most 512 bytes, valid `pkt` traffic must be a single final Trystero frame; non-final `pkt` frames are dropped without retaining payload chunks.
 
-`tools/test_trystero_pkt_limit.mjs` regression-tests the patched bundle by importing the actual action-wire code, proving exact 512-byte payloads still deliver, multi-chunk oversize payloads clear pending chunks before buffered payload bytes exceed 512, and malformed non-binary `pkt` frames do not reach Trystero JSON parsing.
+`tools/test_trystero_pkt_limit.mjs` regression-tests the patched bundle by importing the actual action-wire code, proving exact 512-byte typed-array-style `pkt` payloads still deliver, single-frame oversize payloads drop, non-final and repeated zero-length non-final `pkt` chunks retain no pending chunks and suppress tails, malformed non-binary `pkt` frames do not reach Trystero JSON parsing, unknown public actions are dropped before buffering, allowed control actions still support bounded chunked delivery, zero-length non-final control chunks retain no pending chunks, over-cap control chunks are cleared/dropped, and many unfinished/chunked `pkt` attempts stay bounded.
 
 ## Regenerate
 
@@ -49,7 +53,7 @@ sha256sum trystero-nostr.bundle.mjs
 Current generated artifact:
 
 ```text
-b13242f9f6de4bc1dcbc8903855efca16937aa7408275f3fac95b19e45bb3c60  trystero-nostr.bundle.mjs
+3723fa68011b856f05cc47f35e1dba4581abb588b9236f3fe16309b5151f2063  trystero-nostr.bundle.mjs
 ```
 
 If the bundle changes intentionally, update this checksum, keep the lockfile in sync, and re-run the JavaScript regression plus the normal Zigfall native/web build checks.

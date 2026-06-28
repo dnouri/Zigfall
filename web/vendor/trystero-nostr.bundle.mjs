@@ -1293,12 +1293,101 @@ var tagIndex = 34;
 var progressIndex = 35;
 var payloadIndex = 36;
 var chunkSize = 16 * 2 ** 10 - payloadIndex;
-// Zigfall local patch: the public transport only accepts protocol.MaxPacketSize
-// (512-byte) packets on the "pkt" action. Enforce that limit while Trystero
-// reassembles chunks so an oversize peer payload is dropped before it can grow
-// an unbounded pending chunks array.
-var zigfallPktActionName = "pkt";
-var zigfallMaxPktActionPayloadBytes = 512;
+// Zigfall local patch: fail closed in Trystero's receive reassembly path.
+// The public transport accepts only opaque protocol.MaxPacketSize (512-byte)
+// packets on the "pkt" action. Unknown public actions and unused internals are
+// dropped before chunk buffering; required Trystero control actions get finite
+// per-transmission and pending-buffer byte/chunk/nonce caps.
+var zigfallGameActionName = "pkt";
+var zigfallControlActionNames = new Set(["@_ping", "@_pong", "@_signal", "@_leave", "@_hsdata", "@_hsready"]);
+var zigfallPktReceivePolicy = Object.freeze({
+  kind: "pkt",
+  requireBinary: true,
+  allowMeta: false,
+  requireSingleFrame: true,
+  maxPendingChunksPerTransmission: 1,
+  maxPayloadBytes: 512,
+  maxPendingNoncesPerPeer: 1,
+  maxPendingNoncesGlobal: 8,
+  maxPendingBytesPerPeer: 512,
+  maxPendingBytesGlobal: 512 * 8,
+  dropNewCompleteWhilePeerPending: false
+});
+var zigfallControlReceivePolicy = Object.freeze({
+  kind: "control",
+  requireBinary: false,
+  allowMeta: false,
+  requireSingleFrame: false,
+  maxPendingChunksPerTransmission: Math.ceil(64 * 1024 / chunkSize),
+  maxPayloadBytes: 64 * 1024,
+  maxPendingNoncesPerPeer: 4,
+  maxPendingNoncesGlobal: 16,
+  maxPendingBytesPerPeer: 128 * 1024,
+  maxPendingBytesGlobal: 512 * 1024,
+  dropNewCompleteWhilePeerPending: false
+});
+var zigfallActionReceivePolicy = (type) => type === zigfallGameActionName ? zigfallPktReceivePolicy : zigfallControlActionNames.has(type) ? zigfallControlReceivePolicy : null;
+var zigfallPendingPayloadBytes = (target) => target?.zigfallPayloadBytes ?? target?.chunks?.reduce((a, c) => a + c.byteLength, 0) ?? 0;
+var zigfallPendingChunkCount = (target) => target?.chunks?.length ?? 0;
+var zigfallPendingStats = (pendingTransmissions, peerId, kind) => {
+  const stats = { peerBytes: 0, peerNonces: 0, globalBytes: 0, globalNonces: 0 };
+  entries(pendingTransmissions).forEach(([id, byType]) => {
+    entries(byType).forEach(([type, byNonce]) => {
+      const policy = zigfallActionReceivePolicy(type);
+      if (!policy || policy.kind !== kind) return;
+      entries(byNonce).forEach(([, target]) => {
+        const bytes = zigfallPendingPayloadBytes(target);
+        stats.globalBytes += bytes;
+        stats.globalNonces += 1;
+        if (id === peerId) {
+          stats.peerBytes += bytes;
+          stats.peerNonces += 1;
+        }
+      });
+    });
+  });
+  return stats;
+};
+var zigfallClearPendingTransmission = (pendingTransmissions, id, type, nonce) => {
+  const byPeer = pendingTransmissions[id];
+  const byType = byPeer?.[type];
+  if (!byType) return;
+  delete byType[nonce];
+  if (keys(byType).length === 0) delete byPeer[type];
+  if (keys(byPeer).length === 0) delete pendingTransmissions[id];
+};
+var zigfallRememberDroppedTransmission = (pendingTransmissions, id, type, nonce, policy) => {
+  const existingTarget = pendingTransmissions[id]?.[type]?.[nonce];
+  if (existingTarget) {
+    existingTarget.chunks = [];
+    existingTarget.zigfallPayloadBytes = 0;
+    existingTarget.zigfallDropped = true;
+    return;
+  }
+  const stats = zigfallPendingStats(pendingTransmissions, id, policy.kind);
+  if (stats.peerNonces >= policy.maxPendingNoncesPerPeer || stats.globalNonces >= policy.maxPendingNoncesGlobal) return;
+  pendingTransmissions[id] ?? (pendingTransmissions[id] = {});
+  pendingTransmissions[id][type] ?? (pendingTransmissions[id][type] = {});
+  pendingTransmissions[id][type][nonce] = { chunks: [], zigfallPayloadBytes: 0, zigfallDropped: true };
+};
+var zigfallCanBufferActionChunk = (pendingTransmissions, peerId, type, nonce, existingTarget, payloadByteLength, isLast, isMeta, isBinary, isJson, policy) => {
+  if (isMeta && !policy.allowMeta) return false;
+  if (policy.requireBinary && !isBinary) return false;
+  if (policy.requireSingleFrame && !isLast) return false;
+  if (!isLast && payloadByteLength === 0) return false;
+  const nextChunkCount = zigfallPendingChunkCount(existingTarget) + (isMeta ? 0 : 1);
+  if (nextChunkCount > policy.maxPendingChunksPerTransmission) return false;
+  if (!isLast && nextChunkCount >= policy.maxPendingChunksPerTransmission) return false;
+  const currentPayloadBytes = zigfallPendingPayloadBytes(existingTarget);
+  const nextPayloadBytes = currentPayloadBytes + payloadByteLength;
+  if (nextPayloadBytes > policy.maxPayloadBytes) return false;
+  const stats = zigfallPendingStats(pendingTransmissions, peerId, policy.kind);
+  if (!existingTarget && isLast) return !policy.dropNewCompleteWhilePeerPending || stats.peerNonces === 0;
+  if (!existingTarget && (stats.peerNonces >= policy.maxPendingNoncesPerPeer || stats.globalNonces >= policy.maxPendingNoncesGlobal)) return false;
+  if (stats.peerBytes + payloadByteLength > policy.maxPendingBytesPerPeer) return false;
+  if (stats.globalBytes + payloadByteLength > policy.maxPendingBytesGlobal) return false;
+  return true;
+};
 var oneByteMax = 255;
 var twoByteMax = 65535;
 var buffLowEvent = "bufferedamountlow";
@@ -1435,7 +1524,9 @@ var createActionWireManager = ({ getPeer, getPeerIds, canReceiveFromPeer, throwI
     const buffer = new Uint8Array(data);
     const type = decodeBytes(buffer.subarray(typeIndex, nonceIndex)).replaceAll("\0", "");
     const action = actions[type];
-    if (!canReceiveFromPeer(id, Boolean(action?.options.receiveWhilePending))) return;
+    const zigfallReceivePolicy = zigfallActionReceivePolicy(type);
+    if (!action || !zigfallReceivePolicy) return;
+    if (!canReceiveFromPeer(id, Boolean(action.options.receiveWhilePending))) return;
     const nonce = (buffer[nonceIndex] ?? 0) << 8 | (buffer[33] ?? 0);
     const tag2 = buffer[tagIndex] ?? 0;
     const progress = buffer[progressIndex] ?? 0;
@@ -1444,42 +1535,47 @@ var createActionWireManager = ({ getPeer, getPeerIds, canReceiveFromPeer, throwI
     const isMeta = Boolean(tag2 & 2);
     const isBinary = Boolean(tag2 & 4);
     const isJson = Boolean(tag2 & 8);
+    const existingTarget = pendingTransmissions[id]?.[type]?.[nonce];
+    if (existingTarget?.zigfallDropped) {
+      if (isLast) zigfallClearPendingTransmission(pendingTransmissions, id, type, nonce);
+      return;
+    }
+    if (!zigfallCanBufferActionChunk(pendingTransmissions, id, type, nonce, existingTarget, payload.byteLength, isLast, isMeta, isBinary, isJson, zigfallReceivePolicy)) {
+      if (isLast) {
+        if (existingTarget) zigfallClearPendingTransmission(pendingTransmissions, id, type, nonce);
+      } else {
+        zigfallRememberDroppedTransmission(pendingTransmissions, id, type, nonce, zigfallReceivePolicy);
+      }
+      return;
+    }
     pendingTransmissions[id] ?? (pendingTransmissions[id] = {});
     (_a = pendingTransmissions[id])[type] ?? (_a[type] = {});
-    const target = (_b2 = pendingTransmissions[id][type])[nonce] ?? (_b2[nonce] = { chunks: [] });
-    if (type === zigfallPktActionName) {
-      if (target.zigfallDropped) {
-        if (isLast) delete pendingTransmissions[id][type][nonce];
+    const target = existingTarget ?? ((_b2 = pendingTransmissions[id][type])[nonce] = { chunks: [], zigfallPayloadBytes: 0 });
+    target.zigfallPayloadBytes = (target.zigfallPayloadBytes ?? 0) + payload.byteLength;
+    if (isMeta) {
+      try {
+        target.meta = fromJson(decodeBytes(payload));
+      } catch {
+        zigfallClearPendingTransmission(pendingTransmissions, id, type, nonce);
         return;
       }
-      if (isMeta || !isBinary) {
-        target.zigfallDropped = true;
-        target.chunks = [];
-        target.zigfallPayloadBytes = 0;
-        if (isLast) delete pendingTransmissions[id][type][nonce];
-        return;
-      }
-      const nextPayloadBytes = (target.zigfallPayloadBytes ?? 0) + payload.byteLength;
-      if (nextPayloadBytes > zigfallMaxPktActionPayloadBytes) {
-        target.zigfallDropped = true;
-        target.chunks = [];
-        target.zigfallPayloadBytes = 0;
-        if (isLast) delete pendingTransmissions[id][type][nonce];
-        return;
-      }
-      target.zigfallPayloadBytes = nextPayloadBytes;
+    } else {
+      target.chunks.push(payload);
     }
-    if (isMeta) target.meta = fromJson(decodeBytes(payload));
-    else target.chunks.push(payload);
-    action?.onProgress(progress / oneByteMax, id, target.meta);
+    action.onProgress(progress / oneByteMax, id, target.meta);
     if (!isLast) return;
     const full = new Uint8Array(target.chunks.reduce((a, c) => a + c.byteLength, 0));
     target.chunks.reduce((a, c) => {
       full.set(c, a);
       return a + c.byteLength;
     }, 0);
-    delete pendingTransmissions[id][type][nonce];
-    const payloadValue = isBinary ? full : isJson ? fromJson(decodeBytes(full)) : decodeBytes(full);
+    zigfallClearPendingTransmission(pendingTransmissions, id, type, nonce);
+    let payloadValue;
+    try {
+      payloadValue = isBinary ? full : isJson ? fromJson(decodeBytes(full)) : decodeBytes(full);
+    } catch {
+      return;
+    }
     if (action) {
       action.onComplete(payloadValue, id, target.meta);
       return;
@@ -1495,9 +1591,30 @@ var createActionWireManager = ({ getPeer, getPeerIds, canReceiveFromPeer, throwI
     handleData,
     __zigfallTestPendingPayloadBytes: (id, type, nonce) => {
       const target = pendingTransmissions[id]?.[type]?.[nonce];
-      if (!target || target.zigfallDropped) return 0;
-      return target.chunks.reduce((a, c) => a + c.byteLength, 0);
+      return zigfallPendingPayloadBytes(target);
     },
+    __zigfallTestPendingChunkCount: (id, type, nonce) => {
+      const target = pendingTransmissions[id]?.[type]?.[nonce];
+      return zigfallPendingChunkCount(target);
+    },
+    __zigfallTestPendingPayloadBytesForPeer: (id, type) => values(pendingTransmissions[id]?.[type] ?? {}).reduce((a, target) => a + zigfallPendingPayloadBytes(target), 0),
+    __zigfallTestPendingPayloadBytesGlobal: (type) => values(pendingTransmissions).reduce((a, byType) => a + values(byType[type] ?? {}).reduce((b, target) => b + zigfallPendingPayloadBytes(target), 0), 0),
+    __zigfallTestPendingNonceCountForPeer: (id, type) => keys(pendingTransmissions[id]?.[type] ?? {}).length,
+    __zigfallTestPendingNonceCountGlobal: (type) => values(pendingTransmissions).reduce((a, byType) => a + keys(byType[type] ?? {}).length, 0),
+    __zigfallTestReceiveLimits: () => ({
+      pktRequireSingleFrame: zigfallPktReceivePolicy.requireSingleFrame,
+      pktMaxPendingChunksPerTransmission: zigfallPktReceivePolicy.maxPendingChunksPerTransmission,
+      pktMaxPendingNoncesPerPeer: zigfallPktReceivePolicy.maxPendingNoncesPerPeer,
+      pktMaxPendingNoncesGlobal: zigfallPktReceivePolicy.maxPendingNoncesGlobal,
+      pktMaxPendingBytesPerPeer: zigfallPktReceivePolicy.maxPendingBytesPerPeer,
+      pktMaxPendingBytesGlobal: zigfallPktReceivePolicy.maxPendingBytesGlobal,
+      controlMaxPayloadBytes: zigfallControlReceivePolicy.maxPayloadBytes,
+      controlMaxPendingChunksPerTransmission: zigfallControlReceivePolicy.maxPendingChunksPerTransmission,
+      controlMaxPendingNoncesPerPeer: zigfallControlReceivePolicy.maxPendingNoncesPerPeer,
+      controlMaxPendingNoncesGlobal: zigfallControlReceivePolicy.maxPendingNoncesGlobal,
+      controlMaxPendingBytesPerPeer: zigfallControlReceivePolicy.maxPendingBytesPerPeer,
+      controlMaxPendingBytesGlobal: zigfallControlReceivePolicy.maxPendingBytesGlobal
+    }),
     clearPeer: (id) => {
       delete pendingTransmissions[id];
     }

@@ -135,13 +135,15 @@ controls.
 
 The web artifact also includes an inactive Trystero/Nostr transport adapter for
 future online play. It is packaged as local static JavaScript copied by
-`build.zig`; production pages do not import Trystero from a runtime CDN, and
-native `zig build` does not require Node, npm, Trystero, browser APIs, or
-network access. Calling `connect()` still uses Trystero's default Nostr/public
-WebRTC signaling and ICE/STUN behavior at runtime, so browser network access is
-needed only for that manual/future online transport path. The adapter is
-observable in-game through the small web-only transport footer and manually from
-the browser console:
+`build.zig`; the shell imports it during Emscripten `preRun` before WASM `main`
+starts. Production pages do not import Trystero from a runtime CDN, and native
+`zig build` does not require Node, npm, Trystero, browser APIs, or network
+access. Calling `connect()` still uses Trystero's default Nostr/public WebRTC
+signaling and ICE/STUN behavior at runtime, so browser network access is needed
+only for that manual/future online transport path. The adapter selects the first
+room peer as the single 1v1 opponent, targets sends to that peer, and reports a
+busy state while extra peers are present. It is observable in-game through the
+small web-only transport footer and manually from the browser console:
 
 ```js
 ZigfallTransport.connect("zigfall-phase5-local")

@@ -213,6 +213,23 @@
           console.error.apply(console, arguments);
         },
         canvas: canvasElement,
+        preRun: [function() {
+          if (globalThis.ZigfallTransport && typeof globalThis.ZigfallTransport.statusCode === "function") return;
+
+          var dependency = "zigfall_transport";
+          Module.addRunDependency(dependency);
+          import("./zigfall_transport.mjs").then(function() {
+            if (!globalThis.ZigfallTransport || typeof globalThis.ZigfallTransport.statusCode !== "function") {
+              throw new Error("zigfall_transport.mjs did not install globalThis.ZigfallTransport");
+            }
+          }).catch(function(err) {
+            globalThis.ZigfallTransportLoadError = err;
+            console.error("[ZigfallTransport] failed to load", err);
+            Module.setStatus("Network transport failed to load; see JavaScript console.");
+          }).finally(function() {
+            Module.removeRunDependency(dependency);
+          });
+        }],
         setStatus: function(text) {
           if (!Module.setStatus.last) Module.setStatus.last = { time: Date.now(), text: "" };
           if (text === Module.setStatus.last.text) return;
@@ -253,7 +270,7 @@
       };
     </script>
 
-    <script type="module" src="zigfall_transport.mjs"></script>
+    <!-- Module.preRun imports zigfall_transport.mjs before WASM main starts. -->
 
     <!-- Emscripten replaces this token with the zigfall.js loader. -->
     {{{ SCRIPT }}}

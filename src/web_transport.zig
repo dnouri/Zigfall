@@ -22,6 +22,7 @@ pub const Status = enum(u8) {
     disconnected = 2,
     connecting = 3,
     connected = 4,
+    busy = 5,
 
     pub fn text(self: Status) [:0]const u8 {
         return switch (self) {
@@ -30,6 +31,7 @@ pub const Status = enum(u8) {
             .disconnected => "disconnected",
             .connecting => "connecting",
             .connected => "connected",
+            .busy => "busy",
         };
     }
 };
@@ -46,6 +48,7 @@ pub const ErrorCode = enum(u8) {
     queue_full = 8,
     send_failed = 9,
     buffer_too_small = 10,
+    busy = 11,
 
     pub fn text(self: ErrorCode) [:0]const u8 {
         return switch (self) {
@@ -60,6 +63,7 @@ pub const ErrorCode = enum(u8) {
             .queue_full => "queue full",
             .send_failed => "send failed",
             .buffer_too_small => "buffer too small",
+            .busy => "busy",
         };
     }
 };
@@ -162,7 +166,7 @@ fn mapSendResult(code: u8) SendError!void {
         .missing_js => error.MissingJs,
         .unavailable => error.Unavailable,
         .not_connected => error.NotConnected,
-        .no_peer => error.NoPeer,
+        .no_peer, .busy => error.NoPeer,
         .packet_too_large => error.PacketTooLarge,
         .send_failed => error.SendFailed,
         else => error.SendFailed,
