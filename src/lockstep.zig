@@ -256,9 +256,10 @@ pub const Peer = struct {
         try self.expectRemoteProtocolSlot(state_hash.sender_slot);
 
         if (state_hash.frame_cursor < self.next_frame_to_simulate) {
-            const local_hash = self.state_hash_history.get(state_hash.frame_cursor) catch |err| {
-                self.recordProtocolError(.state_hash_too_old);
-                return err;
+            const local_hash = self.state_hash_history.get(state_hash.frame_cursor) catch |err| switch (err) {
+                // Stale integrity data can arrive after its local history has
+                // been evicted; it is not proof of protocol corruption.
+                error.StateHashTooOld => return,
             };
             try self.compareStateHashValue(state_hash.frame_cursor, local_hash, state_hash.state_hash);
             return;
@@ -414,7 +415,7 @@ const PendingStateHashes = struct {
 
     fn put(self: *PendingStateHashes, frame_cursor: u64, state_hash: u64, current_frame_cursor: u64) PendingStateHashError!void {
         if (frame_cursor < current_frame_cursor) return error.StateHashWindowExceeded;
-        if (frame_cursor - current_frame_cursor >= @as(u64, @intCast(MaxPendingStateHashFrames))) return error.StateHashWindowExceeded;
+        if (frame_cursor - current_frame_cursor > @as(u64, @intCast(MaxPendingStateHashFrames))) return error.StateHashWindowExceeded;
 
         for (&self.entries) |*entry| {
             if (entry.present and entry.frame_cursor == frame_cursor) {
@@ -952,10 +953,10 @@ test "future state hash is checked when frame cursor catches up" {
     try std.testing.expect(peer.isOk());
 }
 
-test "future state hash at window edge is accepted and stored" {
+test "future state hash at max buffered cursor is accepted and stored" {
     var peer = try Peer.init(testSettings(), .p1, 0, TestMatchId);
-    const window: u64 = @intCast(MaxPendingStateHashFrames);
-    const frame_cursor = peer.frameCursor() + window - 1;
+    const window: u64 = @intCast(MaxBufferedFrames);
+    const frame_cursor = peer.frameCursor() + window;
     const hash: u64 = 0x1234_5678_9abc_def0;
     const packet = try stateHashPacket(1, frame_cursor, hash);
 
@@ -984,10 +985,10 @@ test "more than thirty-two in-window future state hashes are accepted" {
     try std.testing.expect(peer.isOk());
 }
 
-test "future state hash at window limit is rejected" {
+test "future state hash beyond max buffered cursor is rejected" {
     var peer = try Peer.init(testSettings(), .p1, 0, TestMatchId);
-    const window: u64 = @intCast(MaxPendingStateHashFrames);
-    const frame_cursor = peer.frameCursor() + window;
+    const window: u64 = @intCast(MaxBufferedFrames);
+    const frame_cursor = peer.frameCursor() + window + 1;
     const packet = try stateHashPacket(1, frame_cursor, 0xaaaa_bbbb_cccc_dddd);
 
     try std.testing.expectError(error.StateHashWindowExceeded, peer.receiveBytes(packet.slice()));
@@ -998,8 +999,8 @@ test "future state hash at window limit is rejected" {
 test "huge future state hash is rejected without poisoning pending storage" {
     var pending = PendingStateHashes{};
     const current_frame_cursor: u64 = 7;
-    const window: u64 = @intCast(MaxPendingStateHashFrames);
-    const legitimate_frame_cursor = current_frame_cursor + window - 1;
+    const window: u64 = @intCast(MaxBufferedFrames);
+    const legitimate_frame_cursor = current_frame_cursor + window;
 
     try std.testing.expectError(
         error.StateHashWindowExceeded,
@@ -1029,14 +1030,22 @@ test "late retained state hash mismatch marks desync" {
     try expectDesync(peer.status, 0, bad_hash);
 }
 
-test "too old state hash is an explicit protocol error" {
+test "too old state hash is ignored and later runtime packets still work" {
     var peer = try Peer.init(testSettings(), .p1, 0, TestMatchId);
     const initial_hash = peer.stateHash();
     try stepNeutralFrames(&peer, MaxStateHashHistory);
 
     const packet = try stateHashPacket(1, 0, initial_hash);
-    try std.testing.expectError(error.StateHashTooOld, peer.receiveBytes(packet.slice()));
-    try expectProtocolError(peer.status, .state_hash_too_old);
+    try peer.receiveBytes(packet.slice());
+    try std.testing.expect(peer.isOk());
+
+    const next_frame = peer.frameCursor();
+    try peer.putInput(0, next_frame, .{});
+    const valid_remote = try inputBatchPacket(1, next_frame, &[_]controls.FrameInput{.{}});
+    try peer.receiveBytes(valid_remote.slice());
+    try std.testing.expectEqual(@as(usize, 1), try peer.stepAvailableMax(1));
+    try std.testing.expect(peer.isOk());
+    try std.testing.expectEqual(next_frame + 1, peer.frameCursor());
 }
 
 test "restart input is rejected for online lockstep stream" {
