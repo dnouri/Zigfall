@@ -267,10 +267,10 @@ fn drawLockedCells(state: *const game.Game) void {
         const visible_y: i32 = @intCast(y - game.HiddenRows);
         var x: usize = 0;
         while (x < game.BoardWidth) : (x += 1) {
-            if (state.board[y][x]) |kind| {
+            if (state.board[y][x]) |cell| {
                 const screen_x = board_x + @as(i32, @intCast(x)) * cell_size;
                 const screen_y = board_y + visible_y * cell_size;
-                drawCell(screen_x, screen_y, cell_size, pieceColor(kind));
+                drawCell(screen_x, screen_y, cell_size, cellColor(cell));
             }
         }
     }
@@ -530,6 +530,13 @@ fn pieceLabel(kind: game.PieceKind) [:0]const u8 {
         .z => "Z",
         .j => "J",
         .l => "L",
+    };
+}
+
+fn cellColor(cell: game.Cell) rl.Color {
+    return switch (cell) {
+        .piece => |kind| pieceColor(kind),
+        .garbage => rl.Color.init(112, 124, 142, 255),
     };
 }
 

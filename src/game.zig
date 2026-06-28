@@ -30,6 +30,29 @@ pub const PieceKind = enum(u3) {
     l,
 };
 
+pub const Cell = union(enum) {
+    piece: PieceKind,
+    garbage,
+
+    pub fn fromPiece(kind: PieceKind) Cell {
+        return .{ .piece = kind };
+    }
+
+    pub fn pieceKind(self: Cell) ?PieceKind {
+        return switch (self) {
+            .piece => |kind| kind,
+            .garbage => null,
+        };
+    }
+
+    pub fn isGarbage(self: Cell) bool {
+        return switch (self) {
+            .piece => false,
+            .garbage => true,
+        };
+    }
+};
+
 pub const Rotation = enum(u2) {
     spawn = 0,
     right = 1,
@@ -90,7 +113,54 @@ pub const StepResult = struct {
     lock_result: ?LockResult = null,
 };
 
-pub const Board = [BoardHeight][BoardWidth]?PieceKind;
+pub const GarbageInsertError = error{
+    HoleOutOfBounds,
+};
+
+pub const GarbageHole = enum(u4) {
+    c0 = 0,
+    c1 = 1,
+    c2 = 2,
+    c3 = 3,
+    c4 = 4,
+    c5 = 5,
+    c6 = 6,
+    c7 = 7,
+    c8 = 8,
+    c9 = 9,
+
+    pub fn init(hole_x: u8) GarbageInsertError!GarbageHole {
+        if (@as(usize, hole_x) >= BoardWidth) return error.HoleOutOfBounds;
+        return fromValidIndex(@as(usize, hole_x));
+    }
+
+    pub fn fromValidIndex(hole_x: usize) GarbageHole {
+        std.debug.assert(hole_x < BoardWidth);
+        return switch (hole_x) {
+            0 => .c0,
+            1 => .c1,
+            2 => .c2,
+            3 => .c3,
+            4 => .c4,
+            5 => .c5,
+            6 => .c6,
+            7 => .c7,
+            8 => .c8,
+            9 => .c9,
+            else => unreachable,
+        };
+    }
+
+    pub fn index(self: GarbageHole) usize {
+        return @as(usize, @intFromEnum(self));
+    }
+};
+
+comptime {
+    if (BoardWidth != 10) @compileError("GarbageHole enum must be updated when BoardWidth changes");
+}
+
+pub const Board = [BoardHeight][BoardWidth]?Cell;
 
 pub const all_piece_kinds = [_]PieceKind{ .i, .o, .t, .s, .z, .j, .l };
 
@@ -378,6 +448,68 @@ pub const Game = struct {
         return cleared;
     }
 
+    pub fn insertGarbageLine(self: *Game, hole_x: u8) GarbageInsertError!void {
+        try self.insertGarbageLines(&.{hole_x});
+    }
+
+    /// Insert garbage at the bottom, shifting existing board rows toward y = 0.
+    /// Occupied cells shifted out of row 0 top out the game. The active piece is
+    /// not moved or cleared; after the full batch is inserted, if the shifted
+    /// board overlaps it, `game_over` is set and `active` remains available for
+    /// post-frame inspection. Public hole values are validated for the whole
+    /// batch before any board mutation, so `HoleOutOfBounds` leaves the game
+    /// unchanged.
+    pub fn insertGarbageLines(self: *Game, holes: []const u8) GarbageInsertError!void {
+        for (holes) |hole_x| {
+            _ = try GarbageHole.init(hole_x);
+        }
+        if (self.game_over or holes.len == 0) return;
+
+        var top_out = false;
+        for (holes) |hole_x| {
+            self.insertGarbageLineUnchecked(GarbageHole.fromValidIndex(@as(usize, hole_x)), &top_out);
+        }
+
+        self.finishGarbageInsertion(top_out);
+    }
+
+    /// Infallible insertion for holes that were already validated or generated
+    /// by deterministic match state.
+    pub fn insertGarbageLineAt(self: *Game, hole: GarbageHole) void {
+        self.insertGarbageLinesAt(&.{hole});
+    }
+
+    /// Infallible batch insertion for bounded hole values. Like the public
+    /// checked wrapper, active-piece collision is evaluated once after the full
+    /// batch is inserted.
+    pub fn insertGarbageLinesAt(self: *Game, holes: []const GarbageHole) void {
+        if (self.game_over or holes.len == 0) return;
+
+        var top_out = false;
+        for (holes) |hole| {
+            self.insertGarbageLineUnchecked(hole, &top_out);
+        }
+
+        self.finishGarbageInsertion(top_out);
+    }
+
+    fn insertGarbageLineUnchecked(self: *Game, hole: GarbageHole, top_out: *bool) void {
+        if (rowOccupied(&self.board[0])) top_out.* = true;
+        var y: usize = 0;
+        while (y < BoardHeight - 1) : (y += 1) {
+            self.board[y] = self.board[y + 1];
+        }
+        self.board[BoardHeight - 1] = garbageRow(hole);
+    }
+
+    fn finishGarbageInsertion(self: *Game, top_out: bool) void {
+        var did_top_out = top_out;
+        if (self.active) |piece| {
+            if (self.collides(piece)) did_top_out = true;
+        }
+        if (did_top_out) self.game_over = true;
+    }
+
     pub fn collides(self: *const Game, piece: ActivePiece) bool {
         const blocks = blockPositions(piece);
         for (blocks) |point| {
@@ -478,7 +610,7 @@ pub const Game = struct {
             const x: usize = @intCast(point.x);
             const y: usize = @intCast(point.y);
             if (y < HiddenRows) top_out = true;
-            self.board[y][x] = piece.kind;
+            self.board[y][x] = Cell.fromPiece(piece.kind);
         }
 
         self.active = null;
@@ -895,18 +1027,31 @@ fn comboAttack(combo_after_lock: i32) u8 {
 }
 
 fn emptyBoard() Board {
-    return [_][BoardWidth]?PieceKind{emptyRow()} ** BoardHeight;
+    return [_][BoardWidth]?Cell{emptyRow()} ** BoardHeight;
 }
 
-fn emptyRow() [BoardWidth]?PieceKind {
-    return [_]?PieceKind{null} ** BoardWidth;
+fn emptyRow() [BoardWidth]?Cell {
+    return [_]?Cell{null} ** BoardWidth;
 }
 
-fn rowFull(row: *const [BoardWidth]?PieceKind) bool {
+fn garbageRow(hole: GarbageHole) [BoardWidth]?Cell {
+    var row = [_]?Cell{Cell.garbage} ** BoardWidth;
+    row[hole.index()] = null;
+    return row;
+}
+
+fn rowFull(row: *const [BoardWidth]?Cell) bool {
     for (row.*) |cell| {
         if (cell == null) return false;
     }
     return true;
+}
+
+fn rowOccupied(row: *const [BoardWidth]?Cell) bool {
+    for (row.*) |cell| {
+        if (cell != null) return true;
+    }
+    return false;
 }
 
 fn boardEmpty(board: *const Board) bool {
@@ -931,7 +1076,7 @@ fn fillRowExcept(game: *Game, y: usize, gaps: []const usize, kind: PieceKind) vo
                 break;
             }
         }
-        game.board[y][x] = if (is_gap) null else kind;
+        game.board[y][x] = if (is_gap) null else Cell.fromPiece(kind);
     }
 }
 
@@ -946,6 +1091,20 @@ fn markLastRotationForTest(game: *Game, piece: ActivePiece, from: Rotation, kick
         .kick_index = kick_index,
         .kick = pt(0, 0),
     };
+}
+
+fn expectPieceCell(expected: PieceKind, cell: ?Cell) !void {
+    try std.testing.expect(cell != null);
+    const actual = cell.?.pieceKind() orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqual(expected, actual);
+}
+
+fn expectGarbageCell(cell: ?Cell) !void {
+    try std.testing.expect(cell != null);
+    try std.testing.expect(cell.?.isGarbage());
 }
 
 test "seven bag produces one of each tetromino before repeat" {
@@ -979,7 +1138,7 @@ test "SRS kicks use JLSTZ and I tables" {
         .rotation = .spawn,
         .pos = .{ .x = 3, .y = 24 },
     };
-    t_game.board[24][4] = .z;
+    t_game.board[24][4] = Cell.fromPiece(.z);
 
     try std.testing.expect(t_game.tryRotate(.clockwise));
     try std.testing.expectEqual(Rotation.right, t_game.active.?.rotation);
@@ -994,7 +1153,7 @@ test "SRS kicks use JLSTZ and I tables" {
         .rotation = .spawn,
         .pos = .{ .x = 3, .y = 24 },
     };
-    i_game.board[24][5] = .z;
+    i_game.board[24][5] = Cell.fromPiece(.z);
 
     try std.testing.expect(i_game.tryRotate(.clockwise));
     try std.testing.expectEqual(Rotation.right, i_game.active.?.rotation);
@@ -1049,8 +1208,8 @@ test "collision and locking stop a piece at the floor" {
     const cleared = game.lockActive();
     try std.testing.expectEqual(@as(u8, 0), cleared);
     try std.testing.expectEqual(@as(u32, 1), game.pieces_locked);
-    try std.testing.expectEqual(PieceKind.o, game.board[BoardHeight - 1][5].?);
-    try std.testing.expectEqual(PieceKind.o, game.board[BoardHeight - 2][6].?);
+    try expectPieceCell(.o, game.board[BoardHeight - 1][5]);
+    try expectPieceCell(.o, game.board[BoardHeight - 2][6]);
     try std.testing.expect(game.active != null);
     try std.testing.expect(!game.game_over);
 }
@@ -1058,7 +1217,7 @@ test "collision and locking stop a piece at the floor" {
 test "locking a piece clears completed lines" {
     var game = Game.initNoSpawn(2);
     for (0..BoardWidth) |x| {
-        game.board[BoardHeight - 1][x] = .t;
+        game.board[BoardHeight - 1][x] = Cell.fromPiece(.t);
     }
     game.board[BoardHeight - 1][4] = null;
     game.board[BoardHeight - 1][5] = null;
@@ -1071,10 +1230,144 @@ test "locking a piece clears completed lines" {
     const cleared = game.lockActive();
     try std.testing.expectEqual(@as(u8, 1), cleared);
     try std.testing.expectEqual(@as(u32, 1), game.total_lines_cleared);
-    try std.testing.expectEqual(PieceKind.o, game.board[BoardHeight - 1][4].?);
-    try std.testing.expectEqual(PieceKind.o, game.board[BoardHeight - 1][5].?);
+    try expectPieceCell(.o, game.board[BoardHeight - 1][4]);
+    try expectPieceCell(.o, game.board[BoardHeight - 1][5]);
     try std.testing.expect(game.board[BoardHeight - 1][0] == null);
     try std.testing.expect(!game.game_over);
+}
+
+test "garbage insertion appends bottom row with hole and shifts cells upward" {
+    var game = Game.initNoSpawn(60);
+    game.board[BoardHeight - 1][0] = Cell.fromPiece(.i);
+    game.board[BoardHeight - 2][2] = Cell.fromPiece(.t);
+
+    try game.insertGarbageLine(3);
+
+    try expectPieceCell(.i, game.board[BoardHeight - 2][0]);
+    try expectPieceCell(.t, game.board[BoardHeight - 3][2]);
+    try std.testing.expect(game.board[BoardHeight - 1][3] == null);
+    for (0..BoardWidth) |x| {
+        if (x == 3) continue;
+        try expectGarbageCell(game.board[BoardHeight - 1][x]);
+    }
+    try std.testing.expect(!game.game_over);
+}
+
+test "garbage insertion rejects holes outside the board" {
+    var game = Game.initNoSpawn(61);
+    const before = game.board;
+
+    try std.testing.expectError(error.HoleOutOfBounds, game.insertGarbageLine(@intCast(BoardWidth)));
+
+    try std.testing.expectEqualDeep(before, game.board);
+    try std.testing.expect(!game.game_over);
+}
+
+test "external garbage insertion validates full batch before mutating" {
+    var game = Game.initNoSpawn(65);
+    game.board[BoardHeight - 1][0] = Cell.fromPiece(.i);
+    const before = game.board;
+    const holes = [_]u8{ 3, @intCast(BoardWidth), 2 };
+
+    try std.testing.expectError(error.HoleOutOfBounds, game.insertGarbageLines(&holes));
+
+    try std.testing.expectEqualDeep(before, game.board);
+    try std.testing.expect(!game.game_over);
+}
+
+// Public wrappers reject arbitrary bytes, while bounded garbage holes are
+// valid-by-construction for deterministic generated insertion.
+test "bounded garbage hole insertion is infallible once constructed" {
+    try std.testing.expectError(error.HoleOutOfBounds, GarbageHole.init(@intCast(BoardWidth)));
+
+    var game = Game.initNoSpawn(67);
+    const hole = try GarbageHole.init(2);
+    game.insertGarbageLineAt(hole);
+
+    try std.testing.expect(game.board[BoardHeight - 1][2] == null);
+    try expectGarbageCell(game.board[BoardHeight - 1][0]);
+    try std.testing.expect(!game.game_over);
+}
+
+test "bounded garbage insertion finalizes top-out internally" {
+    var ejection = Game.initNoSpawn(68);
+    ejection.board[0][1] = Cell.fromPiece(.s);
+    ejection.insertGarbageLineAt(GarbageHole.fromValidIndex(0));
+    try std.testing.expect(ejection.game_over);
+
+    var collision = Game.initNoSpawn(69);
+    const active_piece = ActivePiece{
+        .kind = .o,
+        .rotation = .spawn,
+        .pos = .{ .x = 3, .y = BoardHeightI - 2 },
+    };
+    collision.active = active_piece;
+    collision.insertGarbageLinesAt(&.{GarbageHole.fromValidIndex(0)});
+    try std.testing.expect(collision.game_over);
+    try std.testing.expectEqual(active_piece, collision.active.?);
+    try std.testing.expect(collision.collides(active_piece));
+}
+
+test "multi-line garbage collision uses final batch state" {
+    var game = Game.initNoSpawn(66);
+    const active_piece = ActivePiece{
+        .kind = .i,
+        .rotation = .right,
+        .pos = .{ .x = 2, .y = BoardHeightI - 6 },
+    };
+    game.active = active_piece;
+    game.board[BoardHeight - 2][4] = Cell.fromPiece(.s);
+
+    try std.testing.expect(!game.collides(active_piece));
+    try game.insertGarbageLines(&.{ 4, 4, 4, 4, 4 });
+
+    try std.testing.expect(!game.game_over);
+    try std.testing.expect(!game.collides(active_piece));
+    try expectPieceCell(.s, game.board[BoardHeight - 7][4]);
+}
+
+test "garbage insertion top-outs when row zero ejects occupied cells" {
+    var game = Game.initNoSpawn(62);
+    game.board[0][1] = Cell.fromPiece(.s);
+
+    try game.insertGarbageLine(0);
+
+    try std.testing.expect(game.game_over);
+    try std.testing.expect(game.board[0][1] == null);
+    try std.testing.expect(game.board[BoardHeight - 1][0] == null);
+    try expectGarbageCell(game.board[BoardHeight - 1][1]);
+}
+
+test "garbage insertion top-outs when shifted board collides with active piece" {
+    var game = Game.initNoSpawn(63);
+    const active_piece = ActivePiece{
+        .kind = .o,
+        .rotation = .spawn,
+        .pos = .{ .x = 3, .y = BoardHeightI - 2 },
+    };
+    game.active = active_piece;
+
+    try std.testing.expect(!game.collides(active_piece));
+    try game.insertGarbageLine(0);
+
+    try std.testing.expect(game.game_over);
+    try std.testing.expectEqual(active_piece, game.active.?);
+    try std.testing.expect(game.collides(active_piece));
+}
+
+test "line clearing treats piece cells and garbage cells as occupied" {
+    var game = Game.initNoSpawn(64);
+    game.board[BoardHeight - 2][0] = Cell.fromPiece(.l);
+    for (0..BoardWidth) |x| {
+        game.board[BoardHeight - 1][x] = if (x == 4) Cell.fromPiece(.t) else Cell.garbage;
+    }
+
+    const cleared = game.clearFullLines();
+
+    try std.testing.expectEqual(@as(u8, 1), cleared);
+    try std.testing.expectEqual(@as(u32, 1), game.total_lines_cleared);
+    try expectPieceCell(.l, game.board[BoardHeight - 1][0]);
+    try std.testing.expect(game.board[BoardHeight - 2][0] == null);
 }
 
 test "hold can be used only once per active piece" {
@@ -1109,7 +1402,7 @@ test "game over when spawn is blocked or a piece locks in hidden rows" {
     for (blockPositions(spawn_piece)) |block| {
         const x: usize = @intCast(block.x);
         const y: usize = @intCast(block.y);
-        blocked.board[y][x] = .z;
+        blocked.board[y][x] = Cell.fromPiece(.z);
     }
 
     try std.testing.expect(!blocked.spawnNext());
@@ -1129,9 +1422,9 @@ test "game over when spawn is blocked or a piece locks in hidden rows" {
 test "T-spin single double triple and mini are detected" {
     var single = Game.initNoSpawn(20);
     fillRowExcept(&single, 36, &.{ 3, 4, 5 }, .j);
-    single.board[35][3] = .j;
-    single.board[35][5] = .j;
-    single.board[37][3] = .j;
+    single.board[35][3] = Cell.fromPiece(.j);
+    single.board[35][5] = Cell.fromPiece(.j);
+    single.board[37][3] = Cell.fromPiece(.j);
     markLastRotationForTest(&single, .{
         .kind = .t,
         .rotation = .spawn,
@@ -1146,7 +1439,7 @@ test "T-spin single double triple and mini are detected" {
     var double = Game.initNoSpawn(21);
     fillRowExcept(&double, 35, &.{4}, .j);
     fillRowExcept(&double, 36, &.{ 3, 4, 5 }, .j);
-    double.board[37][3] = .j;
+    double.board[37][3] = Cell.fromPiece(.j);
     markLastRotationForTest(&double, .{
         .kind = .t,
         .rotation = .spawn,
@@ -1173,9 +1466,9 @@ test "T-spin single double triple and mini are detected" {
 
     var mini = Game.initNoSpawn(23);
     fillRowExcept(&mini, 36, &.{ 3, 4, 5 }, .j);
-    mini.board[35][3] = .j;
-    mini.board[37][3] = .j;
-    mini.board[37][5] = .j;
+    mini.board[35][3] = Cell.fromPiece(.j);
+    mini.board[37][3] = Cell.fromPiece(.j);
+    mini.board[37][5] = Cell.fromPiece(.j);
     markLastRotationForTest(&mini, .{
         .kind = .t,
         .rotation = .spawn,
@@ -1189,7 +1482,7 @@ test "T-spin single double triple and mini are detected" {
 
 test "combo counter back-to-back and scoring metadata" {
     var combo = Game.initNoSpawn(30);
-    combo.board[0][0] = .i;
+    combo.board[0][0] = Cell.fromPiece(.i);
     fillRowExcept(&combo, BoardHeight - 1, &.{ 4, 5 }, .j);
     combo.active = .{
         .kind = .o,
@@ -1202,7 +1495,7 @@ test "combo counter back-to-back and scoring metadata" {
     try std.testing.expectEqual(@as(u32, 0), first.combo_bonus_points);
 
     combo.board = emptyBoard();
-    combo.board[0][0] = .i;
+    combo.board[0][0] = Cell.fromPiece(.i);
     fillRowExcept(&combo, BoardHeight - 1, &.{ 4, 5 }, .j);
     combo.active = .{
         .kind = .o,
@@ -1214,7 +1507,7 @@ test "combo counter back-to-back and scoring metadata" {
     try std.testing.expectEqual(@as(u32, 50), second.combo_bonus_points);
 
     combo.board = emptyBoard();
-    combo.board[0][0] = .i;
+    combo.board[0][0] = Cell.fromPiece(.i);
     combo.active = .{
         .kind = .o,
         .rotation = .spawn,
@@ -1225,7 +1518,7 @@ test "combo counter back-to-back and scoring metadata" {
     try std.testing.expectEqual(@as(i32, -1), miss.combo_after_lock);
 
     var b2b = Game.initNoSpawn(31);
-    b2b.board[0][0] = .i;
+    b2b.board[0][0] = Cell.fromPiece(.i);
     for (36..40) |y| fillRowExcept(&b2b, y, &.{4}, .j);
     b2b.active = .{
         .kind = .i,
@@ -1240,7 +1533,7 @@ test "combo counter back-to-back and scoring metadata" {
     try std.testing.expectEqual(@as(u32, 800), first_quad.base_score_points);
 
     b2b.board = emptyBoard();
-    b2b.board[0][0] = .i;
+    b2b.board[0][0] = Cell.fromPiece(.i);
     for (36..40) |y| fillRowExcept(&b2b, y, &.{4}, .j);
     b2b.active = .{
         .kind = .i,
@@ -1290,7 +1583,7 @@ test "pure drop distance and ghost piece do not mutate active piece" {
     try std.testing.expectEqual(@as(i32, 38), ghost.pos.y);
     try std.testing.expectEqual(before, game.active.?);
 
-    game.board[BoardHeight - 1][4] = .i;
+    game.board[BoardHeight - 1][4] = Cell.fromPiece(.i);
     try std.testing.expectEqual(@as(u32, 7), game.activeDropDistance());
     const blocked_ghost = game.ghostPiece().?;
     try std.testing.expectEqual(@as(i32, 37), blocked_ghost.pos.y);
