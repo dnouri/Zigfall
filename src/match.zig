@@ -218,9 +218,11 @@ pub const PlayerGarbageStepResult = struct {
     generated: u32 = 0,
     /// Generated lines spent canceling this player's pre-existing pending queue.
     canceled: u32 = 0,
-    /// Generated lines accepted into the opponent pending queue after
-    /// cancellation. This can be lower than generated-minus-canceled only when
-    /// the abuse guard saturates an already-near-maximum queue.
+    /// Generated lines accepted into the opponent pending queue during this
+    /// frame's queue phase. Same-frame non-clearing locks may immediately
+    /// insert these lines, so the opponent's final pending count can be lower.
+    /// This can be lower than generated-minus-canceled only when the abuse
+    /// guard saturates an already-near-maximum queue.
     queued: u32 = 0,
     /// Pending incoming lines inserted into this player's board this frame.
     inserted: u32 = 0,
@@ -422,23 +424,41 @@ pub const Match = struct {
     }
 
     fn resolveModernGarbage(self: *Match, result: *MatchStepResult) void {
-        var staged_incoming = [_]u32{0} ** PlayerCount;
+        var attack_lines_by_attacker = [_]u32{0} ** PlayerCount;
+        var incoming_lines_by_recipient = [_]u32{0} ** PlayerCount;
 
-        // Same-frame attacks only cancel garbage that was already pending on
-        // the attacker. Remainders are staged so opponents cannot cross-cancel
-        // attacks produced during the same frame.
-        for (0..PlayerCount) |player_index| {
-            const lock_result = result.players[player_index].lock_result orelse continue;
+        // Option B phase order:
+        // - snapshot generated attacks before mutating pending queues;
+        // - cancel only each attacker's pre-existing pending garbage;
+        // - queue remainders for recipients before non-clearing insertion.
+        // Same-frame remainders can insert immediately but cannot cross-cancel.
+        for (0..PlayerCount) |attacker_index| {
+            const lock_result = result.players[attacker_index].lock_result orelse continue;
             const attack_lines = @as(u32, lock_result.attack_lines);
-            result.players[player_index].garbage.generated = attack_lines;
+            attack_lines_by_attacker[attacker_index] = attack_lines;
+            result.players[attacker_index].garbage.generated = attack_lines;
+        }
 
-            const canceled = @min(attack_lines, self.players[player_index].pending_garbage);
-            self.players[player_index].pending_garbage -= canceled;
-            result.players[player_index].garbage.canceled = canceled;
+        for (0..PlayerCount) |attacker_index| {
+            const attack_lines = attack_lines_by_attacker[attacker_index];
+            if (attack_lines == 0) continue;
+
+            const canceled = @min(attack_lines, self.players[attacker_index].pending_garbage);
+            self.players[attacker_index].pending_garbage -= canceled;
+            result.players[attacker_index].garbage.canceled = canceled;
 
             const remainder = attack_lines - canceled;
-            const opponent_index = opponentIndex(player_index);
-            staged_incoming[opponent_index] = saturatingAddU32(staged_incoming[opponent_index], remainder);
+            const recipient_index = opponentIndex(attacker_index);
+            incoming_lines_by_recipient[recipient_index] = saturatingAddU32(incoming_lines_by_recipient[recipient_index], remainder);
+        }
+
+        // Queue by recipient so same-frame insertion sees accepted attacks, but
+        // report the queued event on the attacker who generated the lines.
+        for (0..PlayerCount) |recipient_index| {
+            const incoming_lines = incoming_lines_by_recipient[recipient_index];
+            const accepted = self.queuePendingGarbageForPlayer(recipient_index, incoming_lines);
+            const attacker_index = opponentIndex(recipient_index);
+            result.players[attacker_index].garbage.queued = accepted;
         }
 
         for (0..PlayerCount) |player_index| {
@@ -446,11 +466,6 @@ pub const Match = struct {
             if (lock_result.lines_cleared == 0) {
                 result.players[player_index].garbage.inserted = self.insertPendingGarbageForPlayer(player_index);
             }
-        }
-
-        for (0..PlayerCount) |player_index| {
-            const accepted = self.queuePendingGarbageForPlayer(player_index, staged_incoming[player_index]);
-            result.players[opponentIndex(player_index)].garbage.queued = accepted;
         }
     }
 
@@ -929,6 +944,34 @@ test "real top-out quad sends attack before outcome" {
     try std.testing.expectEqual(@as(u32, 4), result.players[0].garbage.queued);
     try std.testing.expectEqual(@as(u32, 4), match.players[1].pendingGarbageCount());
     try expectWinner(result.outcome, .p2);
+}
+
+test "top-out quad queues before same-frame opponent non-clear inserts garbage" {
+    var match = try Match.init(testSettings());
+    prepareHiddenQuadTopOut(&match.players[0]);
+    // Keep P2 seed-independent: this O hard-drop clears nothing, while the
+    // row-0 sentinel makes accepted garbage top out during insertion.
+    match.players[1].game.active = .{
+        .kind = .o,
+        .rotation = .spawn,
+        .pos = .{ .x = 3, .y = rules.HiddenRowsI - 2 },
+    };
+    match.players[1].game.board[0][1] = rules.Cell.fromPiece(.s);
+
+    const result = match.step(testInput(.{ .hard_drop_pressed = true }, .{ .hard_drop_pressed = true }));
+
+    try std.testing.expect(match.players[0].game.game_over);
+    try std.testing.expect(match.players[1].game.game_over);
+    try std.testing.expectEqual(@as(u8, 4), result.players[0].lock_result.?.lines_cleared);
+    try std.testing.expectEqual(@as(u8, 4), result.players[0].lock_result.?.attack_lines);
+    try std.testing.expect(result.players[1].lock_result != null);
+    try std.testing.expectEqual(@as(u8, 0), result.players[1].lock_result.?.lines_cleared);
+    try std.testing.expectEqual(@as(u8, 0), result.players[1].lock_result.?.attack_lines);
+    try std.testing.expectEqual(@as(u32, 4), result.players[0].garbage.generated);
+    try std.testing.expectEqual(@as(u32, 4), result.players[0].garbage.queued);
+    try std.testing.expectEqual(@as(u32, 4), result.players[1].garbage.inserted);
+    try std.testing.expectEqual(@as(u32, 0), match.players[1].pendingGarbageCount());
+    try expectDraw(result.outcome);
 }
 
 test "same seeds and inputs produce same deterministic runtime state" {
