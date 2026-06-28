@@ -180,14 +180,17 @@
     </section>
 
     <script>
-      const gameScrollCodes = new Set(["Space", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"]);
+      // Space, Enter, and arrows are game controls; Slash is Player 2's
+      // local-versus 180-rotate key. Prevent browser scroll/quick-find defaults
+      // when the game owns focus, but preserve normal focused UI controls/links.
+      const gameDefaultCodes = new Set(["Space", "Enter", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Slash"]);
 
-      function isEditableTarget(target) {
-        return target instanceof Element && target.closest("input, textarea, select, button, [contenteditable='true'], [contenteditable='']");
+      function isBrowserControlTarget(target) {
+        return target instanceof Element && target.closest("a[href], input, textarea, select, button, [contenteditable='true'], [contenteditable='']");
       }
 
       window.addEventListener("keydown", (event) => {
-        if (gameScrollCodes.has(event.code) && !isEditableTarget(event.target)) {
+        if (gameDefaultCodes.has(event.code) && !isBrowserControlTarget(event.target)) {
           event.preventDefault();
         }
       }, { capture: true });

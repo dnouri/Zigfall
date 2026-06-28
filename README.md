@@ -39,6 +39,13 @@ as follows:
 
 ## Controls
 
+Mode hotkeys:
+
+- `1`: switch to one-player (no-op if already active; use `R` to restart)
+- `2`: switch to local two-player versus (no-op if already active; use `R` to restart)
+
+One-player controls are unchanged:
+
 - Left / Right: move piece, with DAS/ARR repeat
 - Down: soft drop
 - Space: hard drop
@@ -50,6 +57,14 @@ as follows:
 - R: restart
 - Esc: close the desktop window
 
+Local two-player controls:
+
+- Player 1: A/D move, S soft drop, Space hard drop, W rotate clockwise, Q rotate counter-clockwise, E rotate 180 degrees, Left Shift hold
+- Player 2: Left/Right move, Down soft drop, Enter hard drop, Up rotate clockwise, `.` rotate counter-clockwise, `/` rotate 180 degrees, Right Shift hold
+- Global: P pauses/resumes, R restarts, Esc closes the desktop window
+
+Native online networking is not supported; versus play is local on one keyboard for now.
+
 ## Game mechanics included
 
 - 10x40 matrix with 20 visible rows and hidden spawn rows
@@ -58,7 +73,7 @@ as follows:
 - SRS-style wall kicks for JLSTZ, I, and O pieces, plus a simple 180 kick set
 - T-spin full/mini detection, back-to-back, combo counter, perfect clear detection
 - Line-clear scoring with soft/hard drop points and line-output metadata for display
-- Pause, restart, game-over handling, and status panels for score, level, combo, B2B, last clear, and output
+- Pause, restart, game-over handling, local two-player versus, and status panels for score, level, combo, B2B, last clear, garbage, and output
 
 ## Requirements
 
@@ -111,8 +126,10 @@ The generated web files are installed to `zig-out/web/`:
 - `zigfall.wasm`
 
 The web build uses a custom Zigfall shell with a GitHub link and a
-keyboard handler that keeps Space and the arrow keys from scrolling the
-browser page while the game is active.
+keyboard handler that keeps Space, Enter, the arrow keys, and Slash (`/`,
+Player 2's 180-rotate key) from scrolling the browser page or opening
+quick-find while the game is active, without blocking focused links or form
+controls.
 
 To launch with Emscripten's `emrun` helper:
 

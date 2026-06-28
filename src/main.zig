@@ -3,19 +3,48 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const rl = @import("raylib");
+const app_controls = @import("app_controls");
 const game = @import("game");
 const input = @import("input");
+const match_mod = @import("match");
 
 const emscripten = std.os.emscripten;
 
+// Zig 0.16's default panic handler currently pulls in std IO paths that fail
+// the wasm32-emscripten ReleaseSmall build. Keep formatted panic messages by
+// routing web panics to the browser console, while native keeps the default.
+pub const panic = std.debug.FullPanic(appPanic);
+
+extern fn emscripten_console_error(utf8String: [*:0]const u8) void;
+
+fn appPanic(message: []const u8, first_trace_addr: ?usize) noreturn {
+    if (comptime builtin.os.tag == .emscripten) {
+        webConsoleError(message);
+        @trap();
+    }
+    std.debug.defaultPanic(message, first_trace_addr);
+}
+
+fn webConsoleError(message: []const u8) void {
+    const max_len = 4095;
+    var buffer: [max_len + 1:0]u8 = undefined;
+    const len = @min(message.len, max_len);
+    @memcpy(buffer[0..len], message[0..len]);
+    buffer[len] = 0;
+    emscripten_console_error(&buffer);
+}
+
 const screen_width: i32 = 1100;
 const screen_height: i32 = 720;
-const cell_size: i32 = 24;
-const board_x: i32 = 330;
-const board_y: i32 = 118;
-const board_w: i32 = game.BoardWidthI * cell_size;
-const board_h: i32 = @as(i32, @intCast(game.VisibleHeight)) * cell_size;
+const single_cell_size: i32 = 24;
+const versus_cell_size: i32 = 18;
 const game_seed: u64 = 0x5A49_4746_414C_4C21;
+const p2_game_seed: u64 = 0x5457_4F50_4C41_5932;
+const local_garbage_seed: u64 = 0x4C4F_4341_4C56_5333;
+
+const single_board_layout = BoardLayout{ .x = 330, .y = 118, .cell = single_cell_size };
+const versus_p1_board_layout = BoardLayout{ .x = 180, .y = 160, .cell = versus_cell_size };
+const versus_p2_board_layout = BoardLayout{ .x = 740, .y = 160, .cell = versus_cell_size };
 
 const color_bg = rl.Color.init(9, 12, 24, 255);
 const color_bg_grid = rl.Color.init(20, 28, 48, 255);
@@ -30,14 +59,35 @@ const color_accent = rl.Color.init(91, 214, 255, 255);
 const color_warning = rl.Color.init(255, 177, 66, 255);
 const color_danger = rl.Color.init(255, 86, 108, 255);
 
-const App = struct {
+const BoardLayout = struct {
+    x: i32,
+    y: i32,
+    cell: i32,
+
+    fn width(self: BoardLayout) i32 {
+        return game.BoardWidthI * self.cell;
+    }
+
+    fn height(self: BoardLayout) i32 {
+        return @as(i32, @intCast(game.VisibleHeight)) * self.cell;
+    }
+};
+
+const AppMode = app_controls.AppMode;
+
+const Mode = union(AppMode) {
+    single: SinglePlayerState,
+    local_versus: LocalVersusState,
+};
+
+const SinglePlayerState = struct {
     state: game.Game,
     controller: input.Controller,
     paused: bool,
     gravity_counter: u16,
     frame_count: u64,
 
-    fn init() App {
+    fn init() SinglePlayerState {
         return .{
             .state = game.Game.init(game_seed),
             .controller = .{},
@@ -47,8 +97,8 @@ const App = struct {
         };
     }
 
-    fn updateAndDraw(self: *App) void {
-        const frame_input = readFrameInput();
+    fn update(self: *SinglePlayerState) void {
+        const frame_input = readSinglePlayerInput();
         const input_result = self.controller.applyToGame(&self.state, frame_input, &self.paused, game_seed);
 
         if (input_result.restarted or input_result.hard_dropped or input_result.paused_toggled or input_result.soft_dropped) {
@@ -57,21 +107,19 @@ const App = struct {
 
         const should_step = !input_result.restarted and !input_result.paused_toggled and !input_result.hard_dropped and !self.paused and !self.state.game_over;
         if (should_step) {
-            const gravity_due = !input_result.soft_dropped and advanceGravityCounter(&self.gravity_counter, self.state.gravityIntervalFrames());
+            const gravity_due = !input_result.soft_dropped and match_mod.advanceGravityCounter(&self.gravity_counter, self.state.gravityIntervalFrames());
             const step_result = self.state.step(.{ .apply_gravity = gravity_due });
             if (step_result.lock_result != null) self.gravity_counter = 0;
         }
 
         self.frame_count += 1;
+    }
 
-        rl.beginDrawing();
-        rl.clearBackground(color_bg);
-
-        drawBackground();
-        drawHeader(&self.state, self.frame_count);
+    fn draw(self: *const SinglePlayerState) void {
+        drawSingleHeader(&self.state, self.frame_count);
         drawHoldPanel(&self.state);
         drawControlsPanel();
-        drawBoard(&self.state);
+        drawBoard(&self.state, single_board_layout, "MATRIX", "hidden spawn rows above this line");
         drawNextPanel(&self.state);
         drawStatusPanel(&self.state, self.paused);
 
@@ -80,8 +128,76 @@ const App = struct {
         } else if (self.paused) {
             drawPauseOverlay();
         }
+    }
+};
+
+const LocalVersusState = struct {
+    match_state: match_mod.Match,
+    last_step_result: match_mod.MatchStepResult = .{},
+
+    fn init() LocalVersusState {
+        return .{
+            .match_state = match_mod.Match.init(localVersusSettings()) catch unreachable,
+        };
+    }
+
+    fn update(self: *LocalVersusState) void {
+        self.last_step_result = self.match_state.step(readLocalVersusInput());
+    }
+
+    fn draw(self: *const LocalVersusState) void {
+        drawVersusHeader(&self.match_state);
+        drawVersusPlayer(.p1, &self.match_state, self.last_step_result.players[0]);
+        drawVersusPlayer(.p2, &self.match_state, self.last_step_result.players[1]);
+        drawVersusControlsStrip();
+        drawMatchOverlay(&self.match_state);
+    }
+};
+
+const App = struct {
+    mode: Mode,
+
+    fn init() App {
+        return .{ .mode = switch (app_controls.initialMode()) {
+            .single => .{ .single = SinglePlayerState.init() },
+            .local_versus => .{ .local_versus = LocalVersusState.init() },
+        } };
+    }
+
+    fn updateAndDraw(self: *App) void {
+        if (selectedModeHotkey(self.currentMode())) |selected_mode| {
+            self.startMode(selected_mode);
+        }
+
+        switch (self.mode) {
+            .single => |*single| single.update(),
+            .local_versus => |*versus| versus.update(),
+        }
+
+        rl.beginDrawing();
+        rl.clearBackground(color_bg);
+
+        drawBackground();
+        switch (self.mode) {
+            .single => |*single| single.draw(),
+            .local_versus => |*versus| versus.draw(),
+        }
 
         rl.endDrawing();
+    }
+
+    fn currentMode(self: *const App) AppMode {
+        return switch (self.mode) {
+            .single => .single,
+            .local_versus => .local_versus,
+        };
+    }
+
+    fn startMode(self: *App, mode: AppMode) void {
+        self.mode = switch (mode) {
+            .single => .{ .single = SinglePlayerState.init() },
+            .local_versus => .{ .local_versus = LocalVersusState.init() },
+        };
     }
 };
 
@@ -108,7 +224,21 @@ fn updateDrawFrame() callconv(.c) void {
     web_app.updateAndDraw();
 }
 
-fn readFrameInput() input.FrameInput {
+fn localVersusSettings() match_mod.MatchSettings {
+    return .{
+        .player_seeds = .{ game_seed, p2_game_seed },
+        .ruleset = .{ .modern = .{ .garbage_seed = local_garbage_seed } },
+    };
+}
+
+fn selectedModeHotkey(current_mode: AppMode) ?AppMode {
+    return app_controls.selectedModeChangeForHotkey(current_mode, .{
+        .one_pressed = rl.isKeyPressed(.one),
+        .two_pressed = rl.isKeyPressed(.two),
+    });
+}
+
+fn readSinglePlayerInput() input.FrameInput {
     return .{
         .left_down = rl.isKeyDown(.left),
         .right_down = rl.isKeyDown(.right),
@@ -125,14 +255,34 @@ fn readFrameInput() input.FrameInput {
     };
 }
 
-fn advanceGravityCounter(counter: *u16, interval_frames: u16) bool {
-    if (interval_frames <= 1) return true;
-    counter.* += 1;
-    if (counter.* >= interval_frames) {
-        counter.* = 0;
-        return true;
-    }
-    return false;
+fn readLocalVersusInput() match_mod.MatchInput {
+    return app_controls.localVersusMatchInputFromKeys(.{
+        .global_p = keyState(.p),
+        .global_r = keyState(.r),
+        .p1_a = keyState(.a),
+        .p1_d = keyState(.d),
+        .p1_s = keyState(.s),
+        .p1_space = keyState(.space),
+        .p1_w = keyState(.w),
+        .p1_q = keyState(.q),
+        .p1_e = keyState(.e),
+        .p1_left_shift = keyState(.left_shift),
+        .p2_left_arrow = keyState(.left),
+        .p2_right_arrow = keyState(.right),
+        .p2_down_arrow = keyState(.down),
+        .p2_enter = keyState(.enter),
+        .p2_up_arrow = keyState(.up),
+        .p2_period = keyState(.period),
+        .p2_slash = keyState(.slash),
+        .p2_right_shift = keyState(.right_shift),
+    });
+}
+
+fn keyState(key: rl.KeyboardKey) app_controls.KeyState {
+    return .{
+        .down = rl.isKeyDown(key),
+        .pressed = rl.isKeyPressed(key),
+    };
 }
 
 fn drawBackground() void {
@@ -149,13 +299,31 @@ fn drawBackground() void {
     }
 }
 
-fn drawHeader(state: *const game.Game, frame_count: u64) void {
+fn drawSingleHeader(state: *const game.Game, frame_count: u64) void {
     rl.drawText("ZIGFALL", 36, 22, 30, color_text);
     rl.drawText("Advanced scoring, hold, ghost, DAS/ARR, lock delay", 38, 55, 15, color_text_dim);
+    drawModeHotkeyHint(.single);
 
     const right_x: i32 = 820;
     rl.drawText(rl.textFormat("FPS %i / fixed %i", .{ rl.getFPS(), @as(i32, input.FixedFps) }), right_x, 22, 18, color_accent);
     rl.drawText(rl.textFormat("frame %u  pieces %u", .{ @as(u32, @truncate(frame_count)), state.pieces_locked }), right_x, 50, 14, color_text_dim);
+}
+
+fn drawVersusHeader(match_state: *const match_mod.Match) void {
+    rl.drawText("ZIGFALL VERSUS", 36, 22, 30, color_text);
+    rl.drawText("Local two-player with Modern garbage rules", 38, 55, 15, color_text_dim);
+    drawModeHotkeyHint(.local_versus);
+
+    const right_x: i32 = 760;
+    rl.drawText(rl.textFormat("FPS %i / fixed %i", .{ rl.getFPS(), @as(i32, input.FixedFps) }), right_x, 22, 18, color_accent);
+    rl.drawText(rl.textFormat("input %u  gameplay %u", .{ @as(u32, @truncate(match_state.input_frame_count)), @as(u32, @truncate(match_state.gameplay_frame_count)) }), right_x, 50, 14, color_text_dim);
+}
+
+fn drawModeHotkeyHint(active_mode: AppMode) void {
+    const x: i32 = 430;
+    rl.drawText("1: ONE-PLAYER", x, 24, 16, if (active_mode == .single) color_accent else color_text_dim);
+    rl.drawText("2: LOCAL VERSUS", x + 150, 24, 16, if (active_mode == .local_versus) color_accent else color_text_dim);
+    rl.drawText("P pause   R restart", x, 52, 13, color_text_dim);
 }
 
 fn drawPanel(x: i32, y: i32, w: i32, h: i32, title: [:0]const u8) void {
@@ -219,101 +387,115 @@ fn drawHelpLine(label: [:0]const u8, value: [:0]const u8, x: i32, y: i32) void {
     rl.drawText(value, x + 88, y - 1, 15, color_text);
 }
 
-fn drawBoard(state: *const game.Game) void {
-    const frame_x = board_x - 18;
-    const frame_y = board_y - 48;
+fn drawBoard(state: *const game.Game, layout: BoardLayout, title: [:0]const u8, subtitle: [:0]const u8) void {
+    const board_w = layout.width();
+    const board_h = layout.height();
+    const frame_x = layout.x - 18;
+    const frame_y = layout.y - 48;
     const frame_w = board_w + 36;
     const frame_h = board_h + 74;
 
     rl.drawRectangleRounded(rect(frame_x, frame_y, frame_w, frame_h), 0.045, 14, color_panel);
     rl.drawRectangleRoundedLinesEx(rect(frame_x, frame_y, frame_w, frame_h), 0.045, 14, 1.5, color_panel_border);
-    rl.drawText("MATRIX", board_x, board_y - 38, 18, color_text);
-    rl.drawText("hidden spawn rows above this line", board_x + 82, board_y - 35, 12, color_text_dim);
+    rl.drawText(title, layout.x, layout.y - 38, 18, color_text);
+    if (subtitle.len > 0) rl.drawText(subtitle, layout.x + 82, layout.y - 35, 12, color_text_dim);
 
-    rl.drawRectangle(board_x - 5, board_y - 5, board_w + 10, board_h + 10, rl.Color.init(2, 5, 12, 255));
-    rl.drawRectangle(board_x - 3, board_y - 3, board_w + 6, board_h + 6, color_panel_border);
-    rl.drawRectangle(board_x, board_y, board_w, board_h, color_board_bg);
+    rl.drawRectangle(layout.x - 5, layout.y - 5, board_w + 10, board_h + 10, rl.Color.init(2, 5, 12, 255));
+    rl.drawRectangle(layout.x - 3, layout.y - 3, board_w + 6, board_h + 6, color_panel_border);
+    rl.drawRectangle(layout.x, layout.y, board_w, board_h, color_board_bg);
 
-    drawBoardGrid();
-    drawLockedCells(state);
+    drawBoardGrid(layout);
+    drawLockedCells(state, layout);
 
     if (state.ghostPiece()) |ghost| {
-        drawGhostPiece(ghost);
+        drawGhostPiece(ghost, layout);
     }
     if (state.active) |piece| {
-        drawPiece(piece, pieceColor(piece.kind));
+        drawPiece(piece, layout, pieceColor(piece.kind));
     }
 
-    drawHiddenBoundary();
+    drawHiddenBoundary(layout);
+    if (state.game_over) drawBoardGameOverBadge(layout);
 }
 
-fn drawBoardGrid() void {
+fn drawBoardGrid(layout: BoardLayout) void {
+    const board_w = layout.width();
+    const board_h = layout.height();
+
     var x: i32 = 0;
     while (x <= game.BoardWidthI) : (x += 1) {
-        const screen_x = board_x + x * cell_size;
-        rl.drawLine(screen_x, board_y, screen_x, board_y + board_h, color_board_grid);
+        const screen_x = layout.x + x * layout.cell;
+        rl.drawLine(screen_x, layout.y, screen_x, layout.y + board_h, color_board_grid);
     }
 
     var y: i32 = 0;
     while (y <= @as(i32, @intCast(game.VisibleHeight))) : (y += 1) {
-        const screen_y = board_y + y * cell_size;
-        rl.drawLine(board_x, screen_y, board_x + board_w, screen_y, color_board_grid);
+        const screen_y = layout.y + y * layout.cell;
+        rl.drawLine(layout.x, screen_y, layout.x + board_w, screen_y, color_board_grid);
     }
 }
 
-fn drawLockedCells(state: *const game.Game) void {
+fn drawLockedCells(state: *const game.Game, layout: BoardLayout) void {
     var y: usize = game.HiddenRows;
     while (y < game.BoardHeight) : (y += 1) {
         const visible_y: i32 = @intCast(y - game.HiddenRows);
         var x: usize = 0;
         while (x < game.BoardWidth) : (x += 1) {
             if (state.board[y][x]) |cell| {
-                const screen_x = board_x + @as(i32, @intCast(x)) * cell_size;
-                const screen_y = board_y + visible_y * cell_size;
-                drawCell(screen_x, screen_y, cell_size, cellColor(cell));
+                const screen_x = layout.x + @as(i32, @intCast(x)) * layout.cell;
+                const screen_y = layout.y + visible_y * layout.cell;
+                drawCell(screen_x, screen_y, layout.cell, cellColor(cell));
             }
         }
     }
 }
 
-fn drawHiddenBoundary() void {
-    rl.drawLine(board_x, board_y, board_x + board_w, board_y, color_warning);
-    rl.drawLine(board_x, board_y + 1, board_x + board_w, board_y + 1, color_warning.alpha(0.55));
+fn drawHiddenBoundary(layout: BoardLayout) void {
+    const board_w = layout.width();
+    rl.drawLine(layout.x, layout.y, layout.x + board_w, layout.y, color_warning);
+    rl.drawLine(layout.x, layout.y + 1, layout.x + board_w, layout.y + 1, color_warning.alpha(0.55));
 
-    var segment_x = board_x;
-    while (segment_x < board_x + board_w) : (segment_x += 18) {
-        rl.drawLine(segment_x, board_y - 8, @min(segment_x + 10, board_x + board_w), board_y - 8, color_warning.alpha(0.75));
+    var segment_x = layout.x;
+    while (segment_x < layout.x + board_w) : (segment_x += 18) {
+        rl.drawLine(segment_x, layout.y - 8, @min(segment_x + 10, layout.x + board_w), layout.y - 8, color_warning.alpha(0.75));
     }
 
-    rl.drawText("SPAWN / HIDDEN", board_x + 4, board_y - 22, 11, color_warning);
+    rl.drawText("SPAWN / HIDDEN", layout.x + 4, layout.y - 22, 11, color_warning);
 }
 
-fn drawPiece(piece: game.ActivePiece, color: rl.Color) void {
+fn drawBoardGameOverBadge(layout: BoardLayout) void {
+    const board_w = layout.width();
+    const board_h = layout.height();
+    rl.drawRectangle(layout.x, layout.y, board_w, board_h, rl.Color.init(0, 0, 0, 120));
+    drawCenteredText("GAME OVER", layout.x + @divTrunc(board_w, 2), layout.y + @divTrunc(board_h, 2) - 14, 18, color_danger);
+}
+
+fn drawPiece(piece: game.ActivePiece, layout: BoardLayout, color: rl.Color) void {
     const blocks = game.blockPositions(piece);
     for (blocks) |point| {
-        const screen_pos = blockScreenPosition(point) orelse continue;
-        drawCell(screen_pos.x, screen_pos.y, cell_size, color);
+        const screen_pos = blockScreenPosition(layout, point) orelse continue;
+        drawCell(screen_pos.x, screen_pos.y, layout.cell, color);
     }
 }
 
-fn drawGhostPiece(piece: game.ActivePiece) void {
+fn drawGhostPiece(piece: game.ActivePiece, layout: BoardLayout) void {
     const color = pieceColor(piece.kind);
     const blocks = game.blockPositions(piece);
     for (blocks) |point| {
-        const screen_pos = blockScreenPosition(point) orelse continue;
-        rl.drawRectangle(screen_pos.x + 6, screen_pos.y + 6, cell_size - 12, cell_size - 12, color.alpha(0.16));
-        rl.drawRectangleLines(screen_pos.x + 3, screen_pos.y + 3, cell_size - 6, cell_size - 6, color.alpha(0.72));
-        rl.drawRectangleLines(screen_pos.x + 6, screen_pos.y + 6, cell_size - 12, cell_size - 12, color.alpha(0.45));
+        const screen_pos = blockScreenPosition(layout, point) orelse continue;
+        rl.drawRectangle(screen_pos.x + 6, screen_pos.y + 6, layout.cell - 12, layout.cell - 12, color.alpha(0.16));
+        rl.drawRectangleLines(screen_pos.x + 3, screen_pos.y + 3, layout.cell - 6, layout.cell - 6, color.alpha(0.72));
+        rl.drawRectangleLines(screen_pos.x + 6, screen_pos.y + 6, layout.cell - 12, layout.cell - 12, color.alpha(0.45));
     }
 }
 
-fn blockScreenPosition(point: game.Point) ?struct { x: i32, y: i32 } {
+fn blockScreenPosition(layout: BoardLayout, point: game.Point) ?struct { x: i32, y: i32 } {
     if (point.x < 0 or point.x >= game.BoardWidthI) return null;
     if (point.y < game.HiddenRowsI or point.y >= game.BoardHeightI) return null;
 
     return .{
-        .x = board_x + point.x * cell_size,
-        .y = board_y + (point.y - game.HiddenRowsI) * cell_size,
+        .x = layout.x + point.x * layout.cell,
+        .y = layout.y + (point.y - game.HiddenRowsI) * layout.cell,
     };
 }
 
@@ -395,9 +577,155 @@ fn drawStatusPanel(state: *const game.Game, paused: bool) void {
     rl.drawText(exitInstructionText(), x + 18, y + h - 18, 12, color_text_dim);
 }
 
+fn drawVersusPlayer(player: match_mod.PlayerIndex, match_state: *const match_mod.Match, player_result: match_mod.PlayerStepResult) void {
+    const runtime = match_state.playerConst(player);
+    const layout = versusBoardLayout(player);
+    drawVersusSidePanels(player, &runtime.game);
+    drawBoard(&runtime.game, layout, playerMatrixTitle(player), "garbage in panel");
+    drawVersusStatusPanel(player, match_state, runtime, player_result);
+}
+
+fn drawVersusSidePanels(player: match_mod.PlayerIndex, state: *const game.Game) void {
+    const x: i32 = switch (player) {
+        .p1 => 28,
+        .p2 => 946,
+    };
+    const w: i32 = 126;
+    drawVersusHoldPanel(state, x, 150, w, 105, playerHoldTitle(player));
+    drawVersusNextPanel(state, x, 272, w, 348, playerNextTitle(player));
+}
+
+fn drawVersusHoldPanel(state: *const game.Game, x: i32, y: i32, w: i32, h: i32, title: [:0]const u8) void {
+    drawPanel(x, y, w, h, title);
+    rl.drawRectangleRounded(rect(x + 12, y + 42, w - 24, 42), 0.12, 8, color_panel_soft);
+    rl.drawRectangleRoundedLinesEx(rect(x + 12, y + 42, w - 24, 42), 0.12, 8, 1.0, color_panel_border.alpha(0.5));
+
+    if (state.hold) |kind| {
+        drawMiniPiece(kind, x + 16, y + 45, w - 32, 36, 11);
+    } else {
+        drawCenteredText("EMPTY", x + @divTrunc(w, 2), y + 55, 12, color_text_dim);
+    }
+
+    drawPill(x + 20, y + 86, w - 40, 16, if (state.held_this_piece) "USED" else "READY", if (state.held_this_piece) color_warning else color_accent);
+}
+
+fn drawVersusNextPanel(state: *const game.Game, x: i32, y: i32, w: i32, h: i32, title: [:0]const u8) void {
+    drawPanel(x, y, w, h, title);
+    for (state.next, 0..) |kind, i| {
+        const row_y = y + 44 + @as(i32, @intCast(i)) * 57;
+        const row_h: i32 = 45;
+        rl.drawRectangleRounded(rect(x + 10, row_y, w - 20, row_h), 0.13, 8, color_panel_soft);
+        rl.drawRectangleRoundedLinesEx(rect(x + 10, row_y, w - 20, row_h), 0.13, 8, 1.0, color_panel_border.alpha(0.4));
+        drawMiniPiece(kind, x + 14, row_y + 5, w - 28, row_h - 10, 10);
+    }
+}
+
+fn drawVersusStatusPanel(player: match_mod.PlayerIndex, match_state: *const match_mod.Match, runtime: *const match_mod.PlayerRuntime, player_result: match_mod.PlayerStepResult) void {
+    const x: i32 = switch (player) {
+        .p1 => 382,
+        .p2 => 560,
+    };
+    const y: i32 = 150;
+    const w: i32 = 158;
+    const h: i32 = 470;
+    drawPanel(x, y, w, h, playerStatusTitle(player));
+
+    var state_label: [:0]const u8 = "playing";
+    var state_color = color_accent;
+    if (match_state.outcome) |outcome| {
+        switch (outcome) {
+            .draw => {
+                state_label = "draw";
+                state_color = color_warning;
+            },
+            .winner => |winner| {
+                if (winner == player) {
+                    state_label = "winner";
+                    state_color = color_accent;
+                } else {
+                    state_label = "lost";
+                    state_color = color_danger;
+                }
+            },
+        }
+    } else if (runtime.game.game_over) {
+        state_label = "game over";
+        state_color = color_danger;
+    } else if (match_state.paused) {
+        state_label = "paused";
+        state_color = color_warning;
+    }
+
+    const metric_gap: i32 = 21;
+    const section_gap: i32 = 24;
+    const section_content_gap: i32 = 22;
+
+    var line_y: i32 = y + 48;
+    drawCompactMetric("State", state_label, x + 14, line_y, state_color);
+    line_y += metric_gap;
+    drawCompactMetric("Score", rl.textFormat("%u", .{runtime.game.score}), x + 14, line_y, color_text);
+    line_y += metric_gap;
+    drawCompactMetric("Lines", rl.textFormat("%u", .{runtime.game.total_lines_cleared}), x + 14, line_y, color_text);
+    line_y += metric_gap;
+    drawCompactMetric("Level", rl.textFormat("%i", .{@as(i32, runtime.game.level)}), x + 14, line_y, color_text);
+    line_y += metric_gap;
+    drawCompactMetric("Pieces", rl.textFormat("%u", .{runtime.game.pieces_locked}), x + 14, line_y, color_text_dim);
+    line_y += metric_gap;
+    drawCompactMetric("Combo", comboText(runtime.game.combo_counter), x + 14, line_y, if (runtime.game.combo_counter >= 1) color_warning else color_text_dim);
+    line_y += metric_gap;
+    drawCompactMetric("B2B", if (runtime.game.back_to_back_active) "active" else "off", x + 14, line_y, if (runtime.game.back_to_back_active) color_warning else color_text_dim);
+
+    line_y += section_gap;
+    drawCompactSection("GARBAGE", x + 14, line_y, w - 28);
+    line_y += section_content_gap;
+    drawCompactMetric("Incoming", rl.textFormat("%u", .{runtime.pendingGarbageCount()}), x + 14, line_y, if (runtime.pendingGarbageCount() > 0) color_danger else color_text_dim);
+    line_y += metric_gap;
+    drawCompactMetric("Generated", rl.textFormat("%u", .{player_result.garbage.generated}), x + 14, line_y, if (player_result.garbage.generated > 0) color_danger else color_text_dim);
+    line_y += metric_gap;
+    drawCompactMetric("Canceled", rl.textFormat("%u", .{player_result.garbage.canceled}), x + 14, line_y, if (player_result.garbage.canceled > 0) color_accent else color_text_dim);
+    line_y += metric_gap;
+    drawCompactMetric("Queued", rl.textFormat("%u", .{player_result.garbage.queued}), x + 14, line_y, if (player_result.garbage.queued > 0) color_warning else color_text_dim);
+    line_y += metric_gap;
+    drawCompactMetric("Inserted", rl.textFormat("%u", .{player_result.garbage.inserted}), x + 14, line_y, if (player_result.garbage.inserted > 0) color_danger else color_text_dim);
+
+    line_y += section_gap;
+    drawCompactSection("LAST LOCK", x + 14, line_y, w - 28);
+    line_y += section_content_gap;
+    if (runtime.game.last_lock_result) |lock_result| {
+        drawCompactMetric("Piece", pieceLabel(lock_result.piece_kind), x + 14, line_y, pieceColor(lock_result.piece_kind));
+        line_y += metric_gap;
+        drawCompactMetric("Clear", clearSummary(lock_result), x + 14, line_y, if (lock_result.lines_cleared > 0) color_accent else color_text_dim);
+        line_y += metric_gap;
+        drawCompactMetric("Output", rl.textFormat("+%i", .{@as(i32, lock_result.attack_lines)}), x + 14, line_y, if (lock_result.attack_lines > 0) color_danger else color_text_dim);
+    } else {
+        drawCompactMetric("Clear", "none", x + 14, line_y, color_text_dim);
+    }
+}
+
+fn drawVersusControlsStrip() void {
+    const x: i32 = 28;
+    const y: i32 = 634;
+    const w: i32 = 1044;
+    const h: i32 = 62;
+    drawPanel(x, y, w, h, "LOCAL CONTROLS");
+    rl.drawText("P1: A/D move | S soft | Space hard | W CW | Q CCW | E 180 | Left Shift hold", x + 405, y + 16, 13, color_text);
+    rl.drawText("P2: Left/Right move | Down soft | Enter hard | Up CW | . CCW | / 180 | Right Shift hold", x + 405, y + 38, 13, color_text);
+    rl.drawText("Global: P pause | R restart | 1 one-player | 2 local versus", x + 18, y + 38, 13, color_text_dim);
+}
+
 fn drawMetric(label: [:0]const u8, value: [:0]const u8, x: i32, y: i32, value_color: rl.Color) void {
     rl.drawText(label, x, y, 14, color_text_dim);
     rl.drawText(value, x + 82, y - 2, 16, value_color);
+}
+
+fn drawCompactMetric(label: [:0]const u8, value: [:0]const u8, x: i32, y: i32, value_color: rl.Color) void {
+    rl.drawText(label, x, y, 12, color_text_dim);
+    rl.drawText(value, x + 76, y - 1, 13, value_color);
+}
+
+fn drawCompactSection(text: [:0]const u8, x: i32, y: i32, width: i32) void {
+    rl.drawText(text, x, y, 13, color_accent);
+    rl.drawLine(x + 70, y + 8, x + width, y + 8, color_panel_border.alpha(0.55));
 }
 
 fn drawSectionTitle(text: [:0]const u8, x: i32, y: i32) void {
@@ -442,8 +770,9 @@ fn drawPauseOverlay() void {
 
 fn drawGameOverOverlay(state: *const game.Game) void {
     rl.drawRectangle(0, 0, screen_width, screen_height, rl.Color.init(0, 0, 0, 145));
-    const x = board_x - 56;
-    const y = board_y + 150;
+    const board_w = single_board_layout.width();
+    const x = single_board_layout.x - 56;
+    const y = single_board_layout.y + 150;
     const w: i32 = board_w + 112;
     const h: i32 = 168;
     rl.drawRectangleRounded(rect(x, y, w, h), 0.09, 14, rl.Color.init(24, 12, 22, 238));
@@ -452,6 +781,26 @@ fn drawGameOverOverlay(state: *const game.Game) void {
     drawCenteredText(rl.textFormat("Score %u  |  Lines %u", .{ state.score, state.total_lines_cleared }), x + @divTrunc(w, 2), y + 78, 18, color_text);
     drawCenteredText("Press R to restart", x + @divTrunc(w, 2), y + 112, 18, color_text_dim);
     drawCenteredText(exitOverlayText(), x + @divTrunc(w, 2), y + 137, 14, color_text_dim);
+}
+
+fn drawMatchOverlay(match_state: *const match_mod.Match) void {
+    if (match_state.outcome) |outcome| {
+        drawScreenOverlay(matchOutcomeTitle(outcome), "Press R to restart  |  1/2 switch modes", if (isDraw(outcome)) color_warning else color_accent);
+    } else if (match_state.paused) {
+        drawScreenOverlay("PAUSED", "Press P to resume  |  R restarts", color_warning);
+    }
+}
+
+fn drawScreenOverlay(title: [:0]const u8, subtitle: [:0]const u8, accent: rl.Color) void {
+    rl.drawRectangle(0, 0, screen_width, screen_height, rl.Color.init(0, 0, 0, 120));
+    const w: i32 = 420;
+    const h: i32 = 140;
+    const x: i32 = @divTrunc(screen_width - w, 2);
+    const y: i32 = 250;
+    rl.drawRectangleRounded(rect(x, y, w, h), 0.09, 14, rl.Color.init(15, 22, 40, 238));
+    rl.drawRectangleRoundedLinesEx(rect(x, y, w, h), 0.09, 14, 2.0, accent);
+    drawCenteredText(title, x + @divTrunc(w, 2), y + 28, 34, accent);
+    drawCenteredText(subtitle, x + @divTrunc(w, 2), y + 86, 18, color_text);
 }
 
 fn exitInstructionText() [:0]const u8 {
@@ -464,8 +813,9 @@ fn exitOverlayText() [:0]const u8 {
 
 fn drawOverlay(title: [:0]const u8, subtitle: [:0]const u8, accent: rl.Color) void {
     rl.drawRectangle(0, 0, screen_width, screen_height, rl.Color.init(0, 0, 0, 115));
-    const x = board_x - 44;
-    const y = board_y + 172;
+    const board_w = single_board_layout.width();
+    const x = single_board_layout.x - 44;
+    const y = single_board_layout.y + 172;
     const w: i32 = board_w + 88;
     const h: i32 = 124;
     rl.drawRectangleRounded(rect(x, y, w, h), 0.1, 14, rl.Color.init(15, 22, 40, 238));
@@ -476,6 +826,58 @@ fn drawOverlay(title: [:0]const u8, subtitle: [:0]const u8, accent: rl.Color) vo
 
 fn drawCenteredText(text: [:0]const u8, center_x: i32, y: i32, size: i32, color: rl.Color) void {
     rl.drawText(text, center_x - @divTrunc(rl.measureText(text, size), 2), y, size, color);
+}
+
+fn versusBoardLayout(player: match_mod.PlayerIndex) BoardLayout {
+    return switch (player) {
+        .p1 => versus_p1_board_layout,
+        .p2 => versus_p2_board_layout,
+    };
+}
+
+fn playerMatrixTitle(player: match_mod.PlayerIndex) [:0]const u8 {
+    return switch (player) {
+        .p1 => "P1 MATRIX",
+        .p2 => "P2 MATRIX",
+    };
+}
+
+fn playerHoldTitle(player: match_mod.PlayerIndex) [:0]const u8 {
+    return switch (player) {
+        .p1 => "P1 HOLD",
+        .p2 => "P2 HOLD",
+    };
+}
+
+fn playerNextTitle(player: match_mod.PlayerIndex) [:0]const u8 {
+    return switch (player) {
+        .p1 => "P1 NEXT",
+        .p2 => "P2 NEXT",
+    };
+}
+
+fn playerStatusTitle(player: match_mod.PlayerIndex) [:0]const u8 {
+    return switch (player) {
+        .p1 => "P1 STATUS",
+        .p2 => "P2 STATUS",
+    };
+}
+
+fn matchOutcomeTitle(outcome: match_mod.MatchOutcome) [:0]const u8 {
+    return switch (outcome) {
+        .winner => |winner| switch (winner) {
+            .p1 => "P1 WINS",
+            .p2 => "P2 WINS",
+        },
+        .draw => "DRAW",
+    };
+}
+
+fn isDraw(outcome: match_mod.MatchOutcome) bool {
+    return switch (outcome) {
+        .draw => true,
+        .winner => false,
+    };
 }
 
 fn comboText(combo: i32) [:0]const u8 {

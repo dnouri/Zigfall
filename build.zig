@@ -37,14 +37,25 @@ pub fn build(b: *std.Build) void {
             .{ .name = "input", .module = input_mod },
         },
     });
+    const app_controls_mod = b.addModule("app_controls", .{
+        .root_source_file = b.path("src/app_controls.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "input", .module = input_mod },
+            .{ .name = "match", .module = match_mod },
+        },
+    });
 
     const app_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "app_controls", .module = app_controls_mod },
             .{ .name = "game", .module = game_mod },
             .{ .name = "input", .module = input_mod },
+            .{ .name = "match", .module = match_mod },
             .{ .name = "raylib", .module = raylib },
         },
     });
@@ -115,9 +126,14 @@ pub fn build(b: *std.Build) void {
         .root_module = match_mod,
     });
     const run_match_tests = b.addRunArtifact(match_tests);
+    const app_controls_tests = b.addTest(.{
+        .root_module = app_controls_mod,
+    });
+    const run_app_controls_tests = b.addRunArtifact(app_controls_tests);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_game_tests.step);
     test_step.dependOn(&run_input_tests.step);
     test_step.dependOn(&run_match_tests.step);
+    test_step.dependOn(&run_app_controls_tests.step);
 }
