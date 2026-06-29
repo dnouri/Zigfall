@@ -89,9 +89,12 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve() } = {}) {
   assert.equal(transport.send(Uint8Array.from([4])), ErrorCode.none);
   assert.equal(action.sent.at(-1).options.target, "peer-a", "extra peers must not change the target");
 
+  action.emit(Uint8Array.from([10]), "peer-a");
   room.leavePeer("peer-a");
   assert.equal(transport.selectedPeerId(), null);
   assert.equal(transport.statusCode(), Status.busy, "remaining non-selected peers keep the room busy, not connected");
+  assert.equal(transport.queuedPacketCount(), 1, "selected peer packets queued before leave should remain pollable");
+  assert.deepEqual(Array.from(transport.poll()), [10]);
   assert.equal(transport.send(Uint8Array.from([5])), ErrorCode.noPeer);
 
   action.emit(Uint8Array.from([6]), "peer-b");
@@ -126,4 +129,23 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve() } = {}) {
   }
 }
 
-console.log("ok: Zigfall transport adapter selects one peer, targets sends, drops extras, and drains disconnects");
+{
+  const { joinRoomImpl, rooms } = makeFakeJoinRoom();
+  const transport = createZigfallTransport({ joinRoomImpl, selfIdValue: "self-test" });
+
+  assert.equal(transport.MaxQueuedPackets, 256, "inbound queue should allow bounded burst drain headroom");
+  assert.equal(transport.connect("queue-test"), ErrorCode.none);
+  const room = rooms[0];
+  const action = room.action;
+  room.join("peer-a");
+
+  for (let i = 0; i < transport.MaxQueuedPackets; i += 1) {
+    action.emit(Uint8Array.from([i & 0xff]), "peer-a");
+  }
+  assert.equal(transport.queuedPacketCount(), transport.MaxQueuedPackets);
+  action.emit(Uint8Array.from([0xee]), "peer-a");
+  assert.equal(transport.errorCode(), ErrorCode.queueFull);
+  assert.equal(transport.queuedPacketCount(), transport.MaxQueuedPackets, "overflow should not grow the bounded queue");
+}
+
+console.log("ok: Zigfall transport adapter selects one peer, targets sends, drops extras, drains disconnects, and bounds backlog");

@@ -214,18 +214,46 @@
         },
         canvas: canvasElement,
         preRun: [function() {
-          if (globalThis.ZigfallTransport && typeof globalThis.ZigfallTransport.statusCode === "function") return;
+          function hasTransport() {
+            return globalThis.ZigfallTransport && typeof globalThis.ZigfallTransport.statusCode === "function";
+          }
 
-          var dependency = "zigfall_transport";
+          function hasInvite() {
+            return globalThis.ZigfallInvite && typeof globalThis.ZigfallInvite.createHostRoom === "function";
+          }
+
+          if (hasTransport() && hasInvite()) return;
+
+          var dependency = "zigfall_web_helpers";
+          var imports = [];
           Module.addRunDependency(dependency);
-          import("./zigfall_transport.mjs").then(function() {
-            if (!globalThis.ZigfallTransport || typeof globalThis.ZigfallTransport.statusCode !== "function") {
-              throw new Error("zigfall_transport.mjs did not install globalThis.ZigfallTransport");
-            }
-          }).catch(function(err) {
-            globalThis.ZigfallTransportLoadError = err;
-            console.error("[ZigfallTransport] failed to load", err);
-            Module.setStatus("Network transport failed to load; see JavaScript console.");
+
+          if (!hasTransport()) {
+            imports.push(import("./zigfall_transport.mjs").then(function() {
+              if (!hasTransport()) {
+                throw new Error("zigfall_transport.mjs did not install globalThis.ZigfallTransport");
+              }
+            }).catch(function(err) {
+              globalThis.ZigfallTransportLoadError = err;
+              console.error("[ZigfallTransport] failed to load", err);
+              throw err;
+            }));
+          }
+
+          if (!hasInvite()) {
+            imports.push(import("./zigfall_invite.mjs").then(function() {
+              if (!hasInvite()) {
+                throw new Error("zigfall_invite.mjs did not install globalThis.ZigfallInvite");
+              }
+            }).catch(function(err) {
+              globalThis.ZigfallInviteLoadError = err;
+              console.error("[ZigfallInvite] failed to load", err);
+              throw err;
+            }));
+          }
+
+          Promise.all(imports).catch(function() {
+            Module.setStatus("Web helpers failed to load; see JavaScript console.");
           }).finally(function() {
             Module.removeRunDependency(dependency);
           });
@@ -270,7 +298,7 @@
       };
     </script>
 
-    <!-- Module.preRun imports zigfall_transport.mjs before WASM main starts. -->
+    <!-- Module.preRun imports zigfall_transport.mjs and zigfall_invite.mjs before WASM main starts. -->
 
     <!-- Emscripten replaces this token with the zigfall.js loader. -->
     {{{ SCRIPT }}}

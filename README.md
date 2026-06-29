@@ -43,6 +43,7 @@ Mode hotkeys:
 
 - `1`: switch to one-player (no-op if already active; use `R` to restart)
 - `2`: switch to local two-player versus (no-op if already active; use `R` to restart)
+- `3`: in the browser, create a web online invite room as host/P1; on native builds this shows a web-only unsupported message
 
 One-player controls are unchanged:
 
@@ -63,7 +64,15 @@ Local two-player controls:
 - Player 2: Left/Right move, Down soft drop, Enter hard drop, Up rotate clockwise, `.` rotate counter-clockwise, `/` rotate 180 degrees, Right Shift hold
 - Global: P pauses/resumes, R restarts, Esc closes the desktop window
 
-Native online networking is not supported; versus play is local on one keyboard for now.
+Web online invite controls:
+
+- Host: press `3` in the browser to create a room/link as P1, then press `C` to copy the invite URL.
+- Joiner: opening a `?join=<room>` link auto-enters online join mode as P2.
+- Gameplay uses one local control set: Left/Right/Down, Space hard drop, X or Up rotate clockwise, Z counter-clockwise, A 180, Left Shift hold.
+- P is deterministic pause/resume. R is a graceful no-op online because rematch/restart is not implemented yet.
+- Desyncs, disconnects, extra-peer busy rooms, and match results are displayed; disconnects are not counted as wins/losses.
+
+Native online networking is not supported; native versus play is local on one keyboard.
 
 ## Game mechanics included
 
@@ -73,7 +82,7 @@ Native online networking is not supported; versus play is local on one keyboard 
 - SRS-style wall kicks for JLSTZ, I, and O pieces, plus a simple 180 kick set
 - T-spin full/mini detection, back-to-back, combo counter, perfect clear detection
 - Line-clear scoring with soft/hard drop points and line-output metadata for display
-- Pause, restart, game-over handling, local two-player versus, and status panels for score, level, combo, B2B, last clear, garbage, and output
+- Pause, restart, game-over handling, local two-player versus, web invite-link P2P matches, and status panels for score, level, combo, B2B, last clear, garbage, and output
 
 ## Requirements
 
@@ -125,6 +134,7 @@ The generated web files are installed to `zig-out/web/`:
 - `zigfall.js`
 - `zigfall.wasm`
 - `zigfall_transport.mjs`
+- `zigfall_invite.mjs`
 - `vendor/trystero-nostr.bundle.mjs` plus concise vendor license/readme files
 
 The web build uses a custom Zigfall shell with a GitHub link and a
@@ -133,14 +143,14 @@ Player 2's 180-rotate key) from scrolling the browser page or opening
 quick-find while the game is active, without blocking focused links or form
 controls.
 
-The web artifact also includes an inactive Trystero/Nostr transport adapter for
-future online play. It is packaged as local static JavaScript copied by
-`build.zig`; the shell imports it during Emscripten `preRun` before WASM `main`
-starts. Production pages do not import Trystero from a runtime CDN, and native
-`zig build` does not require Node, npm, Trystero, browser APIs, or network
-access. Calling `connect()` still uses Trystero's default Nostr/public WebRTC
-signaling and ICE/STUN behavior at runtime, so browser network access is needed
-only for that manual/future online transport path. The adapter selects the first
+The web artifact also includes Trystero/Nostr transport and invite-link helpers
+for casual invite-link online matches. They are packaged as local static
+JavaScript copied by `build.zig`; the shell imports them during Emscripten
+`preRun` before WASM `main` starts. Production pages do not import Trystero from
+a runtime CDN, and native `zig build` does not require Node, npm, Trystero,
+browser APIs, or network access. Runtime online play still uses Trystero's
+default Nostr/public WebRTC signaling and ICE/STUN behavior, so browser network
+access is needed for the online path. The transport adapter selects the first
 room peer as the single 1v1 opponent, targets sends to that peer, and reports a
 busy state while extra peers are present. It is observable in-game through the
 small web-only transport footer and manually from the browser console:
@@ -155,10 +165,23 @@ ZigfallTransport.send(Uint8Array.from([
 Array.from(ZigfallTransport.poll() ?? [])
 ```
 
-Open two built web tabs, connect both to the same room, send the packet from one
-tab, and poll from the other. This is only a transport seam; online gameplay,
-invite links, matchmaking, setup handshakes, profiles, and native networking are
-not implemented.
+For the playable UI flow, open one built web tab and press `3`, copy the link
+with `C`, then open that link in a second tab. The host is P1/setup authority,
+the join-link opener is P2, and both peers use fixed-delay conservative lockstep
+with periodic state hashes. Restart/rematch, matchmaking, accounts, profiles,
+ratings, and native networking are not implemented.
+
+The lower-level transport and invite seams are also available from the browser
+console:
+
+```js
+const room = ZigfallInvite.createHostRoom()
+ZigfallInvite.joinUrl(room)
+ZigfallInvite.readInitialJoinRoom()
+```
+
+These console helpers are mostly for debugging; normal online play should use
+the in-game `3`/`C` invite flow or a `?join=<room>` URL.
 
 To launch with Emscripten's `emrun` helper:
 

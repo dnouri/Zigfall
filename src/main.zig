@@ -6,7 +6,11 @@ const rl = @import("raylib");
 const app_controls = @import("app_controls");
 const game = @import("game");
 const input = @import("input");
+const lockstep = @import("lockstep");
 const match_mod = @import("match");
+const online_session = @import("online_session");
+const protocol = @import("protocol");
+const web_invite = @import("web_invite");
 const web_transport = @import("web_transport");
 
 const emscripten = std.os.emscripten;
@@ -42,6 +46,15 @@ const versus_cell_size: i32 = 18;
 const game_seed: u64 = 0x5A49_4746_414C_4C21;
 const p2_game_seed: u64 = 0x5457_4F50_4C41_5932;
 const local_garbage_seed: u64 = 0x4C4F_4341_4C56_5333;
+const online_hash_seed: u64 = 0x4F4E_4C49_4E45_5036;
+const online_state_hash_interval_frames: u64 = 60;
+const online_max_steps_per_frame: usize = 4;
+const online_input_batch_target_count: u8 = 4;
+const online_input_batch_max_hold_frames: u8 = 3;
+const online_result_drain_frames: u16 = 120;
+const online_notice_frames: u16 = 180;
+const online_message_capacity: usize = 192;
+const online_notice_capacity: usize = 128;
 
 const single_board_layout = BoardLayout{ .x = 330, .y = 118, .cell = single_cell_size };
 const versus_p1_board_layout = BoardLayout{ .x = 180, .y = 160, .cell = versus_cell_size };
@@ -79,6 +92,7 @@ const AppMode = app_controls.AppMode;
 const Mode = union(AppMode) {
     single: SinglePlayerState,
     local_versus: LocalVersusState,
+    online: OnlineState,
 };
 
 const SinglePlayerState = struct {
@@ -155,14 +169,749 @@ const LocalVersusState = struct {
     }
 };
 
+const OnlineTerminal = enum {
+    none,
+    finished,
+    disconnected,
+    desynced,
+    unsupported,
+    failed,
+};
+
+const OnlineTerminalPacket = union(enum) {
+    none,
+    result,
+    desync,
+    disconnect: u8,
+};
+
+const OnlineState = struct {
+    role: ?online_session.Role = null,
+    session: ?online_session.Session = null,
+    last_step_result: match_mod.MatchStepResult = .{},
+    room_buf: [web_invite.MaxRoomIdLength]u8 = undefined,
+    room_len: usize = 0,
+    join_url_buf: [web_invite.MaxJoinUrlLength]u8 = undefined,
+    join_url_len: usize = 0,
+    receive_buf: [web_transport.MaxPacketSize]u8 = undefined,
+    message_buf: [online_message_capacity]u8 = undefined,
+    message_len: usize = 0,
+    notice_buf: [online_notice_capacity]u8 = undefined,
+    notice_len: usize = 0,
+    notice_frames_left: u16 = 0,
+    sent_setup: bool = false,
+    sent_ack: bool = false,
+    sent_result: bool = false,
+    sent_desync: bool = false,
+    pending_remote_result: ?protocol.Result = null,
+    pending_input_batch: online_session.InputBatcher = .{},
+    result_drain_frames_left: u16 = 0,
+    next_hash_frame: u64 = online_state_hash_interval_frames,
+    ever_had_peer: bool = false,
+    terminal: OnlineTerminal = .none,
+
+    fn startHost(self: *OnlineState) void {
+        self.* = .{};
+        if (comptime builtin.os.tag != .emscripten) {
+            self.markTerminal(.unsupported, "Online invites are web-only in this build.", .{});
+            return;
+        }
+
+        const room_id = web_invite.createHostRoom(&self.room_buf) catch |err| {
+            self.markTerminal(.failed, "Could not create invite room: {s}", .{@errorName(err)});
+            return;
+        };
+        self.room_len = room_id.len;
+        self.refreshJoinUrl();
+
+        const settings = onlineSettingsForRoom(room_id);
+        const match_id = onlineMatchIdForRoom(room_id);
+        self.session = online_session.Session.initHost(match_id, settings) catch |err| {
+            self.markTerminal(.failed, "Could not create online session: {s}", .{@errorName(err)});
+            return;
+        };
+        self.role = .host;
+
+        web_transport.connect(room_id) catch |err| {
+            self.markTerminal(.failed, "Could not connect invite room: {s}", .{@errorName(err)});
+            return;
+        };
+
+        self.setMessage("Invite ready. Share the link and wait for P2.", .{});
+    }
+
+    fn startJoinRoom(self: *OnlineState, room_id: []const u8) void {
+        self.* = .{};
+        if (comptime builtin.os.tag != .emscripten) {
+            self.markTerminal(.unsupported, "Online join links are web-only in this build.", .{});
+            return;
+        }
+        if (!self.setRoom(room_id)) return;
+        self.refreshJoinUrl();
+        self.session = online_session.Session.initJoinerForMatch(onlineMatchIdForRoom(self.roomId()));
+        self.role = .joiner;
+
+        web_transport.connect(self.roomId()) catch |err| {
+            self.markTerminal(.failed, "Could not join invite room: {s}", .{@errorName(err)});
+            return;
+        };
+
+        self.setMessage("Joining invite. Waiting for host setup.", .{});
+    }
+
+    fn startJoinError(self: *OnlineState, err: anyerror) void {
+        self.* = .{};
+        self.markTerminal(.failed, "Invalid join link: {s}", .{@errorName(err)});
+    }
+
+    fn deinit(self: *OnlineState) void {
+        if (self.terminal == .none) self.sendDisconnectBestEffort(1);
+        web_transport.disconnect();
+    }
+
+    fn update(self: *OnlineState) void {
+        const online_input = readOnlineInput();
+        self.tickNotice();
+        self.handleShellActions(online_input);
+        if (self.terminal != .none) return;
+
+        self.pollTransport();
+        if (self.terminal != .none) return;
+
+        self.updateTransportHealth();
+        if (self.terminal != .none) return;
+
+        self.driveHandshake();
+        if (self.terminal != .none) return;
+
+        self.driveLockstep(online_input.frame);
+    }
+
+    fn draw(self: *const OnlineState) void {
+        if (self.lockstepPeerConst()) |peer| {
+            drawOnlineHeader(self, &peer.match);
+            drawVersusPlayer(.p1, &peer.match, self.last_step_result.players[0]);
+            drawVersusPlayer(.p2, &peer.match, self.last_step_result.players[1]);
+            drawOnlineControlsStrip(self);
+            if (self.terminal == .none) drawOnlineMatchOverlay(self, &peer.match);
+        } else {
+            drawOnlineHeader(self, null);
+            drawOnlineWaitingPanel(self);
+            drawOnlineControlsStrip(self);
+        }
+
+        if (self.terminal != .none) {
+            drawOnlineTerminalOverlay(self);
+        } else if (!self.isPlaying()) {
+            drawOnlineWaitingOverlay(self);
+        }
+        if (self.notice_frames_left > 0 and self.notice_len > 0) drawOnlineNotice(self.notice());
+    }
+
+    fn handleShellActions(self: *OnlineState, online_input: app_controls.OnlineInput) void {
+        if (online_input.copy_link_pressed) self.copyJoinLink();
+        if (online_input.restart_pressed) {
+            self.setNotice("Online rematch/restart is not available yet; use 1/2/3 for a fresh mode.", .{});
+        }
+    }
+
+    fn updateTransportHealth(self: *OnlineState) void {
+        const status = web_transport.status();
+        if (web_transport.peerCount() > 0) self.ever_had_peer = true;
+        // Trystero can report noPeer immediately after delivering a final result.
+        // Let local result validation/drain finish before treating peer leave as terminal.
+        const defer_peer_leave_disconnect = self.shouldDeferPeerLeaveDisconnect();
+
+        switch (status) {
+            .busy => {
+                self.enterTerminal(.failed, .{ .disconnect = 2 }, "Extra peer joined this room; match stopped. Create a new invite.", .{});
+                return;
+            },
+            .missing_js => {
+                self.enterTerminal(.failed, .none, "Web transport helper is missing; reload the page.", .{});
+                return;
+            },
+            .unavailable => {
+                self.enterTerminal(.unsupported, .none, "Online transport is unavailable in this build.", .{});
+                return;
+            },
+            .disconnected => if (self.ever_had_peer and !defer_peer_leave_disconnect) {
+                self.enterTerminal(.disconnected, .none, "Opponent disconnected.", .{});
+                return;
+            },
+            .connecting, .connected => {},
+        }
+
+        switch (web_transport.lastError()) {
+            .no_peer => if (self.ever_had_peer and !defer_peer_leave_disconnect) {
+                self.enterTerminal(.disconnected, .none, "Opponent disconnected.", .{});
+            },
+            .queue_full => {
+                self.enterTerminal(.failed, .{ .disconnect = 3 }, "Network receive backlog overflowed; match stopped before hiding a lost packet.", .{});
+            },
+            .send_failed => {
+                self.enterTerminal(.failed, .{ .disconnect = 3 }, "Transport send failed; match stopped.", .{});
+            },
+            else => {},
+        }
+    }
+
+    fn pollTransport(self: *OnlineState) void {
+        var packets_read: usize = 0;
+        while (packets_read < 256) : (packets_read += 1) {
+            const maybe_packet = web_transport.poll(&self.receive_buf) catch |err| {
+                self.enterTerminal(.failed, .{ .disconnect = 6 }, "Receive failed: {s}", .{@errorName(err)});
+                return;
+            };
+            const bytes = maybe_packet orelse break;
+            self.handlePacket(bytes);
+            if (self.terminal != .none) return;
+        }
+    }
+
+    fn handlePacket(self: *OnlineState, bytes: []const u8) void {
+        const ignore_stale = online_session.shouldIgnorePacketForKnownMatch(self.currentMatchId(), bytes) catch |err| {
+            self.enterTerminal(.failed, .{ .disconnect = 8 }, "Malformed network packet header: {s}", .{@errorName(err)});
+            return;
+        };
+        if (ignore_stale) return;
+
+        const packet = protocol.decode(bytes) catch |err| {
+            self.enterTerminal(.failed, .{ .disconnect = 9 }, "Malformed network packet: {s}", .{@errorName(err)});
+            return;
+        };
+
+        switch (packet) {
+            .setup => |setup| self.handleSetup(setup),
+            .ack => |ack| self.handleAck(ack),
+            .input_batch, .state_hash, .desync => self.handleRuntimePacket(bytes),
+            .disconnect => |disconnect| self.handleDisconnect(disconnect),
+            .result => |result| self.handleResult(result),
+        }
+    }
+
+    fn handleSetup(self: *OnlineState, setup: protocol.Setup) void {
+        if (self.role != .joiner) {
+            self.enterTerminal(.failed, .{ .disconnect = 14 }, "Unexpected setup packet from peer.", .{});
+            return;
+        }
+        var session = self.sessionPtr() orelse return;
+        switch (session.state) {
+            .waiting_for_setup => {},
+            .setup_received, .playing => return,
+            .waiting_for_ack => {
+                self.enterTerminal(.failed, .{ .disconnect = 15 }, "Joiner received setup while waiting for ack.", .{});
+                return;
+            },
+        }
+
+        session.acceptSetup(setup) catch |err| {
+            self.enterTerminal(.failed, .{ .disconnect = 16 }, "Host setup rejected: {s}", .{@errorName(err)});
+            return;
+        };
+        const ack = session.encodeJoinerAck() catch |err| {
+            self.enterTerminal(.failed, .{ .disconnect = 17 }, "Could not encode join ack: {s}", .{@errorName(err)});
+            return;
+        };
+        if (!self.sendPacketBytes(ack.slice())) return;
+        self.sent_ack = true;
+        self.next_hash_frame = online_state_hash_interval_frames;
+        self.setMessage("Setup accepted. Online match started as P2.", .{});
+    }
+
+    fn handleAck(self: *OnlineState, ack: protocol.Ack) void {
+        if (self.role != .host) return;
+        var session = self.sessionPtr() orelse return;
+        switch (session.state) {
+            .waiting_for_ack => {},
+            .playing => return,
+            else => {
+                self.enterTerminal(.failed, .{ .disconnect = 18 }, "Host received ack before setup was ready.", .{});
+                return;
+            },
+        }
+        session.acceptAck(ack) catch |err| {
+            self.enterTerminal(.failed, .{ .disconnect = 19 }, "Join ack rejected: {s}", .{@errorName(err)});
+            return;
+        };
+        self.next_hash_frame = online_state_hash_interval_frames;
+        self.setMessage("Joiner acknowledged setup. Online match started as P1.", .{});
+    }
+
+    fn handleRuntimePacket(self: *OnlineState, bytes: []const u8) void {
+        if (!self.isPlaying()) return;
+        var peer = self.lockstepPeer() orelse return;
+        peer.receiveBytes(bytes) catch |err| {
+            self.handleLockstepError(err);
+            return;
+        };
+        self.handlePeerStatus();
+    }
+
+    fn handleDisconnect(self: *OnlineState, disconnect: protocol.Disconnect) void {
+        if (self.role) |role| {
+            online_session.validateLifecycleSender(role, disconnect.sender_slot) catch |err| {
+                self.enterTerminal(.failed, .{ .disconnect = 10 }, "Disconnect sender rejected: {s}", .{@errorName(err)});
+                return;
+            };
+        } else return;
+        // A best-effort lifecycle disconnect may be queued behind a final result
+        // when the peer closes quickly; do not let it overwrite result handling.
+        if (self.shouldDeferPeerLeaveDisconnect()) return;
+        self.enterTerminal(.disconnected, .none, "Opponent disconnected at frame {}.", .{@as(u32, @truncate(disconnect.last_frame_cursor))});
+    }
+
+    fn handleResult(self: *OnlineState, result: protocol.Result) void {
+        const role = self.role orelse return;
+        const peer = self.lockstepPeerConst() orelse return;
+        if (self.pending_remote_result) |pending| {
+            if (!std.meta.eql(pending, result)) {
+                self.enterTerminal(.failed, .{ .disconnect = 11 }, "Opponent sent conflicting result packets.", .{});
+                return;
+            }
+        }
+
+        switch (online_session.validateRemoteResult(role, peer, result) catch |err| {
+            self.handleRemoteResultValidationError(err);
+            return;
+        }) {
+            .accepted => {
+                self.pending_remote_result = result;
+                self.finishOnlineMatch();
+            },
+            .pending_local_result => {
+                self.pending_remote_result = result;
+                self.setNotice("Opponent reported a result; waiting for local lockstep to catch up.", .{});
+            },
+        }
+    }
+
+    fn driveHandshake(self: *OnlineState) void {
+        var session = self.sessionPtr() orelse return;
+        if (self.role == .host and session.state == .waiting_for_ack and web_transport.status() == .connected and !self.sent_setup) {
+            const setup = session.encodeSetupPacket() catch |err| {
+                self.enterTerminal(.failed, .{ .disconnect = 20 }, "Could not encode host setup: {s}", .{@errorName(err)});
+                return;
+            };
+            if (!self.sendPacketBytes(setup.slice())) return;
+            self.sent_setup = true;
+            self.setMessage("Setup sent. Waiting for P2 ack.", .{});
+        }
+    }
+
+    fn driveLockstep(self: *OnlineState, frame_input: input.FrameInput) void {
+        if (!self.isPlaying()) return;
+        var peer = self.lockstepPeer() orelse return;
+        if (peer.match.outcome != null) {
+            self.finishOnlineMatch();
+            return;
+        }
+
+        self.pending_input_batch.noteFrameHeld();
+        if (self.pending_input_batch.isFull()) {
+            if (!self.sendPendingInputBatch()) return;
+        }
+
+        if (peer.canSampleLocalInput() and !self.pending_input_batch.isFull()) {
+            const sample = peer.sampleLocalInputFrame(frame_input) catch |err| {
+                self.handleLockstepError(err);
+                return;
+            };
+            self.pending_input_batch.append(sample) catch |err| {
+                self.handleLockstepError(err);
+                return;
+            };
+        } else if (peer.canSampleLocalInput()) {
+            self.setNotice("Network input backlog is full; waiting for transport to drain.", .{});
+        }
+
+        if (self.pending_input_batch.shouldFlush(online_input_batch_target_count, online_input_batch_max_hold_frames)) {
+            if (!self.sendPendingInputBatch()) return;
+        }
+
+        const advanced = peer.stepAvailableMax(online_max_steps_per_frame) catch |err| {
+            self.handleLockstepError(err);
+            return;
+        };
+        self.last_step_result = if (advanced > 0) peer.last_step_result else .{};
+        self.handlePeerStatus();
+        if (self.terminal != .none) return;
+
+        self.sendDueStateHash(peer);
+        if (self.terminal != .none) return;
+
+        if (peer.match.outcome != null) self.finishOnlineMatch();
+    }
+
+    fn sendDueStateHash(self: *OnlineState, peer: *lockstep.Peer) void {
+        const frame_cursor = peer.frameCursor();
+        if (frame_cursor < self.next_hash_frame) return;
+        const hash_packet = peer.makeStateHashPacket() catch |err| {
+            self.handleLockstepError(err);
+            return;
+        };
+        if (!self.sendPacketBytes(hash_packet.slice())) return;
+        while (self.next_hash_frame <= frame_cursor) {
+            self.next_hash_frame += online_state_hash_interval_frames;
+        }
+    }
+
+    fn sendPendingInputBatch(self: *OnlineState) bool {
+        if (!self.pending_input_batch.hasPending()) return true;
+        const encoded = self.pending_input_batch.encode() catch |err| {
+            self.handleLockstepError(err);
+            return false;
+        };
+        if (!self.sendPacketBytes(encoded.slice())) return false;
+        self.pending_input_batch.clear();
+        return true;
+    }
+
+    fn flushPendingInputBestEffort(self: *OnlineState) void {
+        if (!self.pending_input_batch.hasPending()) return;
+        const encoded = self.pending_input_batch.encode() catch {
+            self.pending_input_batch.clear();
+            return;
+        };
+        web_transport.send(encoded.slice()) catch {};
+        self.pending_input_batch.clear();
+    }
+
+    fn finishOnlineMatch(self: *OnlineState) void {
+        if (self.terminal != .none) return;
+        if (self.pending_remote_result != null) {
+            if (!self.validatePendingRemoteResult()) return;
+            if (!self.sent_result) {
+                self.flushPendingInputBestEffort();
+                self.sendResultBestEffort();
+                self.result_drain_frames_left = online_result_drain_frames;
+                self.setMessage("Match result validated. Closing connection shortly.", .{});
+            }
+            if (self.result_drain_frames_left > 0) {
+                self.result_drain_frames_left -= 1;
+                return;
+            }
+            self.enterTerminal(.finished, .none, "Match complete. Online rematch is not implemented yet.", .{});
+            return;
+        }
+
+        if (!self.sent_result) {
+            self.flushPendingInputBestEffort();
+            self.sendResultBestEffort();
+            self.result_drain_frames_left = online_result_drain_frames;
+            self.setMessage("Match complete locally. Waiting briefly for opponent result.", .{});
+        }
+        if (self.result_drain_frames_left > 0) {
+            self.result_drain_frames_left -= 1;
+            return;
+        }
+        self.enterTerminal(.finished, .none, "Match complete. Opponent result was not received before disconnect.", .{});
+    }
+
+    fn validatePendingRemoteResult(self: *OnlineState) bool {
+        const result = self.pending_remote_result orelse return true;
+        const role = self.role orelse return true;
+        const peer = self.lockstepPeerConst() orelse return true;
+        switch (online_session.validateRemoteResult(role, peer, result) catch |err| {
+            self.handleRemoteResultValidationError(err);
+            return false;
+        }) {
+            .accepted => return true,
+            .pending_local_result => return true,
+        }
+    }
+
+    fn handleRemoteResultValidationError(self: *OnlineState, err: anyerror) void {
+        switch (err) {
+            error.ResultOutcomeMismatch, error.ResultFrameCursorMismatch, error.ResultStateHashMismatch => {
+                self.enterTerminal(.desynced, .desync, "Opponent result disagreed with local final state: {s}", .{@errorName(err)});
+            },
+            error.InvalidResultSenderSlot => {
+                self.enterTerminal(.failed, .{ .disconnect = 12 }, "Opponent result sender rejected: {s}", .{@errorName(err)});
+            },
+            error.WrongMatchId => {},
+            else => {
+                self.enterTerminal(.failed, .{ .disconnect = 13 }, "Opponent result rejected: {s}", .{@errorName(err)});
+            },
+        }
+    }
+
+    fn handleLockstepError(self: *OnlineState, err: anyerror) void {
+        self.handlePeerStatus();
+        if (self.terminal != .none) return;
+        if (err == error.StateHashMismatch) {
+            self.enterTerminal(.desynced, .desync, "Desync detected; match stopped.", .{});
+            return;
+        }
+        self.enterTerminal(.failed, .{ .disconnect = 4 }, "Lockstep error: {s}", .{@errorName(err)});
+    }
+
+    fn handlePeerStatus(self: *OnlineState) void {
+        const peer = self.lockstepPeer() orelse return;
+        switch (peer.status) {
+            .ok => {},
+            .protocol_error => |reason| {
+                self.enterTerminal(.failed, .{ .disconnect = 5 }, "Protocol error: {s}", .{protocolErrorText(reason).ptr});
+            },
+            .desync => {
+                self.enterTerminal(.desynced, .desync, "Desync detected; match stopped.", .{});
+            },
+        }
+    }
+
+    fn copyJoinLink(self: *OnlineState) void {
+        if (self.room_len == 0) {
+            self.setNotice("No invite link is available yet.", .{});
+            return;
+        }
+        web_invite.requestCopyJoinUrl(self.roomId()) catch |err| {
+            self.setNotice("Copy failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.setNotice("Copy requested. Browser clipboard status appears below.", .{});
+    }
+
+    fn sendPacketBytes(self: *OnlineState, bytes: []const u8) bool {
+        web_transport.send(bytes) catch |err| {
+            // After a peer has sent or received a result, noPeer/notConnected send
+            // failures are just the transport close racing the result drain.
+            if (self.shouldDeferPeerLeaveDisconnect()) switch (err) {
+                error.NoPeer, error.NotConnected => return true,
+                else => {},
+            };
+            self.enterTerminal(.failed, .none, "Send failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        return true;
+    }
+
+    fn sendDisconnectBestEffort(self: *OnlineState, reason: u8) void {
+        const match_id = self.currentMatchId() orelse return;
+        var encoded = online_session.EncodedPacket{};
+        const frame_cursor = if (self.lockstepPeerConst()) |peer| peer.frameCursor() else 0;
+        encoded.len = protocol.encode(.{ .disconnect = .{
+            .match_id = match_id,
+            .sender_slot = self.localProtocolSlot(),
+            .reason = reason,
+            .last_frame_cursor = frame_cursor,
+        } }, encoded.bytes[0..]) catch return;
+        web_transport.send(encoded.slice()) catch {};
+    }
+
+    fn sendDesyncBestEffort(self: *OnlineState) void {
+        if (self.sent_desync) return;
+        const match_id = self.currentMatchId() orelse return;
+        const peer = self.lockstepPeerConst() orelse return;
+        const info = switch (peer.status) {
+            .desync => |desync| desync,
+            else => lockstep.DesyncInfo{
+                .frame_cursor = peer.frameCursor(),
+                .local_hash = peer.stateHash(),
+                .peer_hash = 0,
+            },
+        };
+        var encoded = online_session.EncodedPacket{};
+        encoded.len = protocol.encode(.{ .desync = .{
+            .match_id = match_id,
+            .sender_slot = self.localProtocolSlot(),
+            .reason = 1,
+            .frame_cursor = info.frame_cursor,
+            .local_hash = info.local_hash,
+            .peer_hash = info.peer_hash,
+        } }, encoded.bytes[0..]) catch return;
+        web_transport.send(encoded.slice()) catch {};
+        self.sent_desync = true;
+    }
+
+    fn sendResultBestEffort(self: *OnlineState) void {
+        if (self.sent_result) return;
+        const match_id = self.currentMatchId() orelse return;
+        const peer = self.lockstepPeerConst() orelse return;
+        const outcome = peer.match.outcome orelse return;
+        var encoded = online_session.EncodedPacket{};
+        encoded.len = protocol.encode(.{ .result = .{
+            .match_id = match_id,
+            .sender_slot = self.localProtocolSlot(),
+            .outcome = online_session.resultOutcomeFromMatchOutcome(outcome),
+            .frame_cursor = peer.frameCursor(),
+            .state_hash = peer.stateHash(),
+        } }, encoded.bytes[0..]) catch return;
+        web_transport.send(encoded.slice()) catch {};
+        self.sent_result = true;
+    }
+
+    fn setRoom(self: *OnlineState, room_id: []const u8) bool {
+        if (room_id.len == 0 or room_id.len > self.room_buf.len) {
+            self.markTerminal(.failed, "Invalid invite room id.", .{});
+            return false;
+        }
+        @memcpy(self.room_buf[0..room_id.len], room_id);
+        self.room_len = room_id.len;
+        return true;
+    }
+
+    fn refreshJoinUrl(self: *OnlineState) void {
+        if (self.room_len == 0) return;
+        const url = web_invite.joinUrl(self.roomId(), &self.join_url_buf) catch {
+            self.join_url_len = 0;
+            return;
+        };
+        self.join_url_len = url.len;
+    }
+
+    fn markTerminal(self: *OnlineState, terminal: OnlineTerminal, comptime fmt: []const u8, args: anytype) void {
+        self.enterTerminal(terminal, .none, fmt, args);
+    }
+
+    fn enterTerminal(self: *OnlineState, terminal: OnlineTerminal, packet: OnlineTerminalPacket, comptime fmt: []const u8, args: anytype) void {
+        if (self.terminal != .none) return;
+        self.flushPendingInputBestEffort();
+        switch (packet) {
+            .none => {},
+            .result => self.sendResultBestEffort(),
+            .desync => self.sendDesyncBestEffort(),
+            .disconnect => |reason| self.sendDisconnectBestEffort(reason),
+        }
+        self.terminal = terminal;
+        self.setMessage(fmt, args);
+        web_transport.disconnect();
+    }
+
+    fn setMessage(self: *OnlineState, comptime fmt: []const u8, args: anytype) void {
+        const text = std.fmt.bufPrint(&self.message_buf, fmt, args) catch {
+            const fallback = "online status message too long";
+            @memcpy(self.message_buf[0..fallback.len], fallback);
+            self.message_len = fallback.len;
+            return;
+        };
+        self.message_len = text.len;
+    }
+
+    fn setNotice(self: *OnlineState, comptime fmt: []const u8, args: anytype) void {
+        const text = std.fmt.bufPrint(&self.notice_buf, fmt, args) catch {
+            const fallback = "online notice too long";
+            @memcpy(self.notice_buf[0..fallback.len], fallback);
+            self.notice_len = fallback.len;
+            self.notice_frames_left = online_notice_frames;
+            return;
+        };
+        self.notice_len = text.len;
+        self.notice_frames_left = online_notice_frames;
+    }
+
+    fn tickNotice(self: *OnlineState) void {
+        if (self.notice_frames_left > 0) self.notice_frames_left -= 1;
+    }
+
+    fn isPlaying(self: *const OnlineState) bool {
+        const session = self.sessionConst() orelse return false;
+        return session.state == .playing;
+    }
+
+    fn currentMatchId(self: *const OnlineState) ?u64 {
+        const session = self.sessionConst() orelse return null;
+        return session.match_id;
+    }
+
+    fn resultCompletionState(self: *const OnlineState) online_session.ResultCompletionState {
+        return .{
+            .pending_remote_result = self.pending_remote_result != null,
+            .sent_result = self.sent_result,
+            .has_local_outcome = if (self.lockstepPeerConst()) |peer| peer.match.outcome != null else false,
+            .result_drain_active = self.result_drain_frames_left > 0,
+        };
+    }
+
+    fn shouldDeferPeerLeaveDisconnect(self: *const OnlineState) bool {
+        return online_session.shouldDeferPeerLeaveDisconnect(self.resultCompletionState());
+    }
+
+    fn localProtocolSlot(self: *const OnlineState) u8 {
+        return online_session.localProtocolSlotForRole(self.role orelse .host);
+    }
+
+    fn phaseText(self: *const OnlineState) [:0]const u8 {
+        return switch (self.terminal) {
+            .finished => "finished",
+            .disconnected => "disconnected",
+            .desynced => "desynced",
+            .unsupported => "web-only unsupported",
+            .failed => "error",
+            .none => if (self.sessionConst()) |session| switch (session.state) {
+                .waiting_for_setup => "waiting for host setup",
+                .waiting_for_ack => "waiting for join ack",
+                .setup_received => "sending join ack",
+                .playing => if (self.sent_result and self.pending_remote_result == null) "validating result" else "playing",
+            } else "starting online",
+        };
+    }
+
+    fn roleText(self: *const OnlineState) [:0]const u8 {
+        return switch (self.role orelse return "not assigned") {
+            .host => "host P1",
+            .joiner => "joiner P2",
+        };
+    }
+
+    fn roomId(self: *const OnlineState) []const u8 {
+        return self.room_buf[0..self.room_len];
+    }
+
+    fn joinUrl(self: *const OnlineState) []const u8 {
+        return self.join_url_buf[0..self.join_url_len];
+    }
+
+    fn message(self: *const OnlineState) []const u8 {
+        return self.message_buf[0..self.message_len];
+    }
+
+    fn notice(self: *const OnlineState) []const u8 {
+        return self.notice_buf[0..self.notice_len];
+    }
+
+    fn sessionPtr(self: *OnlineState) ?*online_session.Session {
+        return if (self.session) |*session| session else null;
+    }
+
+    fn sessionConst(self: *const OnlineState) ?*const online_session.Session {
+        return if (self.session) |*session| session else null;
+    }
+
+    fn lockstepPeer(self: *OnlineState) ?*lockstep.Peer {
+        const session = self.sessionPtr() orelse return null;
+        return if (session.peer) |*peer_value| peer_value else null;
+    }
+
+    fn lockstepPeerConst(self: *const OnlineState) ?*const lockstep.Peer {
+        const session = self.sessionConst() orelse return null;
+        return if (session.peer) |*peer_value| peer_value else null;
+    }
+};
+
 const App = struct {
     mode: Mode,
 
     fn init() App {
-        return .{ .mode = switch (app_controls.initialMode()) {
-            .single => .{ .single = SinglePlayerState.init() },
-            .local_versus => .{ .local_versus = LocalVersusState.init() },
-        } };
+        var app = App{ .mode = .{ .single = SinglePlayerState.init() } };
+        var room_buf: [web_invite.MaxRoomIdLength]u8 = undefined;
+        switch (initialOnlineFromLocation(&room_buf)) {
+            .none => {},
+            .join_room => |room| {
+                app.startOnlineJoin(room);
+                return app;
+            },
+            .join_error => |err| {
+                app.startOnlineJoinError(err);
+                return app;
+            },
+        }
+
+        switch (app_controls.initialMode()) {
+            .single => {},
+            .local_versus => app.mode = .{ .local_versus = LocalVersusState.init() },
+            .online => app.startOnlineHost(),
+        }
+        return app;
     }
 
     fn updateAndDraw(self: *App) void {
@@ -175,11 +924,12 @@ const App = struct {
         };
 
         // Draw the new mode immediately, but do not let gameplay keys chorded
-        // with 1/2 step a freshly-created game on the transition frame.
+        // with 1/2/3 step a freshly-created game on the transition frame.
         if (!changed_mode) {
             switch (self.mode) {
                 .single => |*single| single.update(),
                 .local_versus => |*versus| versus.update(),
+                .online => |*online| online.update(),
             }
         }
 
@@ -190,6 +940,7 @@ const App = struct {
         switch (self.mode) {
             .single => |*single| single.draw(),
             .local_versus => |*versus| versus.draw(),
+            .online => |*online| online.draw(),
         }
         drawWebTransportFooter();
 
@@ -200,14 +951,48 @@ const App = struct {
         return switch (self.mode) {
             .single => .single,
             .local_versus => .local_versus,
+            .online => .online,
         };
     }
 
     fn startMode(self: *App, mode: AppMode) void {
-        self.mode = switch (mode) {
-            .single => .{ .single = SinglePlayerState.init() },
-            .local_versus => .{ .local_versus = LocalVersusState.init() },
-        };
+        self.deinitOnlineIfActive();
+        switch (mode) {
+            .single => self.mode = .{ .single = SinglePlayerState.init() },
+            .local_versus => self.mode = .{ .local_versus = LocalVersusState.init() },
+            .online => self.startOnlineHost(),
+        }
+    }
+
+    fn startOnlineHost(self: *App) void {
+        self.mode = .{ .online = undefined };
+        switch (self.mode) {
+            .online => |*online| online.startHost(),
+            else => unreachable,
+        }
+    }
+
+    fn startOnlineJoin(self: *App, room_id: []const u8) void {
+        self.mode = .{ .online = undefined };
+        switch (self.mode) {
+            .online => |*online| online.startJoinRoom(room_id),
+            else => unreachable,
+        }
+    }
+
+    fn startOnlineJoinError(self: *App, err: anyerror) void {
+        self.mode = .{ .online = undefined };
+        switch (self.mode) {
+            .online => |*online| online.startJoinError(err),
+            else => unreachable,
+        }
+    }
+
+    fn deinitOnlineIfActive(self: *App) void {
+        switch (self.mode) {
+            .online => |*online| online.deinit(),
+            else => {},
+        }
     }
 };
 
@@ -224,6 +1009,7 @@ pub fn main() void {
         rl.setTargetFPS(@intCast(input.FixedFps));
 
         var app = App.init();
+        defer app.deinitOnlineIfActive();
         while (!rl.windowShouldClose()) {
             app.updateAndDraw();
         }
@@ -234,10 +1020,70 @@ fn updateDrawFrame() callconv(.c) void {
     web_app.updateAndDraw();
 }
 
+const InitialOnline = union(enum) {
+    none,
+    join_room: []const u8,
+    join_error: anyerror,
+};
+
+fn initialOnlineFromLocation(room_buf: *[web_invite.MaxRoomIdLength]u8) InitialOnline {
+    const join_room = web_invite.initialJoinRoom(room_buf) catch |err| return .{ .join_error = err };
+    if (join_room) |room| return .{ .join_room = room };
+    return .none;
+}
+
 fn localVersusSettings() match_mod.MatchSettings {
     return .{
         .player_seeds = .{ game_seed, p2_game_seed },
-        .ruleset = .{ .modern = .{ .garbage_seed = local_garbage_seed } },
+        .ruleset = modernRulesetSettings(local_garbage_seed),
+    };
+}
+
+fn onlineSettingsForRoom(room_id: []const u8) match_mod.MatchSettings {
+    return .{
+        .player_seeds = .{
+            onlineSeed("p1", room_id),
+            onlineSeed("p2", room_id),
+        },
+        .ruleset = modernRulesetSettings(onlineSeed("garbage", room_id)),
+    };
+}
+
+fn modernRulesetSettings(garbage_seed: u64) match_mod.RulesetSettings {
+    return .{ .modern = .{
+        .garbage_seed = garbage_seed,
+        .garbage = .{
+            .hole_change_chance = .{ .numerator = 1, .denominator = 4 },
+            .initial_holes = .{ null, null },
+        },
+    } };
+}
+
+fn onlineMatchIdForRoom(room_id: []const u8) u64 {
+    return onlineSeed("match", room_id);
+}
+
+fn onlineSeed(comptime label: []const u8, room_id: []const u8) u64 {
+    var hasher = std.hash.XxHash64.init(online_hash_seed);
+    hasher.update("Zigfall.Phase6.Online.");
+    hasher.update(label);
+    hasher.update(".");
+    hasher.update(room_id);
+    return hasher.final();
+}
+
+fn protocolErrorText(reason: lockstep.ProtocolError) [:0]const u8 {
+    return switch (reason) {
+        .invalid_player_slot => "invalid player slot",
+        .input_window_exceeded => "input window exceeded",
+        .state_hash_window_exceeded => "state hash window exceeded",
+        .frame_index_overflow => "frame index overflow",
+        .restart_input_unsupported => "restart input unsupported",
+        .conflicting_input_duplicate => "conflicting input duplicate",
+        .conflicting_state_hash => "conflicting state hash",
+        .malformed_packet => "malformed packet",
+        .state_hash_too_old => "state hash too old",
+        .unexpected_sender_slot => "unexpected sender slot",
     };
 }
 
@@ -245,6 +1091,7 @@ fn modeHotkeyTransition(current_mode: AppMode) app_controls.ModeTransition {
     return app_controls.modeTransitionForHotkey(current_mode, .{
         .one_pressed = rl.isKeyPressed(.one),
         .two_pressed = rl.isKeyPressed(.two),
+        .three_pressed = rl.isKeyPressed(.three),
     });
 }
 
@@ -285,6 +1132,23 @@ fn readLocalVersusInput() match_mod.MatchInput {
         .p2_period = keyState(.period),
         .p2_slash = keyState(.slash),
         .p2_right_shift = keyState(.right_shift),
+    });
+}
+
+fn readOnlineInput() app_controls.OnlineInput {
+    return app_controls.onlineInputFromKeys(.{
+        .global_p = keyState(.p),
+        .global_r = keyState(.r),
+        .copy_c = keyState(.c),
+        .left_arrow = keyState(.left),
+        .right_arrow = keyState(.right),
+        .down_arrow = keyState(.down),
+        .space = keyState(.space),
+        .x = keyState(.x),
+        .up_arrow = keyState(.up),
+        .z = keyState(.z),
+        .a = keyState(.a),
+        .left_shift = keyState(.left_shift),
     });
 }
 
@@ -329,11 +1193,31 @@ fn drawVersusHeader(match_state: *const match_mod.Match) void {
     rl.drawText(rl.textFormat("input %u  gameplay %u", .{ @as(u32, @truncate(match_state.input_frame_count)), @as(u32, @truncate(match_state.gameplay_frame_count)) }), right_x, 50, 14, color_text_dim);
 }
 
+fn drawOnlineHeader(online: *const OnlineState, match_state: ?*const match_mod.Match) void {
+    rl.drawText("ZIGFALL ONLINE", 36, 22, 30, color_text);
+    rl.drawText("Web invite-link P2P versus", 38, 55, 15, color_text_dim);
+    drawModeHotkeyHint(.online);
+
+    const right_x: i32 = 750;
+    rl.drawText(rl.textFormat("FPS %i / fixed %i", .{ rl.getFPS(), @as(i32, input.FixedFps) }), right_x, 22, 18, color_accent);
+    if (match_state) |state| {
+        rl.drawText(rl.textFormat("input %u  gameplay %u  %s", .{
+            @as(u32, @truncate(state.input_frame_count)),
+            @as(u32, @truncate(state.gameplay_frame_count)),
+            online.phaseText().ptr,
+        }), right_x, 50, 14, color_text_dim);
+    } else {
+        rl.drawText(rl.textFormat("%s | transport %s", .{ online.phaseText().ptr, web_transport.status().text().ptr }), right_x, 50, 14, color_text_dim);
+    }
+}
+
 fn drawModeHotkeyHint(active_mode: AppMode) void {
-    const x: i32 = 430;
+    const x: i32 = 390;
     rl.drawText("1: ONE-PLAYER", x, 24, 16, if (active_mode == .single) color_accent else color_text_dim);
-    rl.drawText("2: LOCAL VERSUS", x + 150, 24, 16, if (active_mode == .local_versus) color_accent else color_text_dim);
-    rl.drawText("P pause   R restart", x, 52, 13, color_text_dim);
+    rl.drawText("2: LOCAL", x + 145, 24, 16, if (active_mode == .local_versus) color_accent else color_text_dim);
+    rl.drawText("3: ONLINE", x + 255, 24, 16, if (active_mode == .online) color_accent else color_text_dim);
+    const hint = if (active_mode == .online) "P pause   C copy link   R no rematch" else "P pause   R restart";
+    rl.drawText(hint, x, 52, 13, color_text_dim);
 }
 
 fn drawPanel(x: i32, y: i32, w: i32, h: i32, title: [:0]const u8) void {
@@ -720,7 +1604,101 @@ fn drawVersusControlsStrip() void {
     drawPanel(x, y, w, h, "LOCAL CONTROLS");
     rl.drawText("P1: A/D move | S soft | Space hard | W CW | Q CCW | E 180 | Left Shift hold", x + 405, y + 16, 13, color_text);
     rl.drawText("P2: Left/Right move | Down soft | Enter hard | Up CW | . CCW | / 180 | Right Shift hold", x + 405, y + 38, 13, color_text);
-    rl.drawText("Global: P pause | R restart | 1 one-player | 2 local versus", x + 18, y + 38, 13, color_text_dim);
+    rl.drawText("Global: P pause | R restart | 1 one-player | 2 local versus | 3 online invite", x + 18, y + 38, 13, color_text_dim);
+}
+
+fn drawOnlineControlsStrip(online: *const OnlineState) void {
+    const x: i32 = 28;
+    const y: i32 = 634;
+    const w: i32 = 1044;
+    const h: i32 = 62;
+    drawPanel(x, y, w, h, "ONLINE INVITE / CONTROLS");
+    rl.drawText(rl.textFormat("You: %s | phase: %s | copy: %s", .{
+        online.roleText().ptr,
+        online.phaseText().ptr,
+        web_invite.copyStatus().text().ptr,
+    }), x + 18, y + 18, 13, color_text);
+    if (online.room_len > 0) {
+        rl.drawText(rl.textFormat("Room %.*s", .{ @as(i32, @intCast(online.roomId().len)), online.roomId().ptr }), x + 18, y + 40, 13, color_text_dim);
+    } else {
+        rl.drawText("No active room", x + 18, y + 40, 13, color_text_dim);
+    }
+    rl.drawText("Move: Left/Right/Down | Space hard | X/Up CW | Z CCW | A 180 | Left Shift hold", x + 400, y + 18, 13, color_text);
+    rl.drawText("P deterministic pause | C copy invite link | R rematch no-op | 1/2 switch modes", x + 400, y + 40, 13, color_text_dim);
+}
+
+fn drawOnlineWaitingPanel(online: *const OnlineState) void {
+    const x: i32 = 250;
+    const y: i32 = 160;
+    const w: i32 = 600;
+    const h: i32 = 330;
+    drawPanel(x, y, w, h, "ONLINE INVITE");
+    drawTextSlice(online.message(), x + 28, y + 56, 18, color_text);
+    rl.drawText(rl.textFormat("Role: %s", .{online.roleText().ptr}), x + 28, y + 92, 16, color_text_dim);
+    rl.drawText(rl.textFormat("Phase: %s", .{online.phaseText().ptr}), x + 28, y + 118, 16, color_text_dim);
+
+    if (online.room_len > 0) {
+        rl.drawText(rl.textFormat("Room: %.*s", .{ @as(i32, @intCast(online.roomId().len)), online.roomId().ptr }), x + 28, y + 158, 16, color_accent);
+    }
+    if (online.join_url_len > 0) {
+        rl.drawText("Join URL:", x + 28, y + 194, 15, color_text_dim);
+        const url = online.joinUrl();
+        const shown_len = @min(url.len, 88);
+        const suffix: [:0]const u8 = if (shown_len < url.len) "..." else "";
+        rl.drawText(rl.textFormat("%.*s%s", .{
+            @as(i32, @intCast(shown_len)),
+            url.ptr,
+            suffix.ptr,
+        }), x + 28, y + 218, 13, color_text);
+    }
+
+    rl.drawText("Press C to copy the invite link. Press 1/2 to leave, or 3 from another mode for a fresh invite.", x + 28, y + h - 54, 15, color_text_dim);
+    rl.drawText(rl.textFormat("Transport: %s | peers %i | last error %s", .{
+        web_transport.status().text().ptr,
+        @as(i32, web_transport.peerCount()),
+        web_transport.lastError().text().ptr,
+    }), x + 28, y + h - 28, 13, color_text_dim);
+}
+
+fn drawOnlineWaitingOverlay(online: *const OnlineState) void {
+    drawScreenOverlay("ONLINE WAIT", rl.textFormat("%.*s", .{ @as(i32, @intCast(online.message().len)), online.message().ptr }), color_accent);
+}
+
+fn drawOnlineTerminalOverlay(online: *const OnlineState) void {
+    const title: [:0]const u8 = switch (online.terminal) {
+        .finished => if (online.lockstepPeerConst()) |peer| if (peer.match.outcome) |outcome| matchOutcomeTitle(outcome) else "MATCH COMPLETE" else "MATCH COMPLETE",
+        .disconnected => "DISCONNECTED",
+        .desynced => "DESYNC",
+        .unsupported => "WEB ONLY",
+        .failed => "ONLINE ERROR",
+        .none => return,
+    };
+    const accent = switch (online.terminal) {
+        .finished => color_accent,
+        .disconnected, .unsupported => color_warning,
+        .desynced, .failed => color_danger,
+        .none => color_text,
+    };
+    drawScreenOverlay(title, rl.textFormat("%.*s", .{ @as(i32, @intCast(online.message().len)), online.message().ptr }), accent);
+}
+
+fn drawOnlineMatchOverlay(online: *const OnlineState, match_state: *const match_mod.Match) void {
+    if (match_state.outcome) |outcome| {
+        _ = online;
+        drawScreenOverlay(matchOutcomeTitle(outcome), "Online rematch is not implemented; press 1/2/3 for a fresh mode", if (isDraw(outcome)) color_warning else color_accent);
+    } else if (match_state.paused) {
+        drawScreenOverlay("PAUSED", "Press P to resume; R is disabled online", color_warning);
+    }
+}
+
+fn drawOnlineNotice(text: []const u8) void {
+    const w: i32 = 720;
+    const h: i32 = 42;
+    const x: i32 = @divTrunc(screen_width - w, 2);
+    const y: i32 = 94;
+    rl.drawRectangleRounded(rect(x, y, w, h), 0.18, 12, rl.Color.init(18, 25, 43, 244));
+    rl.drawRectangleRoundedLinesEx(rect(x, y, w, h), 0.18, 12, 1.5, color_warning);
+    drawCenteredTextSlice(text, x + @divTrunc(w, 2), y + 12, 15, color_warning);
 }
 
 fn drawMetric(label: [:0]const u8, value: [:0]const u8, x: i32, y: i32, value_color: rl.Color) void {
@@ -856,6 +1834,15 @@ fn drawOverlay(title: [:0]const u8, subtitle: [:0]const u8, accent: rl.Color) vo
 
 fn drawCenteredText(text: [:0]const u8, center_x: i32, y: i32, size: i32, color: rl.Color) void {
     rl.drawText(text, center_x - @divTrunc(rl.measureText(text, size), 2), y, size, color);
+}
+
+fn drawTextSlice(text: []const u8, x: i32, y: i32, size: i32, color: rl.Color) void {
+    rl.drawText(rl.textFormat("%.*s", .{ @as(i32, @intCast(text.len)), text.ptr }), x, y, size, color);
+}
+
+fn drawCenteredTextSlice(text: []const u8, center_x: i32, y: i32, size: i32, color: rl.Color) void {
+    const c_text = rl.textFormat("%.*s", .{ @as(i32, @intCast(text.len)), text.ptr });
+    drawCenteredText(c_text, center_x, y, size, color);
 }
 
 fn versusBoardLayout(player: match_mod.PlayerIndex) BoardLayout {

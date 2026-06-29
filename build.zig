@@ -55,6 +55,17 @@ pub fn build(b: *std.Build) void {
             .{ .name = "protocol", .module = protocol_mod },
         },
     });
+    const online_session_mod = b.addModule("online_session", .{
+        .root_source_file = b.path("src/online_session.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "input", .module = input_mod },
+            .{ .name = "lockstep", .module = lockstep_mod },
+            .{ .name = "match", .module = match_mod },
+            .{ .name = "protocol", .module = protocol_mod },
+        },
+    });
     const app_controls_mod = b.addModule("app_controls", .{
         .root_source_file = b.path("src/app_controls.zig"),
         .target = target,
@@ -72,6 +83,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "protocol", .module = protocol_mod },
         },
     });
+    const web_invite_mod = b.addModule("web_invite", .{
+        .root_source_file = b.path("src/web_invite.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const app_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -81,8 +97,12 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_controls", .module = app_controls_mod },
             .{ .name = "game", .module = game_mod },
             .{ .name = "input", .module = input_mod },
+            .{ .name = "lockstep", .module = lockstep_mod },
             .{ .name = "match", .module = match_mod },
+            .{ .name = "online_session", .module = online_session_mod },
+            .{ .name = "protocol", .module = protocol_mod },
             .{ .name = "raylib", .module = raylib },
+            .{ .name = "web_invite", .module = web_invite_mod },
             .{ .name = "web_transport", .module = web_transport_mod },
         },
     });
@@ -101,12 +121,19 @@ pub fn build(b: *std.Build) void {
             .asyncify = false,
         });
         const transport_shim_path = "web/zigfall_transport_emscripten.js";
+        const invite_shim_path = "web/zigfall_invite_emscripten.js";
         emcc_flags.put(b.fmt("--js-library={s}", .{b.path(transport_shim_path).getPath(b)}), {}) catch unreachable;
+        emcc_flags.put(b.fmt("--js-library={s}", .{b.path(invite_shim_path).getPath(b)}), {}) catch unreachable;
         // zemscripten 0.2's StepOptions cannot add a JS-library LazyPath as a
         // tracked input. Put a content hash on the emcc command line so shim
         // edits invalidate the link step, while the --js-library path still
         // makes a missing shim fail clearly.
         emcc_flags.put(b.fmt("-DZF_TRANSPORT_SHIM_SHA256={s}", .{fileSha256Hex(b, transport_shim_path)}), {}) catch unreachable;
+        emcc_flags.put(b.fmt("-DZF_INVITE_SHIM_SHA256={s}", .{fileSha256Hex(b, invite_shim_path)}), {}) catch unreachable;
+        // Online mode embeds the deterministic match/lockstep state in the app
+        // state. Emscripten's small default stack can overflow while copying the
+        // first web Session into place, especially with debug/sanitizer builds.
+        emcc_flags.put("-sSTACK_SIZE=1048576", {}) catch unreachable;
         const emcc_settings = emsdk.emccDefaultSettings(b.allocator, .{
             .optimize = optimize,
         });
@@ -118,12 +145,13 @@ pub fn build(b: *std.Build) void {
             .install_dir = install_dir,
         });
         b.getInstallStep().dependOn(emcc_step);
-        installWebTransportArtifact(b, install_dir, "web/zigfall_transport.mjs", "zigfall_transport.mjs");
-        installWebTransportArtifact(b, install_dir, "web/vendor/trystero-nostr.bundle.mjs", "vendor/trystero-nostr.bundle.mjs");
-        installWebTransportArtifact(b, install_dir, "web/vendor/README.md", "vendor/README.md");
-        installWebTransportArtifact(b, install_dir, "web/vendor/LICENSE-trystero.txt", "vendor/LICENSE-trystero.txt");
-        installWebTransportArtifact(b, install_dir, "web/vendor/LICENSE-noble-secp256k1.txt", "vendor/LICENSE-noble-secp256k1.txt");
-        installWebTransportArtifact(b, install_dir, "web/vendor/LICENSE-esbuild.txt", "vendor/LICENSE-esbuild.txt");
+        installWebArtifact(b, install_dir, "web/zigfall_transport.mjs", "zigfall_transport.mjs");
+        installWebArtifact(b, install_dir, "web/zigfall_invite.mjs", "zigfall_invite.mjs");
+        installWebArtifact(b, install_dir, "web/vendor/trystero-nostr.bundle.mjs", "vendor/trystero-nostr.bundle.mjs");
+        installWebArtifact(b, install_dir, "web/vendor/README.md", "vendor/README.md");
+        installWebArtifact(b, install_dir, "web/vendor/LICENSE-trystero.txt", "vendor/LICENSE-trystero.txt");
+        installWebArtifact(b, install_dir, "web/vendor/LICENSE-noble-secp256k1.txt", "vendor/LICENSE-noble-secp256k1.txt");
+        installWebArtifact(b, install_dir, "web/vendor/LICENSE-esbuild.txt", "vendor/LICENSE-esbuild.txt");
 
         const emrun_step = emsdk.emrunStep(
             b,
@@ -174,6 +202,10 @@ pub fn build(b: *std.Build) void {
         .root_module = lockstep_mod,
     });
     const run_lockstep_tests = b.addRunArtifact(lockstep_tests);
+    const online_session_tests = b.addTest(.{
+        .root_module = online_session_mod,
+    });
+    const run_online_session_tests = b.addRunArtifact(online_session_tests);
     const app_controls_tests = b.addTest(.{
         .root_module = app_controls_mod,
     });
@@ -182,6 +214,10 @@ pub fn build(b: *std.Build) void {
         .root_module = web_transport_mod,
     });
     const run_web_transport_tests = b.addRunArtifact(web_transport_tests);
+    const web_invite_tests = b.addTest(.{
+        .root_module = web_invite_mod,
+    });
+    const run_web_invite_tests = b.addRunArtifact(web_invite_tests);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_game_tests.step);
@@ -189,11 +225,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_protocol_tests.step);
     test_step.dependOn(&run_match_tests.step);
     test_step.dependOn(&run_lockstep_tests.step);
+    test_step.dependOn(&run_online_session_tests.step);
     test_step.dependOn(&run_app_controls_tests.step);
     test_step.dependOn(&run_web_transport_tests.step);
+    test_step.dependOn(&run_web_invite_tests.step);
 }
 
-fn installWebTransportArtifact(
+fn installWebArtifact(
     b: *std.Build,
     install_dir: std.Build.InstallDir,
     src_path: []const u8,

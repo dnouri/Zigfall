@@ -80,6 +80,13 @@ pub const EncodedPacket = struct {
     }
 };
 
+pub const LocalInputSample = struct {
+    match_id: u64,
+    player_slot: u8,
+    frame: u64,
+    frame_input: controls.FrameInput,
+};
+
 pub const Peer = struct {
     match: match_mod.Match,
     match_id: u64,
@@ -90,6 +97,7 @@ pub const Peer = struct {
     inputs: [match_mod.PlayerCount]InputStore = .{ .{}, .{} },
     pending_state_hashes: PendingStateHashes = .{},
     state_hash_history: StateHashHistory = .{},
+    last_step_result: match_mod.MatchStepResult = .{},
     status: Status = .ok,
 
     pub fn init(settings: match_mod.MatchSettings, local_slot: match_mod.PlayerIndex, input_delay_frames: u16, match_id: u64) LockstepError!Peer {
@@ -137,6 +145,12 @@ pub const Peer = struct {
     }
 
     pub fn sampleLocalInput(self: *Peer, frame_input: controls.FrameInput) LockstepError!EncodedPacket {
+        const sample = try self.sampleLocalInputFrame(frame_input);
+        const batch = try protocol.InputBatch.init(sample.match_id, sample.player_slot, sample.frame, &[_]controls.FrameInput{sample.frame_input});
+        return encodePacket(.{ .input_batch = batch });
+    }
+
+    pub fn sampleLocalInputFrame(self: *Peer, frame_input: controls.FrameInput) LockstepError!LocalInputSample {
         try self.ensureOk();
         if (hasRestartInput(frame_input)) {
             self.recordProtocolError(.restart_input_unsupported);
@@ -158,8 +172,12 @@ pub const Peer = struct {
         };
         self.local_app_tick += 1;
 
-        const batch = try protocol.InputBatch.init(self.match_id, protocolSlot(self.local_slot), target_frame, &[_]controls.FrameInput{frame_input});
-        return encodePacket(.{ .input_batch = batch });
+        return .{
+            .match_id = self.match_id,
+            .player_slot = protocolSlot(self.local_slot),
+            .frame = target_frame,
+            .frame_input = frame_input,
+        };
     }
 
     pub fn makeStateHashPacket(self: *const Peer) LockstepError!EncodedPacket {
@@ -195,12 +213,14 @@ pub const Peer = struct {
 
         var advanced: usize = 0;
         while (advanced < max_frames) {
+            if (self.match.outcome != null) break;
             const frame_cursor = self.next_frame_to_simulate;
             const p1_input = self.inputs[0].get(frame_cursor) orelse break;
             const p2_input = self.inputs[1].get(frame_cursor) orelse break;
 
             const result = self.match.step(.{ .players = .{ p1_input, p2_input } });
             std.debug.assert(!result.restarted);
+            self.last_step_result = result;
             self.next_frame_to_simulate = std.math.add(u64, self.next_frame_to_simulate, 1) catch {
                 self.recordProtocolError(.frame_index_overflow);
                 return error.FrameIndexOverflow;
@@ -210,6 +230,7 @@ pub const Peer = struct {
             advanced += 1;
 
             try self.checkPendingStateHash();
+            if (self.match.outcome != null) break;
         }
         return advanced;
     }
@@ -706,6 +727,21 @@ test "delayed and out-of-order packets eventually converge peers" {
     try std.testing.expectEqual(@as(u64, 2 + p1_inputs.len), p1.frameCursor());
     try std.testing.expectEqual(p1.frameCursor(), p2.frameCursor());
     try std.testing.expectEqual(p1.stateHash(), p2.stateHash());
+}
+
+test "batched stepping stops on the first terminal frame" {
+    var peer = try Peer.init(testSettings(), .p1, 0, TestMatchId);
+    peer.match.players[0].game.game_over = true;
+
+    try peer.putInput(0, 0, .{});
+    try peer.putInput(1, 0, .{});
+    try peer.putInput(0, 1, .{});
+    try peer.putInput(1, 1, .{});
+
+    try std.testing.expectEqual(@as(usize, 1), try peer.stepAvailableMax(4));
+    try std.testing.expectEqual(@as(u64, 1), peer.frameCursor());
+    try std.testing.expectEqual(@as(u64, 1), peer.match.input_frame_count);
+    try std.testing.expect(peer.match.outcome != null);
 }
 
 test "future packet waits behind earlier frame gap" {

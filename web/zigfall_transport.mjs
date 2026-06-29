@@ -3,7 +3,10 @@
 import { joinRoom, selfId } from "./vendor/trystero-nostr.bundle.mjs";
 
 const MaxPacketSize = 512;
-const MaxQueuedPackets = 64;
+// Bounded inbound backlog for the Zig poll bridge. Online lockstep now batches
+// inputs, but brief browser scheduling stalls can still deliver bursts; keep the
+// cap finite while giving the app a few seconds at 60 Hz to drain gracefully.
+const MaxQueuedPackets = 256;
 const MaxRoomIdLength = 128;
 const AppId = "zigfall-trystero-v1";
 const PacketActionName = "pkt";
@@ -219,7 +222,9 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId 
         peers.delete(peerId);
         if (wasSelected) {
           selectedPeerId = null;
-          incoming = [];
+          // Keep already-queued selected-peer packets available for Zig to poll
+          // before it observes noPeer; final result/disconnect packets can race
+          // with the Trystero leave callback.
           setError(ErrorCode.noPeer, "selected peer left room");
         } else if (lastError === ErrorCode.busy && extraPeerCount() === 0) {
           clearError();
