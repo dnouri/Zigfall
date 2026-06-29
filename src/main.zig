@@ -61,7 +61,7 @@ const online_remote_input_stall_notice_frames: u16 = 30;
 const online_message_capacity: usize = 192;
 const online_notice_capacity: usize = 128;
 
-const single_board_layout = BoardLayout{ .x = 330, .y = 118, .cell = single_cell_size };
+const single_board_layout = BoardLayout{ .x = 330, .y = 140, .cell = single_cell_size };
 const versus_p1_board_layout = BoardLayout{ .x = 180, .y = 160, .cell = versus_cell_size };
 const versus_p2_board_layout = BoardLayout{ .x = 740, .y = 160, .cell = versus_cell_size };
 
@@ -105,7 +105,6 @@ const SinglePlayerState = struct {
     controller: input.Controller,
     paused: bool,
     gravity_counter: u16,
-    frame_count: u64,
 
     fn init() SinglePlayerState {
         return .{
@@ -113,7 +112,6 @@ const SinglePlayerState = struct {
             .controller = .{},
             .paused = false,
             .gravity_counter = 0,
-            .frame_count = 0,
         };
     }
 
@@ -131,15 +129,13 @@ const SinglePlayerState = struct {
             const step_result = self.state.step(.{ .apply_gravity = gravity_due });
             if (step_result.lock_result != null) self.gravity_counter = 0;
         }
-
-        self.frame_count += 1;
     }
 
     fn draw(self: *const SinglePlayerState) void {
-        drawSingleHeader(&self.state, self.frame_count);
+        drawSingleHeader();
         drawHoldPanel(&self.state);
         drawControlsPanel();
-        drawBoard(&self.state, single_board_layout, "MATRIX", "hidden spawn rows above this line");
+        drawBoard(&self.state, single_board_layout, "MATRIX", "");
         drawNextPanel(&self.state);
         drawStatusPanel(&self.state, self.paused);
 
@@ -993,6 +989,23 @@ const OnlineState = struct {
         };
     }
 
+    fn phaseShortText(self: *const OnlineState) [:0]const u8 {
+        return switch (self.terminal) {
+            .finished => "finished",
+            .unverified_result => "unverified",
+            .disconnected => "disconnected",
+            .desynced => "desynced",
+            .unsupported => "unsupported",
+            .failed => "error",
+            .none => if (self.sessionConst()) |session| switch (session.state) {
+                .waiting_for_setup => "setup",
+                .waiting_for_ack => "waiting",
+                .setup_received => "acking",
+                .playing => if (self.sent_result) "validating" else "playing",
+            } else "starting",
+        };
+    }
+
     fn roleText(self: *const OnlineState) [:0]const u8 {
         return switch (self.role orelse return "not assigned") {
             .host => "host P1",
@@ -1124,9 +1137,11 @@ const App = struct {
         switch (self.mode) {
             .single => |*single| single.draw(),
             .local_versus => |*versus| versus.draw(),
-            .online => |*online| online.draw(),
+            .online => |*online| {
+                online.draw();
+                drawWebTransportFooter();
+            },
         }
-        drawWebTransportFooter();
 
         rl.endDrawing();
     }
@@ -1357,14 +1372,10 @@ fn drawBackground() void {
     }
 }
 
-fn drawSingleHeader(state: *const game.Game, frame_count: u64) void {
+fn drawSingleHeader() void {
     rl.drawText("ZIGFALL", 36, 22, 30, color_text);
-    rl.drawText("Advanced scoring, hold, ghost, DAS/ARR, lock delay", 38, 55, 15, color_text_dim);
+    rl.drawText("Advanced scoring, hold, ghost, DAS/ARR", 38, 55, 15, color_text_dim);
     drawModeHotkeyHint(.single);
-
-    const right_x: i32 = 820;
-    rl.drawText(rl.textFormat("FPS %i / fixed %i", .{ rl.getFPS(), @as(i32, input.FixedFps) }), right_x, 22, 18, color_accent);
-    rl.drawText(rl.textFormat("frame %u  pieces %u", .{ @as(u32, @truncate(frame_count)), state.pieces_locked }), right_x, 50, 14, color_text_dim);
 }
 
 fn drawVersusHeader(match_state: *const match_mod.Match) void {
@@ -1400,8 +1411,6 @@ fn drawModeHotkeyHint(active_mode: AppMode) void {
     rl.drawText("1: ONE-PLAYER", x, 24, 16, if (active_mode == .single) color_accent else color_text_dim);
     rl.drawText("2: LOCAL", x + 145, 24, 16, if (active_mode == .local_versus) color_accent else color_text_dim);
     rl.drawText("3: ONLINE", x + 255, 24, 16, if (active_mode == .online) color_accent else color_text_dim);
-    const hint = if (active_mode == .online) "P pause   C copy link   R no rematch" else "P pause   R restart";
-    rl.drawText(hint, x, 52, 13, color_text_dim);
 }
 
 fn drawPanel(x: i32, y: i32, w: i32, h: i32, title: [:0]const u8) void {
@@ -1436,28 +1445,20 @@ fn drawControlsPanel() void {
     const x: i32 = 40;
     const y: i32 = 302;
     const w: i32 = 250;
-    const h: i32 = 320;
+    const h: i32 = 196;
     drawPanel(x, y, w, h, "CONTROLS");
 
     var line_y: i32 = y + 50;
-    drawHelpLine("Move", "Left / Right", x + 20, line_y);
+    drawHelpLine("Move", "Left/Right/Down", x + 20, line_y);
     line_y += 28;
-    drawHelpLine("Soft drop", "Down", x + 20, line_y);
+    drawHelpLine("Rotate", "X/Up, Z, A", x + 20, line_y);
     line_y += 28;
-    drawHelpLine("Hard drop", "Space", x + 20, line_y);
+    drawHelpLine("Drop", "Space", x + 20, line_y);
     line_y += 28;
-    drawHelpLine("Rotate", "X/Up CW, Z CCW", x + 20, line_y);
-    line_y += 28;
-    drawHelpLine("180", "A", x + 20, line_y);
-    line_y += 28;
-    drawHelpLine("Hold", "C or Left Shift", x + 20, line_y);
-    line_y += 28;
-    drawHelpLine("Pause", "P", x + 20, line_y);
-    line_y += 28;
-    drawHelpLine("Restart", "R", x + 20, line_y);
+    drawHelpLine("Hold", "C / Left Shift", x + 20, line_y);
 
     rl.drawLine(x + 18, y + h - 38, x + w - 18, y + h - 38, color_panel_border.alpha(0.45));
-    rl.drawText(rl.textFormat("DAS %if  ARR %if  Lock %if", .{ @as(i32, input.DasDelayFrames), @as(i32, input.ArrIntervalFrames), @as(i32, game.DefaultLockDelayFrames) }), x + 20, y + h - 25, 13, color_text_dim);
+    rl.drawText("P pause   R restart", x + 20, y + h - 25, 14, color_text_dim);
 }
 
 fn drawHelpLine(label: [:0]const u8, value: [:0]const u8, x: i32, y: i32) void {
@@ -1475,8 +1476,8 @@ fn drawBoard(state: *const game.Game, layout: BoardLayout, title: [:0]const u8, 
 
     rl.drawRectangleRounded(rect(frame_x, frame_y, frame_w, frame_h), 0.045, 14, color_panel);
     rl.drawRectangleRoundedLinesEx(rect(frame_x, frame_y, frame_w, frame_h), 0.045, 14, 1.5, color_panel_border);
-    rl.drawText(title, layout.x, layout.y - 38, 18, color_text);
-    if (subtitle.len > 0) rl.drawText(subtitle, layout.x + 82, layout.y - 35, 12, color_text_dim);
+    rl.drawText(title, layout.x, layout.y - 44, 18, color_text);
+    if (subtitle.len > 0) rl.drawText(subtitle, layout.x + 82, layout.y - 41, 12, color_text_dim);
 
     rl.drawRectangle(layout.x - 5, layout.y - 5, board_w + 10, board_h + 10, rl.Color.init(2, 5, 12, 255));
     rl.drawRectangle(layout.x - 3, layout.y - 3, board_w + 6, board_h + 6, color_panel_border);
@@ -1535,10 +1536,10 @@ fn drawHiddenBoundary(layout: BoardLayout) void {
 
     var segment_x = layout.x;
     while (segment_x < layout.x + board_w) : (segment_x += 18) {
-        rl.drawLine(segment_x, layout.y - 8, @min(segment_x + 10, layout.x + board_w), layout.y - 8, color_warning.alpha(0.75));
+        rl.drawLine(segment_x, layout.y - 5, @min(segment_x + 10, layout.x + board_w), layout.y - 5, color_warning.alpha(0.75));
     }
 
-    rl.drawText("SPAWN / HIDDEN", layout.x + 4, layout.y - 22, 11, color_warning);
+    rl.drawText("SPAWN", layout.x + 4, layout.y - 18, 11, color_warning);
 }
 
 fn drawBoardGameOverBadge(layout: BoardLayout) void {
@@ -1604,7 +1605,7 @@ fn drawStatusPanel(state: *const game.Game, paused: bool) void {
     const x: i32 = 810;
     const y: i32 = 112;
     const w: i32 = 250;
-    const h: i32 = 568;
+    const h: i32 = 430;
     drawPanel(x, y, w, h, "STATUS");
 
     var line_y: i32 = y + 48;
@@ -1618,48 +1619,38 @@ fn drawStatusPanel(state: *const game.Game, paused: bool) void {
     line_y += 25;
     drawMetric("Speed", rl.textFormat("%if/cell", .{@as(i32, state.gravityIntervalFrames())}), x + 18, line_y, color_text);
     line_y += 25;
-    drawMetric("Lock", rl.textFormat("%i/%i  resets %i", .{ @as(i32, state.lock_delay_elapsed), @as(i32, state.lock_delay_frames), @as(i32, state.max_lock_move_resets - state.lock_move_resets_used) }), x + 18, line_y, color_text_dim);
-    line_y += 25;
     drawMetric("Combo", comboText(state.combo_counter), x + 18, line_y, if (state.combo_counter >= 1) color_warning else color_text_dim);
     line_y += 25;
     drawMetric("B2B", if (state.back_to_back_active) "active" else "off", x + 18, line_y, if (state.back_to_back_active) color_warning else color_text_dim);
 
-    line_y += 38;
+    line_y += 30;
     drawSectionTitle("LAST LOCK", x + 18, line_y);
     line_y += 26;
 
     if (state.last_lock_result) |result| {
         drawMetric("Piece", pieceLabel(result.piece_kind), x + 18, line_y, pieceColor(result.piece_kind));
         line_y += 23;
-        drawMetric("Clear", clearSummary(result), x + 18, line_y, if (result.lines_cleared > 0) color_accent else color_text_dim);
+        drawMetric("Clear", clearSummary(result), x + 18, line_y, if (result.lines_cleared > 0 or result.t_spin_kind != .none) color_accent else color_text_dim);
         line_y += 23;
-        drawMetric("T-spin", tSpinValue(result.t_spin_kind), x + 18, line_y, if (result.t_spin_kind == .none) color_text_dim else color_warning);
-        line_y += 23;
-        drawMetric("Perfect", if (result.perfect_clear) "YES" else "no", x + 18, line_y, if (result.perfect_clear) color_warning else color_text_dim);
-        line_y += 23;
-        drawMetric("Output", rl.textFormat("+%i", .{@as(i32, result.attack_lines)}), x + 18, line_y, if (result.attack_lines > 0) color_danger else color_text_dim);
+        drawMetric("Attack", rl.textFormat("+%i", .{@as(i32, result.attack_lines)}), x + 18, line_y, if (result.attack_lines > 0) color_danger else color_text_dim);
         line_y += 23;
         drawMetric("Score +", rl.textFormat("%u", .{result.score_delta}), x + 18, line_y, color_text);
-        line_y += 23;
-        drawMetric("Base/B2B", rl.textFormat("%u / %u", .{ result.base_score_points, result.back_to_back_bonus_points }), x + 18, line_y, color_text_dim);
-        line_y += 23;
-        drawMetric("Combo/PC", rl.textFormat("%u / %u", .{ result.combo_bonus_points, result.perfect_clear_bonus_points }), x + 18, line_y, color_text_dim);
-        line_y += 23;
-        drawMetric("Drop", rl.textFormat("HD %u:%u  SD %u", .{ result.hard_drop_cells, result.hard_drop_points, result.soft_drop_points }), x + 18, line_y, color_text_dim);
+        if (result.perfect_clear) {
+            line_y += 23;
+            drawMetric("Perfect", "YES", x + 18, line_y, color_warning);
+        }
     } else {
         drawMetric("Clear", "none yet", x + 18, line_y, color_text_dim);
     }
 
-    rl.drawLine(x + 18, y + h - 54, x + w - 18, y + h - 54, color_panel_border.alpha(0.45));
-    rl.drawText(rl.textFormat("FPS: %i    fixed step: %i", .{ rl.getFPS(), @as(i32, input.FixedFps) }), x + 18, y + h - 37, 14, color_accent);
-    rl.drawText(exitInstructionText(), x + 18, y + h - 18, 12, color_text_dim);
+    rl.drawText(exitInstructionText(), x + 18, y + h - 24, 12, color_text_dim);
 }
 
 fn drawVersusPlayer(player: match_mod.PlayerIndex, match_state: *const match_mod.Match, player_result: match_mod.PlayerStepResult, outcome_verified: bool) void {
     const runtime = match_state.playerConst(player);
     const layout = versusBoardLayout(player);
     drawVersusSidePanels(player, &runtime.game);
-    drawBoard(&runtime.game, layout, playerMatrixTitle(player), "garbage in panel");
+    drawBoard(&runtime.game, layout, playerMatrixTitle(player), "");
     drawVersusStatusPanel(player, match_state, runtime, player_result, outcome_verified);
 }
 
@@ -1787,33 +1778,41 @@ fn drawVersusStatusPanel(player: match_mod.PlayerIndex, match_state: *const matc
 
 fn drawVersusControlsStrip() void {
     const x: i32 = 28;
-    const y: i32 = 634;
+    const y: i32 = 626;
     const w: i32 = 1044;
-    const h: i32 = 62;
+    const h: i32 = 70;
     drawPanel(x, y, w, h, "LOCAL CONTROLS");
-    rl.drawText("P1: A/D move | S soft | Space hard | W CW | Q CCW | E 180 | Left Shift hold", x + 405, y + 16, 13, color_text);
-    rl.drawText("P2: Left/Right move | Down soft | Enter hard | Up CW | . CCW | / 180 | Right Shift hold", x + 405, y + 38, 13, color_text);
-    rl.drawText("Global: P pause | R restart | 1 one-player | 2 local versus | 3 online invite", x + 18, y + 38, 13, color_text_dim);
+    rl.drawText("Global: P pause | R restart | Modes 1 one-player, 2 local, 3 online", x + 338, y + 18, 12, color_text_dim);
+    rl.drawLine(x + 522, y + 40, x + 522, y + h - 12, color_panel_border.alpha(0.45));
+    rl.drawText("P1: A/D move | S soft | Space hard | W CW | Q CCW | E 180 | LShift", x + 18, y + 44, 12, color_text);
+    rl.drawText("P2: Arrows move/soft | Enter hard | Up CW | . CCW | / 180 | RShift", x + 542, y + 44, 12, color_text);
 }
 
 fn drawOnlineControlsStrip(online: *const OnlineState) void {
     const x: i32 = 28;
-    const y: i32 = 634;
+    const y: i32 = 624;
     const w: i32 = 1044;
-    const h: i32 = 62;
-    drawPanel(x, y, w, h, "ONLINE INVITE / CONTROLS");
-    rl.drawText(rl.textFormat("You: %s | phase: %s | copy: %s", .{
+    const h: i32 = 70;
+    drawPanel(x, y, w, h, "ONLINE");
+    rl.drawText(rl.textFormat("%s | %s | copy %s", .{
         online.roleText().ptr,
-        online.phaseText().ptr,
+        online.phaseShortText().ptr,
         web_invite.copyStatus().text().ptr,
-    }), x + 18, y + 18, 13, color_text);
+    }), x + 18, y + 36, 13, color_text);
     if (online.room_len > 0) {
-        rl.drawText(rl.textFormat("Room %.*s", .{ @as(i32, @intCast(online.roomId().len)), online.roomId().ptr }), x + 18, y + 40, 13, color_text_dim);
+        const room = online.roomId();
+        const shown_len = @min(room.len, 42);
+        const suffix: [:0]const u8 = if (shown_len < room.len) "..." else "";
+        rl.drawText(rl.textFormat("Room %.*s%s", .{
+            @as(i32, @intCast(shown_len)),
+            room.ptr,
+            suffix.ptr,
+        }), x + 18, y + 56, 13, color_text_dim);
     } else {
-        rl.drawText("No active room", x + 18, y + 40, 13, color_text_dim);
+        rl.drawText("No active room", x + 18, y + 56, 13, color_text_dim);
     }
-    rl.drawText("Move: Left/Right/Down | Space hard | X/Up CW | Z CCW | A 180 | Left Shift hold", x + 400, y + 18, 13, color_text);
-    rl.drawText("P deterministic pause | C copy invite link | R rematch no-op | 1/2 switch modes", x + 400, y + 40, 13, color_text_dim);
+    rl.drawText("Move: arrows/down | Space hard | X/Up/Z/A rotate | LShift hold", x + 400, y + 36, 13, color_text);
+    rl.drawText("C copy invite | P pause | R no rematch | 1/2 switch modes", x + 400, y + 56, 13, color_text_dim);
 }
 
 fn drawOnlineWaitingPanel(online: *const OnlineState) void {
@@ -1998,7 +1997,7 @@ fn drawWebTransportFooter() void {
             error_text.ptr,
         }),
         32,
-        screen_height - 20,
+        screen_height - 16,
         12,
         color_text_dim,
     );
@@ -2122,14 +2121,6 @@ fn lineClearLabel(lines: u8) [:0]const u8 {
         3 => "Triple",
         4 => "Quad",
         else => "Multi clear",
-    };
-}
-
-fn tSpinValue(kind: game.TSpinKind) [:0]const u8 {
-    return switch (kind) {
-        .none => "none",
-        .mini => "mini",
-        .full => "full",
     };
 }
 
