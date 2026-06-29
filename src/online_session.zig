@@ -90,11 +90,32 @@ pub const ResultCompletionState = struct {
     result_drain_active: bool = false,
 };
 
+pub const PeerLeaveDisconnectAction = enum {
+    disconnect_now,
+    defer_disconnect,
+    pending_result_timed_out,
+};
+
+pub const PeerLeaveDisconnectState = struct {
+    completion: ResultCompletionState = .{},
+    pending_result_peer_leave_frames: u16 = 0,
+    pending_result_peer_leave_grace_frames: u16 = 0,
+};
+
 pub fn shouldDeferPeerLeaveDisconnect(state: ResultCompletionState) bool {
     return state.pending_remote_result or
         state.sent_result or
         state.has_local_outcome or
         state.result_drain_active;
+}
+
+pub fn peerLeaveDisconnectAction(state: PeerLeaveDisconnectState) PeerLeaveDisconnectAction {
+    if (state.completion.sent_result or state.completion.has_local_outcome or state.completion.result_drain_active) return .defer_disconnect;
+    if (state.completion.pending_remote_result) {
+        if (state.pending_result_peer_leave_frames >= state.pending_result_peer_leave_grace_frames) return .pending_result_timed_out;
+        return .defer_disconnect;
+    }
+    return .disconnect_now;
 }
 
 pub const InputBatcher = struct {
@@ -386,7 +407,10 @@ pub fn validateRemoteResult(role: Role, peer: *const lockstep.Peer, result: prot
     if (result.match_id != peer.match_id) return error.WrongMatchId;
     if (result.sender_slot != remoteProtocolSlotForRole(role)) return error.InvalidResultSenderSlot;
 
-    const local_outcome = peer.match.outcome orelse return .pending_local_result;
+    const local_outcome = peer.match.outcome orelse {
+        if (result.frame_cursor <= peer.frameCursor()) return error.ResultFrameCursorMismatch;
+        return .pending_local_result;
+    };
     if (result.outcome != resultOutcomeFromMatchOutcome(local_outcome)) return error.ResultOutcomeMismatch;
     if (result.frame_cursor != peer.frameCursor()) return error.ResultFrameCursorMismatch;
     if (result.state_hash != peer.stateHash()) return error.ResultStateHashMismatch;
@@ -661,6 +685,23 @@ test "result completion state defers peer-leave disconnects only while finishing
     try std.testing.expect(shouldDeferPeerLeaveDisconnect(.{ .sent_result = true }));
     try std.testing.expect(shouldDeferPeerLeaveDisconnect(.{ .has_local_outcome = true }));
     try std.testing.expect(shouldDeferPeerLeaveDisconnect(.{ .result_drain_active = true }));
+
+    try std.testing.expectEqual(PeerLeaveDisconnectAction.disconnect_now, peerLeaveDisconnectAction(.{}));
+    try std.testing.expectEqual(PeerLeaveDisconnectAction.defer_disconnect, peerLeaveDisconnectAction(.{
+        .completion = .{ .pending_remote_result = true },
+        .pending_result_peer_leave_frames = 1,
+        .pending_result_peer_leave_grace_frames = 2,
+    }));
+    try std.testing.expectEqual(PeerLeaveDisconnectAction.pending_result_timed_out, peerLeaveDisconnectAction(.{
+        .completion = .{ .pending_remote_result = true },
+        .pending_result_peer_leave_frames = 2,
+        .pending_result_peer_leave_grace_frames = 2,
+    }));
+    try std.testing.expectEqual(PeerLeaveDisconnectAction.defer_disconnect, peerLeaveDisconnectAction(.{
+        .completion = .{ .pending_remote_result = true, .has_local_outcome = true },
+        .pending_result_peer_leave_frames = 2,
+        .pending_result_peer_leave_grace_frames = 2,
+    }));
 }
 
 test "remote result waits for local terminal outcome then validates final state" {
@@ -675,6 +716,10 @@ test "remote result waits for local terminal outcome then validates final state"
         .state_hash = 0xaaaa,
     };
     try std.testing.expectEqual(ResultValidationStatus.pending_local_result, try validateRemoteResult(.host, peer, pending_result));
+
+    var stale_result = pending_result;
+    stale_result.frame_cursor = peer.frameCursor();
+    try std.testing.expectError(error.ResultFrameCursorMismatch, validateRemoteResult(.host, peer, stale_result));
 
     peer.match.outcome = .{ .winner = .p1 };
     const valid_result = protocol.Result{

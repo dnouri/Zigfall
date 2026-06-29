@@ -52,6 +52,8 @@ const online_max_steps_per_frame: usize = 4;
 const online_input_batch_target_count: u8 = 4;
 const online_input_batch_max_hold_frames: u8 = 3;
 const online_result_drain_frames: u16 = 120;
+const online_pending_result_peer_leave_grace_frames: u16 = 120;
+const online_peer_leave_drain_frames: usize = lockstep.MaxBufferedFrames;
 const online_notice_frames: u16 = 180;
 const online_message_capacity: usize = 192;
 const online_notice_capacity: usize = 128;
@@ -205,9 +207,11 @@ const OnlineState = struct {
     sent_desync: bool = false,
     pending_remote_result: ?protocol.Result = null,
     pending_input_batch: online_session.InputBatcher = .{},
+    pending_result_peer_leave_frames: u16 = 0,
     result_drain_frames_left: u16 = 0,
     next_hash_frame: u64 = online_state_hash_interval_frames,
     ever_had_peer: bool = false,
+    peer_leave_observed: bool = false,
     terminal: OnlineTerminal = .none,
 
     fn startHost(self: *OnlineState) void {
@@ -317,10 +321,17 @@ const OnlineState = struct {
 
     fn updateTransportHealth(self: *OnlineState) void {
         const status = web_transport.status();
+        const last_error = web_transport.lastError();
         if (web_transport.peerCount() > 0) self.ever_had_peer = true;
-        // Trystero can report noPeer immediately after delivering a final result.
-        // Let local result validation/drain finish before treating peer leave as terminal.
-        const defer_peer_leave_disconnect = self.shouldDeferPeerLeaveDisconnect();
+
+        // Trystero can report noPeer immediately after delivering the last
+        // selected-peer packets. Before making peer-leave terminal, step any
+        // already-buffered lockstep inputs so a deterministic final outcome or
+        // result validation wins the race.
+        const peer_leave_observed = self.peer_leave_observed or (self.ever_had_peer and (status == .disconnected or last_error == .no_peer));
+        const defer_peer_leave_disconnect = if (peer_leave_observed) self.handlePeerLeaveObserved() else false;
+        if (!peer_leave_observed) self.pending_result_peer_leave_frames = 0;
+        if (self.terminal != .none) return;
 
         switch (status) {
             .busy => {
@@ -342,18 +353,61 @@ const OnlineState = struct {
             .connecting, .connected => {},
         }
 
-        switch (web_transport.lastError()) {
+        switch (last_error) {
             .no_peer => if (self.ever_had_peer and !defer_peer_leave_disconnect) {
                 self.enterTerminal(.disconnected, .none, "Opponent disconnected.", .{});
+            },
+            .packet_too_large => {
+                self.enterTerminal(.failed, .{ .disconnect = 3 }, "Network packet exceeded the protocol size limit; match stopped before hiding a lost packet.", .{});
             },
             .queue_full => {
                 self.enterTerminal(.failed, .{ .disconnect = 3 }, "Network receive backlog overflowed; match stopped before hiding a lost packet.", .{});
             },
-            .send_failed => {
+            .send_failed => if (!self.shouldIgnoreAsyncSendFailure()) {
                 self.enterTerminal(.failed, .{ .disconnect = 3 }, "Transport send failed; match stopped.", .{});
             },
             else => {},
         }
+    }
+
+    fn handlePeerLeaveObserved(self: *OnlineState) bool {
+        self.drainBufferedLockstepForPeerLeave();
+        if (self.terminal != .none) return true;
+
+        if (self.pending_remote_result != null and !self.hasLocalOutcome()) {
+            if (self.pending_result_peer_leave_frames < std.math.maxInt(u16)) self.pending_result_peer_leave_frames += 1;
+        } else {
+            self.pending_result_peer_leave_frames = 0;
+        }
+
+        switch (online_session.peerLeaveDisconnectAction(.{
+            .completion = self.resultCompletionState(),
+            .pending_result_peer_leave_frames = self.pending_result_peer_leave_frames,
+            .pending_result_peer_leave_grace_frames = online_pending_result_peer_leave_grace_frames,
+        })) {
+            .disconnect_now => return false,
+            .defer_disconnect => return true,
+            .pending_result_timed_out => {
+                self.enterTerminal(.desynced, .desync, "Opponent result could not be validated after disconnect; match stopped.", .{});
+                return true;
+            },
+        }
+    }
+
+    fn drainBufferedLockstepForPeerLeave(self: *OnlineState) void {
+        if (!self.isPlaying()) return;
+        var peer = self.lockstepPeer() orelse return;
+        if (peer.match.outcome == null) {
+            const advanced = peer.stepAvailableMax(online_peer_leave_drain_frames) catch |err| {
+                self.handleLockstepError(err);
+                return;
+            };
+            self.last_step_result = if (advanced > 0) peer.last_step_result else .{};
+            self.handlePeerStatus();
+            if (self.terminal != .none) return;
+        }
+        if (self.pending_remote_result != null and !self.validatePendingRemoteResult()) return;
+        if (peer.match.outcome != null and !self.sent_result) self.finishOnlineMatch();
     }
 
     fn pollTransport(self: *OnlineState) void {
@@ -455,9 +509,12 @@ const OnlineState = struct {
                 return;
             };
         } else return;
-        // A best-effort lifecycle disconnect may be queued behind a final result
-        // when the peer closes quickly; do not let it overwrite result handling.
-        if (self.shouldDeferPeerLeaveDisconnect()) return;
+        // A best-effort lifecycle disconnect may be queued behind final runtime
+        // packets when the peer closes quickly; step buffered input/result state
+        // before letting it become terminal.
+        self.peer_leave_observed = true;
+        if (self.handlePeerLeaveObserved()) return;
+        if (self.terminal != .none) return;
         self.enterTerminal(.disconnected, .none, "Opponent disconnected at frame {}.", .{@as(u32, @truncate(disconnect.last_frame_cursor))});
     }
 
@@ -477,10 +534,12 @@ const OnlineState = struct {
         }) {
             .accepted => {
                 self.pending_remote_result = result;
+                self.pending_result_peer_leave_frames = 0;
                 self.finishOnlineMatch();
             },
             .pending_local_result => {
                 self.pending_remote_result = result;
+                self.pending_result_peer_leave_frames = 0;
                 self.setNotice("Opponent reported a result; waiting for local lockstep to catch up.", .{});
             },
         }
@@ -536,6 +595,7 @@ const OnlineState = struct {
         self.last_step_result = if (advanced > 0) peer.last_step_result else .{};
         self.handlePeerStatus();
         if (self.terminal != .none) return;
+        if (self.pending_remote_result != null and !self.validatePendingRemoteResult()) return;
 
         self.sendDueStateHash(peer);
         if (self.terminal != .none) return;
@@ -813,17 +873,26 @@ const OnlineState = struct {
         return session.match_id;
     }
 
+    fn hasLocalOutcome(self: *const OnlineState) bool {
+        return if (self.lockstepPeerConst()) |peer| peer.match.outcome != null else false;
+    }
+
     fn resultCompletionState(self: *const OnlineState) online_session.ResultCompletionState {
         return .{
             .pending_remote_result = self.pending_remote_result != null,
             .sent_result = self.sent_result,
-            .has_local_outcome = if (self.lockstepPeerConst()) |peer| peer.match.outcome != null else false,
+            .has_local_outcome = self.hasLocalOutcome(),
             .result_drain_active = self.result_drain_frames_left > 0,
         };
     }
 
     fn shouldDeferPeerLeaveDisconnect(self: *const OnlineState) bool {
         return online_session.shouldDeferPeerLeaveDisconnect(self.resultCompletionState());
+    }
+
+    fn shouldIgnoreAsyncSendFailure(self: *const OnlineState) bool {
+        const state = self.resultCompletionState();
+        return state.sent_result or state.has_local_outcome or state.result_drain_active;
     }
 
     fn localProtocolSlot(self: *const OnlineState) u8 {

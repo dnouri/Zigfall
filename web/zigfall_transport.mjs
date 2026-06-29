@@ -247,7 +247,11 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId 
     if (!room || !packetAction) return setError(ErrorCode.notConnected, "not connected to a room");
     if (!hasSelectedPeer()) return setError(ErrorCode.noPeer, "no selected peer in room");
 
-    packetAction.send(bytes, { target: selectedPeerId }).catch((err) => {
+    const generation = connectionGeneration;
+    const action = packetAction;
+    const targetPeerId = selectedPeerId;
+    action.send(bytes, { target: targetPeerId }).catch((err) => {
+      if (generation !== connectionGeneration || packetAction !== action) return;
       setError(ErrorCode.sendFailed, errorMessage(err));
       console.warn("[ZigfallTransport] send failed", err);
     });

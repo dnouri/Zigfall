@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { createZigfallTransport, ErrorCode, Status } from "../web/zigfall_transport.mjs";
 
-function makeFakeAction() {
+function makeFakeAction({ sendImpl = null } = {}) {
   return {
     sent: [],
     _onMessage: null,
@@ -14,8 +14,9 @@ function makeFakeAction() {
       this._onMessage = handler;
     },
     send(data, options = {}) {
-      this.sent.push({ data: new Uint8Array(data), options });
-      return Promise.resolve();
+      const record = { data: new Uint8Array(data), options };
+      this.sent.push(record);
+      return sendImpl ? sendImpl(record) : Promise.resolve();
     },
     emit(data, peerId) {
       this._onMessage?.(data, { peerId });
@@ -23,10 +24,10 @@ function makeFakeAction() {
   };
 }
 
-function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve() } = {}) {
+function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl = () => makeFakeAction() } = {}) {
   const rooms = [];
   const joinRoomImpl = (config, roomId) => {
-    const action = makeFakeAction();
+    const action = makeActionImpl({ index: rooms.length, roomId });
     const room = {
       config,
       roomId,
@@ -148,4 +149,54 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve() } = {}) {
   assert.equal(transport.queuedPacketCount(), transport.MaxQueuedPackets, "overflow should not grow the bounded queue");
 }
 
-console.log("ok: Zigfall transport adapter selects one peer, targets sends, drops extras, drains disconnects, and bounds backlog");
+{
+  const { joinRoomImpl, rooms } = makeFakeJoinRoom();
+  const transport = createZigfallTransport({ joinRoomImpl, selfIdValue: "self-test" });
+
+  assert.equal(transport.connect("oversize-test"), ErrorCode.none);
+  const room = rooms[0];
+  room.join("peer-a");
+
+  room.action.emit(new Uint8Array(transport.MaxPacketSize + 1), "peer-a");
+  assert.equal(transport.errorCode(), ErrorCode.packetTooLarge, "oversized selected-peer packets must be terminal to Zig");
+  assert.equal(transport.queuedPacketCount(), 0, "oversized packets are dropped rather than queued");
+}
+
+{
+  let rejectOldSend;
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args);
+  try {
+    const { joinRoomImpl, rooms } = makeFakeJoinRoom({
+      makeActionImpl: ({ index }) => makeFakeAction({
+        sendImpl: () => {
+          if (index !== 0) return Promise.resolve();
+          return new Promise((_, reject) => {
+            rejectOldSend = reject;
+          });
+        },
+      }),
+    });
+    const transport = createZigfallTransport({ joinRoomImpl, selfIdValue: "self-test" });
+
+    assert.equal(transport.connect("old-send-room"), ErrorCode.none);
+    rooms[0].join("peer-a");
+    assert.equal(transport.send(Uint8Array.from([1])), ErrorCode.none);
+
+    assert.equal(transport.connect("new-send-room"), ErrorCode.none);
+    rooms[1].join("peer-b");
+    assert.equal(transport.statusCode(), Status.connected);
+    assert.equal(transport.errorCode(), ErrorCode.none);
+
+    rejectOldSend(new Error("old room send failed"));
+    await Promise.resolve();
+    assert.equal(transport.errorCode(), ErrorCode.none, "stale-generation send rejection must not poison the current room");
+    assert.equal(transport.statusCode(), Status.connected);
+    assert.equal(warnings.length, 0, "stale-generation send rejection should be ignored without warning");
+  } finally {
+    console.warn = originalWarn;
+  }
+}
+
+console.log("ok: Zigfall transport adapter selects one peer, targets sends, drops extras, drains disconnects, bounds backlog, and scopes async send failures");
