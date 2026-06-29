@@ -8,6 +8,7 @@ const MaxPacketSize = 512;
 // cap finite while giving the app a few seconds at 60 Hz to drain gracefully.
 const MaxQueuedPackets = 256;
 const MaxRoomIdLength = 128;
+const RetiringSelectedPeerDrainMs = 2000;
 const AppId = "zigfall-trystero-v1";
 const PacketActionName = "pkt";
 const noop = () => {};
@@ -48,12 +49,13 @@ function errorMessage(err) {
   return err && err.message ? err.message : err;
 }
 
-function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId } = {}) {
+function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId, nowImpl = () => Date.now() } = {}) {
   let room = null;
   let packetAction = null;
   let roomId = "";
   let peers = new Set();
   let selectedPeerId = null;
+  let retiringSelectedPeer = null;
   let hasSelectedPeerOnce = false;
   let incoming = [];
   let currentStatus = Status.disconnected;
@@ -78,6 +80,34 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId 
 
   function hasSelectedPeer() {
     return selectedPeerId !== null && peers.has(selectedPeerId);
+  }
+
+  function nowMs() {
+    const value = Number(nowImpl());
+    return Number.isFinite(value) ? value : Date.now();
+  }
+
+  function pruneRetiringSelectedPeer() {
+    if (!retiringSelectedPeer) return;
+    if (retiringSelectedPeer.generation !== connectionGeneration || nowMs() > retiringSelectedPeer.expiresAt) {
+      retiringSelectedPeer = null;
+    }
+  }
+
+  function beginRetiringSelectedPeerDrain(peerId, generation) {
+    retiringSelectedPeer = {
+      peerId,
+      generation,
+      expiresAt: nowMs() + RetiringSelectedPeerDrainMs,
+    };
+  }
+
+  function isRetiringSelectedMessagePeer(peerId) {
+    pruneRetiringSelectedPeer();
+    return retiringSelectedPeer !== null &&
+      retiringSelectedPeer.generation === connectionGeneration &&
+      typeof peerId === "string" &&
+      peerId === retiringSelectedPeer.peerId;
   }
 
   function extraPeerCount() {
@@ -121,14 +151,18 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId 
   }
 
   function isSelectedMessagePeer(peerId) {
-    return typeof peerId === "string" && peerId === selectedPeerId && peers.has(peerId);
+    return (typeof peerId === "string" && peerId === selectedPeerId && peers.has(peerId)) || isRetiringSelectedMessagePeer(peerId);
   }
 
   function queueIncomingPacket(packet, generation, peerId) {
     if (generation !== connectionGeneration) return;
 
     if (!isSelectedMessagePeer(peerId)) {
-      setError(ErrorCode.busy, peerId ? "dropped packet from non-selected peer" : "dropped packet without peer id");
+      if (selectedPeerId === null && peers.size === 0 && hasSelectedPeerOnce) {
+        setError(ErrorCode.noPeer, peerId ? "dropped packet from departed peer" : "dropped packet without peer id after peer left");
+      } else {
+        setError(ErrorCode.busy, peerId ? "dropped packet from non-selected peer" : "dropped packet without peer id");
+      }
       updateConnectedStatus();
       return;
     }
@@ -173,6 +207,7 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId 
     roomId = "";
     peers = new Set();
     selectedPeerId = null;
+    retiringSelectedPeer = null;
     hasSelectedPeerOnce = false;
     incoming = [];
     setStatus(Status.disconnected);
@@ -209,6 +244,7 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId 
         peers.add(peerId);
         if (!hasSelectedPeerOnce) {
           selectedPeerId = peerId;
+          retiringSelectedPeer = null;
           hasSelectedPeerOnce = true;
         } else if (peerId !== selectedPeerId) {
           setError(ErrorCode.busy, `room already has selected peer ${selectedPeerId ?? "(left)"}; ignoring ${peerId}`);
@@ -221,13 +257,19 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId 
         const wasSelected = peerId === selectedPeerId;
         peers.delete(peerId);
         if (wasSelected) {
+          beginRetiringSelectedPeerDrain(peerId, generation);
           selectedPeerId = null;
           // Keep already-queued selected-peer packets available for Zig to poll
-          // before it observes noPeer; final result/disconnect packets can race
-          // with the Trystero leave callback.
+          // before it observes noPeer, and keep accepting same-generation final
+          // packets from this retiring peer for a short bounded window; Trystero
+          // can report leave before dispatching the peer's final data-channel message.
           setError(ErrorCode.noPeer, "selected peer left room");
         } else if (lastError === ErrorCode.busy && extraPeerCount() === 0) {
-          clearError();
+          if (selectedPeerId === null && hasSelectedPeerOnce) {
+            setError(ErrorCode.noPeer, "selected peer left room");
+          } else {
+            clearError();
+          }
         }
         updateConnectedStatus();
       };
@@ -292,6 +334,7 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId 
     MaxPacketSize,
     MaxQueuedPackets,
     MaxRoomIdLength,
+    RetiringSelectedPeerDrainMs,
     Status,
     ErrorCode,
     selfId: selfIdValue,

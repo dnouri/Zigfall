@@ -52,9 +52,12 @@ const online_max_steps_per_frame: usize = 4;
 const online_input_batch_target_count: u8 = 4;
 const online_input_batch_max_hold_frames: u8 = 3;
 const online_result_drain_frames: u16 = 120;
+const online_terminal_packet_drain_frames: u16 = 30;
+const online_late_final_packet_peer_leave_grace_frames: u16 = 30;
 const online_pending_result_peer_leave_grace_frames: u16 = 120;
 const online_peer_leave_drain_frames: usize = lockstep.MaxBufferedFrames;
 const online_notice_frames: u16 = 180;
+const online_remote_input_stall_notice_frames: u16 = 30;
 const online_message_capacity: usize = 192;
 const online_notice_capacity: usize = 128;
 
@@ -164,8 +167,8 @@ const LocalVersusState = struct {
 
     fn draw(self: *const LocalVersusState) void {
         drawVersusHeader(&self.match_state);
-        drawVersusPlayer(.p1, &self.match_state, self.last_step_result.players[0]);
-        drawVersusPlayer(.p2, &self.match_state, self.last_step_result.players[1]);
+        drawVersusPlayer(.p1, &self.match_state, self.last_step_result.players[0], true);
+        drawVersusPlayer(.p2, &self.match_state, self.last_step_result.players[1], true);
         drawVersusControlsStrip();
         drawMatchOverlay(&self.match_state);
     }
@@ -174,6 +177,7 @@ const LocalVersusState = struct {
 const OnlineTerminal = enum {
     none,
     finished,
+    unverified_result,
     disconnected,
     desynced,
     unsupported,
@@ -206,13 +210,19 @@ const OnlineState = struct {
     sent_result: bool = false,
     sent_desync: bool = false,
     pending_remote_result: ?protocol.Result = null,
+    verified_result: bool = false,
     pending_input_batch: online_session.InputBatcher = .{},
     pending_result_peer_leave_frames: u16 = 0,
+    late_final_packet_peer_leave_frames: u16 = 0,
     result_drain_frames_left: u16 = 0,
+    remote_input_stall_frames: u16 = 0,
     next_hash_frame: u64 = online_state_hash_interval_frames,
     ever_had_peer: bool = false,
     peer_leave_observed: bool = false,
     terminal: OnlineTerminal = .none,
+    terminal_packet: online_session.TerminalPacketKind = .none,
+    terminal_drain_frames_left: u16 = 0,
+    terminal_disconnected: bool = false,
 
     fn startHost(self: *OnlineState) void {
         self.* = .{};
@@ -277,13 +287,17 @@ const OnlineState = struct {
         const online_input = readOnlineInput();
         self.tickNotice();
         self.handleShellActions(online_input);
-        if (self.terminal != .none) return;
+        if (self.terminal != .none) {
+            self.updateTerminalDrain();
+            return;
+        }
 
         self.pollTransport();
         if (self.terminal != .none) return;
 
         self.updateTransportHealth();
         if (self.terminal != .none) return;
+        if (self.isLateFinalPacketPeerLeaveGraceActive()) return;
 
         self.driveHandshake();
         if (self.terminal != .none) return;
@@ -294,8 +308,9 @@ const OnlineState = struct {
     fn draw(self: *const OnlineState) void {
         if (self.lockstepPeerConst()) |peer| {
             drawOnlineHeader(self, &peer.match);
-            drawVersusPlayer(.p1, &peer.match, self.last_step_result.players[0]);
-            drawVersusPlayer(.p2, &peer.match, self.last_step_result.players[1]);
+            const outcome_verified = self.hasVerifiedResult();
+            drawVersusPlayer(.p1, &peer.match, self.last_step_result.players[0], outcome_verified);
+            drawVersusPlayer(.p2, &peer.match, self.last_step_result.players[1], outcome_verified);
             drawOnlineControlsStrip(self);
             if (self.terminal == .none) drawOnlineMatchOverlay(self, &peer.match);
         } else {
@@ -324,66 +339,63 @@ const OnlineState = struct {
         const last_error = web_transport.lastError();
         if (web_transport.peerCount() > 0) self.ever_had_peer = true;
 
-        // Trystero can report noPeer immediately after delivering the last
-        // selected-peer packets. Before making peer-leave terminal, step any
-        // already-buffered lockstep inputs so a deterministic final outcome or
-        // result validation wins the race.
-        const peer_leave_observed = self.peer_leave_observed or (self.ever_had_peer and (status == .disconnected or last_error == .no_peer));
-        const defer_peer_leave_disconnect = if (peer_leave_observed) self.handlePeerLeaveObserved() else false;
-        if (!peer_leave_observed) self.pending_result_peer_leave_frames = 0;
+        // Trystero can report noPeer before dispatching a retiring peer's final
+        // lifecycle packet. Keep polling for a short bounded grace, and before
+        // making peer-leave terminal step any already-buffered lockstep inputs so
+        // a deterministic final outcome or result validation wins the race.
+        const transport_peer_leave_observed = self.ever_had_peer and (status == .disconnected or last_error == .no_peer);
+        if (transport_peer_leave_observed) self.peer_leave_observed = true;
+        const allow_late_final_packet_grace = transport_peer_leave_observed or self.late_final_packet_peer_leave_frames > 0;
+        const defer_peer_leave_disconnect = if (self.peer_leave_observed) self.handlePeerLeaveObserved(allow_late_final_packet_grace) else false;
+        if (!self.peer_leave_observed) {
+            self.pending_result_peer_leave_frames = 0;
+            self.late_final_packet_peer_leave_frames = 0;
+        }
         if (self.terminal != .none) return;
 
-        switch (status) {
-            .busy => {
-                self.enterTerminal(.failed, .{ .disconnect = 2 }, "Extra peer joined this room; match stopped. Create a new invite.", .{});
-                return;
-            },
-            .missing_js => {
-                self.enterTerminal(.failed, .none, "Web transport helper is missing; reload the page.", .{});
-                return;
-            },
-            .unavailable => {
-                self.enterTerminal(.unsupported, .none, "Online transport is unavailable in this build.", .{});
-                return;
-            },
-            .disconnected => if (self.ever_had_peer and !defer_peer_leave_disconnect) {
-                self.enterTerminal(.disconnected, .none, "Opponent disconnected.", .{});
-                return;
-            },
-            .connecting, .connected => {},
-        }
-
-        switch (last_error) {
-            .no_peer => if (self.ever_had_peer and !defer_peer_leave_disconnect) {
-                self.enterTerminal(.disconnected, .none, "Opponent disconnected.", .{});
-            },
-            .packet_too_large => {
-                self.enterTerminal(.failed, .{ .disconnect = 3 }, "Network packet exceeded the protocol size limit; match stopped before hiding a lost packet.", .{});
-            },
-            .queue_full => {
-                self.enterTerminal(.failed, .{ .disconnect = 3 }, "Network receive backlog overflowed; match stopped before hiding a lost packet.", .{});
-            },
-            .send_failed => if (!self.shouldIgnoreAsyncSendFailure()) {
-                self.enterTerminal(.failed, .{ .disconnect = 3 }, "Transport send failed; match stopped.", .{});
-            },
-            else => {},
+        switch (online_session.transportHealthAction(.{
+            .status = onlineTransportStatus(status),
+            .last_error = onlineTransportError(last_error),
+            .ever_had_peer = self.ever_had_peer,
+            .peer_leave_observed = self.peer_leave_observed,
+            .defer_peer_leave_disconnect = defer_peer_leave_disconnect,
+            .ignore_async_send_failure = self.shouldIgnoreAsyncSendFailure(),
+        })) {
+            .none => {},
+            .fail_extra_peer => self.enterTerminal(.failed, .{ .disconnect = 2 }, "Extra peer joined this room; match stopped. Create a new invite.", .{}),
+            .fail_missing_js => self.enterTerminal(.failed, .none, "Web transport helper is missing; reload the page.", .{}),
+            .unsupported => self.enterTerminal(.unsupported, .none, "Online transport is unavailable in this build.", .{}),
+            .disconnected => self.enterTerminal(.disconnected, .none, "Opponent disconnected.", .{}),
+            .fail_packet_too_large => self.enterTerminal(.failed, .{ .disconnect = 3 }, "Network packet exceeded the protocol size limit; match stopped before hiding a lost packet.", .{}),
+            .fail_queue_full => self.enterTerminal(.failed, .{ .disconnect = 3 }, "Network receive backlog overflowed; match stopped before hiding a lost packet.", .{}),
+            .fail_send_failed => self.enterTerminal(.failed, .{ .disconnect = 3 }, "Transport send failed; match stopped.", .{}),
         }
     }
 
-    fn handlePeerLeaveObserved(self: *OnlineState) bool {
+    fn handlePeerLeaveObserved(self: *OnlineState, allow_late_final_packet_grace: bool) bool {
         self.drainBufferedLockstepForPeerLeave();
         if (self.terminal != .none) return true;
 
-        if (self.pending_remote_result != null and !self.hasLocalOutcome()) {
+        const completion = self.resultCompletionState();
+        if (completion.pending_remote_result and !completion.has_local_outcome) {
             if (self.pending_result_peer_leave_frames < std.math.maxInt(u16)) self.pending_result_peer_leave_frames += 1;
         } else {
             self.pending_result_peer_leave_frames = 0;
         }
 
+        if (allow_late_final_packet_grace and !online_session.shouldDeferPeerLeaveDisconnect(completion)) {
+            if (self.late_final_packet_peer_leave_frames < std.math.maxInt(u16)) self.late_final_packet_peer_leave_frames += 1;
+        } else {
+            self.late_final_packet_peer_leave_frames = 0;
+        }
+
         switch (online_session.peerLeaveDisconnectAction(.{
-            .completion = self.resultCompletionState(),
+            .completion = completion,
             .pending_result_peer_leave_frames = self.pending_result_peer_leave_frames,
             .pending_result_peer_leave_grace_frames = online_pending_result_peer_leave_grace_frames,
+            .late_final_packet_peer_leave_frames = self.late_final_packet_peer_leave_frames,
+            .late_final_packet_peer_leave_grace_frames = online_late_final_packet_peer_leave_grace_frames,
+            .allow_late_final_packet_grace = allow_late_final_packet_grace,
         })) {
             .disconnect_now => return false,
             .defer_disconnect => return true,
@@ -513,7 +525,7 @@ const OnlineState = struct {
         // packets when the peer closes quickly; step buffered input/result state
         // before letting it become terminal.
         self.peer_leave_observed = true;
-        if (self.handlePeerLeaveObserved()) return;
+        if (self.handlePeerLeaveObserved(true)) return;
         if (self.terminal != .none) return;
         self.enterTerminal(.disconnected, .none, "Opponent disconnected at frame {}.", .{@as(u32, @truncate(disconnect.last_frame_cursor))});
     }
@@ -534,11 +546,13 @@ const OnlineState = struct {
         }) {
             .accepted => {
                 self.pending_remote_result = result;
+                self.verified_result = true;
                 self.pending_result_peer_leave_frames = 0;
                 self.finishOnlineMatch();
             },
             .pending_local_result => {
                 self.pending_remote_result = result;
+                self.verified_result = false;
                 self.pending_result_peer_leave_frames = 0;
                 self.setNotice("Opponent reported a result; waiting for local lockstep to catch up.", .{});
             },
@@ -593,6 +607,7 @@ const OnlineState = struct {
             return;
         };
         self.last_step_result = if (advanced > 0) peer.last_step_result else .{};
+        self.handleRemoteInputStall(advanced, peer);
         self.handlePeerStatus();
         if (self.terminal != .none) return;
         if (self.pending_remote_result != null and !self.validatePendingRemoteResult()) return;
@@ -601,6 +616,19 @@ const OnlineState = struct {
         if (self.terminal != .none) return;
 
         if (peer.match.outcome != null) self.finishOnlineMatch();
+    }
+
+    fn handleRemoteInputStall(self: *OnlineState, advanced: usize, peer: *const lockstep.Peer) void {
+        if (advanced > 0 or peer.match.outcome != null or !peer.isOk()) {
+            self.remote_input_stall_frames = 0;
+            return;
+        }
+        if (self.remote_input_stall_frames < std.math.maxInt(u16)) self.remote_input_stall_frames += 1;
+        if (self.remote_input_stall_frames == online_remote_input_stall_notice_frames or
+            (self.remote_input_stall_frames > online_remote_input_stall_notice_frames and self.remote_input_stall_frames % online_notice_frames == 0))
+        {
+            self.setNotice("Waiting for opponent input...", .{});
+        }
     }
 
     fn sendDueStateHash(self: *OnlineState, peer: *lockstep.Peer) void {
@@ -639,46 +667,61 @@ const OnlineState = struct {
 
     fn finishOnlineMatch(self: *OnlineState) void {
         if (self.terminal != .none) return;
-        if (self.pending_remote_result != null) {
-            if (!self.validatePendingRemoteResult()) return;
-            if (!self.sent_result) {
+        const remote_status = self.remoteResultStatus() orelse return;
+        if (self.terminal != .none) return;
+
+        switch (online_session.resultFinishAction(.{
+            .remote_result_status = remote_status,
+            .has_local_outcome = self.hasLocalOutcome(),
+            .sent_local_result = self.sent_result,
+            .result_drain_frames_left = self.result_drain_frames_left,
+            .peer_left = self.peer_leave_observed,
+        })) {
+            .no_local_outcome => {},
+            .send_local_result => {
                 self.flushPendingInputBestEffort();
                 self.sendResultBestEffort();
                 self.result_drain_frames_left = online_result_drain_frames;
-                self.setMessage("Match result validated. Closing connection shortly.", .{});
-            }
-            if (self.result_drain_frames_left > 0) {
-                self.result_drain_frames_left -= 1;
-                return;
-            }
-            self.enterTerminal(.finished, .none, "Match complete. Online rematch is not implemented yet.", .{});
-            return;
+                if (remote_status == .validated) {
+                    self.setMessage("Match result validated. Closing connection shortly.", .{});
+                } else {
+                    self.setMessage("Match complete locally. Waiting briefly for opponent result verification.", .{});
+                }
+            },
+            .wait_for_remote_result, .wait_for_verified_drain => {
+                if (self.result_drain_frames_left > 0) self.result_drain_frames_left -= 1;
+            },
+            .finish_verified => {
+                self.enterTerminal(.finished, .none, "Match complete. Online rematch is not implemented yet.", .{});
+            },
+            .finish_unverified_disconnect => {
+                self.enterTerminal(.unverified_result, .none, "Opponent disconnected before result verification; this match is not counted as a win or loss.", .{});
+            },
+            .finish_unverified_timeout => {
+                self.enterTerminal(.unverified_result, .none, "Opponent result was not verified; this match is not counted as a win or loss.", .{});
+            },
         }
+    }
 
-        if (!self.sent_result) {
-            self.flushPendingInputBestEffort();
-            self.sendResultBestEffort();
-            self.result_drain_frames_left = online_result_drain_frames;
-            self.setMessage("Match complete locally. Waiting briefly for opponent result.", .{});
+    fn remoteResultStatus(self: *OnlineState) ?online_session.RemoteResultStatus {
+        const result = self.pending_remote_result orelse return .none;
+        const role = self.role orelse return .none;
+        const peer = self.lockstepPeerConst() orelse return .none;
+        switch (online_session.validateRemoteResult(role, peer, result) catch |err| {
+            self.handleRemoteResultValidationError(err);
+            return null;
+        }) {
+            .accepted => {
+                self.verified_result = true;
+                return .validated;
+            },
+            .pending_local_result => return .pending_local_result,
         }
-        if (self.result_drain_frames_left > 0) {
-            self.result_drain_frames_left -= 1;
-            return;
-        }
-        self.enterTerminal(.finished, .none, "Match complete. Opponent result was not received before disconnect.", .{});
     }
 
     fn validatePendingRemoteResult(self: *OnlineState) bool {
-        const result = self.pending_remote_result orelse return true;
-        const role = self.role orelse return true;
-        const peer = self.lockstepPeerConst() orelse return true;
-        switch (online_session.validateRemoteResult(role, peer, result) catch |err| {
-            self.handleRemoteResultValidationError(err);
-            return false;
-        }) {
-            .accepted => return true,
-            .pending_local_result => return true,
-        }
+        _ = self.remoteResultStatus() orelse return false;
+        return self.terminal == .none;
     }
 
     fn handleRemoteResultValidationError(self: *OnlineState, err: anyerror) void {
@@ -826,6 +869,7 @@ const OnlineState = struct {
     fn enterTerminal(self: *OnlineState, terminal: OnlineTerminal, packet: OnlineTerminalPacket, comptime fmt: []const u8, args: anytype) void {
         if (self.terminal != .none) return;
         self.flushPendingInputBestEffort();
+        const terminal_packet = terminalPacketKind(packet);
         switch (packet) {
             .none => {},
             .result => self.sendResultBestEffort(),
@@ -833,8 +877,31 @@ const OnlineState = struct {
             .disconnect => |reason| self.sendDisconnectBestEffort(reason),
         }
         self.terminal = terminal;
+        self.terminal_packet = terminal_packet;
+        self.terminal_drain_frames_left = if (terminal_packet == .none) 0 else online_terminal_packet_drain_frames;
         self.setMessage(fmt, args);
+        if (terminal_packet == .none) self.disconnectTerminalTransport();
+    }
+
+    fn updateTerminalDrain(self: *OnlineState) void {
+        switch (online_session.terminalDrainAction(.{
+            .packet = self.terminal_packet,
+            .frames_left = self.terminal_drain_frames_left,
+            .disconnected = self.terminal_disconnected,
+        })) {
+            .no_op => {},
+            .disconnect_now => self.disconnectTerminalTransport(),
+            .wait => {
+                if (self.terminal_drain_frames_left > 0) self.terminal_drain_frames_left -= 1;
+                if (self.terminal_drain_frames_left == 0) self.disconnectTerminalTransport();
+            },
+        }
+    }
+
+    fn disconnectTerminalTransport(self: *OnlineState) void {
+        if (self.terminal_disconnected) return;
         web_transport.disconnect();
+        self.terminal_disconnected = true;
     }
 
     fn setMessage(self: *OnlineState, comptime fmt: []const u8, args: anytype) void {
@@ -877,6 +944,10 @@ const OnlineState = struct {
         return if (self.lockstepPeerConst()) |peer| peer.match.outcome != null else false;
     }
 
+    fn hasVerifiedResult(self: *const OnlineState) bool {
+        return self.verified_result;
+    }
+
     fn resultCompletionState(self: *const OnlineState) online_session.ResultCompletionState {
         return .{
             .pending_remote_result = self.pending_remote_result != null,
@@ -888,6 +959,12 @@ const OnlineState = struct {
 
     fn shouldDeferPeerLeaveDisconnect(self: *const OnlineState) bool {
         return online_session.shouldDeferPeerLeaveDisconnect(self.resultCompletionState());
+    }
+
+    fn isLateFinalPacketPeerLeaveGraceActive(self: *const OnlineState) bool {
+        return self.peer_leave_observed and
+            self.late_final_packet_peer_leave_frames > 0 and
+            !self.shouldDeferPeerLeaveDisconnect();
     }
 
     fn shouldIgnoreAsyncSendFailure(self: *const OnlineState) bool {
@@ -902,6 +979,7 @@ const OnlineState = struct {
     fn phaseText(self: *const OnlineState) [:0]const u8 {
         return switch (self.terminal) {
             .finished => "finished",
+            .unverified_result => "unverified result",
             .disconnected => "disconnected",
             .desynced => "desynced",
             .unsupported => "web-only unsupported",
@@ -910,7 +988,7 @@ const OnlineState = struct {
                 .waiting_for_setup => "waiting for host setup",
                 .waiting_for_ack => "waiting for join ack",
                 .setup_received => "sending join ack",
-                .playing => if (self.sent_result and self.pending_remote_result == null) "validating result" else "playing",
+                .playing => if (self.sent_result) "validating result" else "playing",
             } else "starting online",
         };
     }
@@ -956,6 +1034,43 @@ const OnlineState = struct {
         return if (session.peer) |*peer_value| peer_value else null;
     }
 };
+
+fn terminalPacketKind(packet: OnlineTerminalPacket) online_session.TerminalPacketKind {
+    return switch (packet) {
+        .none => .none,
+        .result => .result,
+        .desync => .desync,
+        .disconnect => .disconnect,
+    };
+}
+
+fn onlineTransportStatus(status: web_transport.Status) online_session.TransportStatus {
+    return switch (status) {
+        .unavailable => .unavailable,
+        .missing_js => .missing_js,
+        .disconnected => .disconnected,
+        .connecting => .connecting,
+        .connected => .connected,
+        .busy => .busy,
+    };
+}
+
+fn onlineTransportError(err: web_transport.ErrorCode) online_session.TransportError {
+    return switch (err) {
+        .none => .none,
+        .missing_js => .missing_js,
+        .unavailable => .unavailable,
+        .bad_room => .bad_room,
+        .join_failed => .join_failed,
+        .not_connected => .not_connected,
+        .no_peer => .no_peer,
+        .packet_too_large => .packet_too_large,
+        .queue_full => .queue_full,
+        .send_failed => .send_failed,
+        .buffer_too_small => .buffer_too_small,
+        .busy => .busy,
+    };
+}
 
 const App = struct {
     mode: Mode,
@@ -1540,12 +1655,12 @@ fn drawStatusPanel(state: *const game.Game, paused: bool) void {
     rl.drawText(exitInstructionText(), x + 18, y + h - 18, 12, color_text_dim);
 }
 
-fn drawVersusPlayer(player: match_mod.PlayerIndex, match_state: *const match_mod.Match, player_result: match_mod.PlayerStepResult) void {
+fn drawVersusPlayer(player: match_mod.PlayerIndex, match_state: *const match_mod.Match, player_result: match_mod.PlayerStepResult, outcome_verified: bool) void {
     const runtime = match_state.playerConst(player);
     const layout = versusBoardLayout(player);
     drawVersusSidePanels(player, &runtime.game);
     drawBoard(&runtime.game, layout, playerMatrixTitle(player), "garbage in panel");
-    drawVersusStatusPanel(player, match_state, runtime, player_result);
+    drawVersusStatusPanel(player, match_state, runtime, player_result, outcome_verified);
 }
 
 fn drawVersusSidePanels(player: match_mod.PlayerIndex, state: *const game.Game) void {
@@ -1583,7 +1698,7 @@ fn drawVersusNextPanel(state: *const game.Game, x: i32, y: i32, w: i32, h: i32, 
     }
 }
 
-fn drawVersusStatusPanel(player: match_mod.PlayerIndex, match_state: *const match_mod.Match, runtime: *const match_mod.PlayerRuntime, player_result: match_mod.PlayerStepResult) void {
+fn drawVersusStatusPanel(player: match_mod.PlayerIndex, match_state: *const match_mod.Match, runtime: *const match_mod.PlayerRuntime, player_result: match_mod.PlayerStepResult, outcome_verified: bool) void {
     const x: i32 = switch (player) {
         .p1 => 382,
         .p2 => 560,
@@ -1596,20 +1711,25 @@ fn drawVersusStatusPanel(player: match_mod.PlayerIndex, match_state: *const matc
     var state_label: [:0]const u8 = "playing";
     var state_color = color_accent;
     if (match_state.outcome) |outcome| {
-        switch (outcome) {
-            .draw => {
-                state_label = "draw";
-                state_color = color_warning;
-            },
-            .winner => |winner| {
-                if (winner == player) {
-                    state_label = "winner";
-                    state_color = color_accent;
-                } else {
-                    state_label = "lost";
-                    state_color = color_danger;
-                }
-            },
+        if (outcome_verified) {
+            switch (outcome) {
+                .draw => {
+                    state_label = "draw";
+                    state_color = color_warning;
+                },
+                .winner => |winner| {
+                    if (winner == player) {
+                        state_label = "winner";
+                        state_color = color_accent;
+                    } else {
+                        state_label = "lost";
+                        state_color = color_danger;
+                    }
+                },
+            }
+        } else {
+            state_label = "unverified";
+            state_color = color_warning;
         }
     } else if (runtime.game.game_over) {
         state_label = "game over";
@@ -1735,7 +1855,8 @@ fn drawOnlineWaitingOverlay(online: *const OnlineState) void {
 
 fn drawOnlineTerminalOverlay(online: *const OnlineState) void {
     const title: [:0]const u8 = switch (online.terminal) {
-        .finished => if (online.lockstepPeerConst()) |peer| if (peer.match.outcome) |outcome| matchOutcomeTitle(outcome) else "MATCH COMPLETE" else "MATCH COMPLETE",
+        .finished => if (online.hasVerifiedResult()) if (online.lockstepPeerConst()) |peer| if (peer.match.outcome) |outcome| matchOutcomeTitle(outcome) else "MATCH COMPLETE" else "MATCH COMPLETE" else "MATCH COMPLETE",
+        .unverified_result => "UNVERIFIED RESULT",
         .disconnected => "DISCONNECTED",
         .desynced => "DESYNC",
         .unsupported => "WEB ONLY",
@@ -1744,7 +1865,7 @@ fn drawOnlineTerminalOverlay(online: *const OnlineState) void {
     };
     const accent = switch (online.terminal) {
         .finished => color_accent,
-        .disconnected, .unsupported => color_warning,
+        .unverified_result, .disconnected, .unsupported => color_warning,
         .desynced, .failed => color_danger,
         .none => color_text,
     };
@@ -1753,8 +1874,11 @@ fn drawOnlineTerminalOverlay(online: *const OnlineState) void {
 
 fn drawOnlineMatchOverlay(online: *const OnlineState, match_state: *const match_mod.Match) void {
     if (match_state.outcome) |outcome| {
-        _ = online;
-        drawScreenOverlay(matchOutcomeTitle(outcome), "Online rematch is not implemented; press 1/2/3 for a fresh mode", if (isDraw(outcome)) color_warning else color_accent);
+        if (online.hasVerifiedResult()) {
+            drawScreenOverlay(matchOutcomeTitle(outcome), "Online rematch is not implemented; press 1/2/3 for a fresh mode", if (isDraw(outcome)) color_warning else color_accent);
+        } else {
+            drawScreenOverlay("VERIFYING RESULT", "Waiting for opponent result; disconnects are unverified", color_warning);
+        }
     } else if (match_state.paused) {
         drawScreenOverlay("PAUSED", "Press P to resume; R is disabled online", color_warning);
     }

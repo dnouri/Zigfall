@@ -70,7 +70,8 @@ Web online invite controls:
 - Joiner: opening a `?join=<room>` link auto-enters online join mode as P2.
 - Gameplay uses one local control set: Left/Right/Down, Space hard drop, X or Up rotate clockwise, Z counter-clockwise, A 180, Left Shift hold.
 - P is deterministic pause/resume. R is a graceful no-op online because rematch/restart is not implemented yet.
-- Desyncs, disconnects, extra-peer busy rooms, and match results are displayed; disconnects are not counted as wins/losses.
+- If remote inputs stop arriving, a "Waiting for opponent input..." notice appears before the match resumes or disconnects.
+- Desyncs, disconnects, extra-peer busy rooms, and match results are displayed; a local result stays "verifying" until the peer's matching result validates, and disconnect/unverified results are not counted as wins/losses.
 
 Native online networking is not supported; native versus play is local on one keyboard.
 

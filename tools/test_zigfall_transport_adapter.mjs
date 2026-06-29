@@ -131,6 +131,78 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
 }
 
 {
+  let now = 1_000;
+  const { joinRoomImpl, rooms } = makeFakeJoinRoom();
+  const transport = createZigfallTransport({ joinRoomImpl, selfIdValue: "self-test", nowImpl: () => now });
+
+  assert.equal(transport.connect("late-final-room"), ErrorCode.none);
+  const room = rooms[0];
+  const action = room.action;
+  room.join("peer-a");
+  room.join("peer-b");
+
+  room.leavePeer("peer-a");
+  assert.equal(transport.selectedPeerId(), null);
+  assert.equal(transport.errorCode(), ErrorCode.noPeer);
+  assert.equal(transport.statusCode(), Status.busy);
+
+  action.emit(Uint8Array.from([0x41]), "peer-a");
+  assert.equal(transport.queuedPacketCount(), 1, "selected peer's final packet should survive leave-before-message callback ordering");
+  action.emit(Uint8Array.from([0x42]), "peer-b");
+  assert.equal(transport.queuedPacketCount(), 1, "extra peers must remain rejected during the retiring-peer drain");
+  assert.deepEqual(Array.from(transport.poll()), [0x41]);
+
+  now += transport.RetiringSelectedPeerDrainMs + 1;
+  action.emit(Uint8Array.from([0x43]), "peer-a");
+  assert.equal(transport.queuedPacketCount(), 0, "retiring selected peer acceptance must be bounded");
+
+  assert.equal(transport.connect("late-final-new-room"), ErrorCode.none);
+  rooms[1].join("peer-c");
+  action.emit(Uint8Array.from([0x44]), "peer-a");
+  assert.equal(transport.queuedPacketCount(), 0, "retiring peers from a prior room generation must not leak into a new room");
+  assert.equal(transport.statusCode(), Status.connected);
+  assert.equal(transport.selectedPeerId(), "peer-c");
+}
+
+{
+  let now = 5_000;
+  const { joinRoomImpl, rooms } = makeFakeJoinRoom();
+  const transport = createZigfallTransport({ joinRoomImpl, selfIdValue: "self-test", nowImpl: () => now });
+
+  assert.equal(transport.connect("expired-late-room"), ErrorCode.none);
+  rooms[0].join("peer-a");
+  rooms[0].leavePeer("peer-a");
+  now += transport.RetiringSelectedPeerDrainMs + 1;
+  rooms[0].action.emit(Uint8Array.from([0x45]), "peer-a");
+  assert.equal(transport.errorCode(), ErrorCode.noPeer, "expired late packets from the departed selected peer must not mask noPeer as busy");
+  assert.equal(transport.statusCode(), Status.connecting);
+}
+
+{
+  let now = 8_000;
+  const { joinRoomImpl, rooms } = makeFakeJoinRoom();
+  const transport = createZigfallTransport({ joinRoomImpl, selfIdValue: "self-test", nowImpl: () => now });
+
+  assert.equal(transport.connect("extra-churn-after-leave"), ErrorCode.none);
+  const room = rooms[0];
+  room.join("peer-a");
+  room.leavePeer("peer-a");
+  room.join("peer-b");
+  assert.equal(transport.statusCode(), Status.busy);
+  assert.equal(transport.errorCode(), ErrorCode.busy);
+  room.leavePeer("peer-b");
+  assert.equal(transport.selectedPeerId(), null);
+  assert.equal(transport.statusCode(), Status.connecting);
+  assert.equal(transport.errorCode(), ErrorCode.noPeer, "extra-peer churn after selected leave must not erase the peer-leave signal");
+  room.action.emit(Uint8Array.from([0x46]), "peer-a");
+  assert.deepEqual(Array.from(transport.poll()), [0x46], "retiring selected peer drain should survive extra-peer churn");
+  now += transport.RetiringSelectedPeerDrainMs + 1;
+  room.action.emit(Uint8Array.from([0x47]), "peer-a");
+  assert.equal(transport.queuedPacketCount(), 0, "retiring selected peer drain remains bounded after extra-peer churn");
+  assert.equal(transport.errorCode(), ErrorCode.noPeer);
+}
+
+{
   const { joinRoomImpl, rooms } = makeFakeJoinRoom();
   const transport = createZigfallTransport({ joinRoomImpl, selfIdValue: "self-test" });
 
@@ -199,4 +271,4 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
   }
 }
 
-console.log("ok: Zigfall transport adapter selects one peer, targets sends, drops extras, drains disconnects, bounds backlog, and scopes async send failures");
+console.log("ok: Zigfall transport adapter selects one peer, targets sends, drops extras, drains late final packets, bounds backlog, and scopes async send failures");

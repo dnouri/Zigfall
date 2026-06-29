@@ -83,6 +83,133 @@ pub const ResultValidationStatus = enum {
     accepted,
 };
 
+pub const RemoteResultStatus = enum {
+    none,
+    pending_local_result,
+    validated,
+};
+
+pub const ResultFinishAction = enum {
+    no_local_outcome,
+    send_local_result,
+    wait_for_remote_result,
+    wait_for_verified_drain,
+    finish_verified,
+    finish_unverified_disconnect,
+    finish_unverified_timeout,
+};
+
+pub const ResultFinishState = struct {
+    remote_result_status: RemoteResultStatus = .none,
+    has_local_outcome: bool = false,
+    sent_local_result: bool = false,
+    result_drain_frames_left: u16 = 0,
+    peer_left: bool = false,
+};
+
+pub fn resultFinishAction(state: ResultFinishState) ResultFinishAction {
+    if (!state.has_local_outcome) return .no_local_outcome;
+    if (state.remote_result_status == .validated) {
+        if (!state.sent_local_result) return .send_local_result;
+        if (state.result_drain_frames_left > 0) return .wait_for_verified_drain;
+        return .finish_verified;
+    }
+
+    if (!state.sent_local_result) return .send_local_result;
+    if (state.result_drain_frames_left > 0) return .wait_for_remote_result;
+    return if (state.peer_left) .finish_unverified_disconnect else .finish_unverified_timeout;
+}
+
+pub const TerminalPacketKind = enum {
+    none,
+    result,
+    desync,
+    disconnect,
+};
+
+pub const TerminalDrainAction = enum {
+    no_op,
+    wait,
+    disconnect_now,
+};
+
+pub const TerminalDrainState = struct {
+    packet: TerminalPacketKind = .none,
+    frames_left: u16 = 0,
+    disconnected: bool = false,
+};
+
+pub fn terminalDrainAction(state: TerminalDrainState) TerminalDrainAction {
+    if (state.disconnected) return .no_op;
+    if (state.packet == .none or state.frames_left == 0) return .disconnect_now;
+    return .wait;
+}
+
+pub const TransportStatus = enum {
+    unavailable,
+    missing_js,
+    disconnected,
+    connecting,
+    connected,
+    busy,
+};
+
+pub const TransportError = enum {
+    none,
+    missing_js,
+    unavailable,
+    bad_room,
+    join_failed,
+    not_connected,
+    no_peer,
+    packet_too_large,
+    queue_full,
+    send_failed,
+    buffer_too_small,
+    busy,
+};
+
+pub const TransportHealthAction = enum {
+    none,
+    fail_extra_peer,
+    fail_missing_js,
+    unsupported,
+    disconnected,
+    fail_packet_too_large,
+    fail_queue_full,
+    fail_send_failed,
+};
+
+pub const TransportHealthState = struct {
+    status: TransportStatus = .disconnected,
+    last_error: TransportError = .none,
+    ever_had_peer: bool = false,
+    peer_leave_observed: bool = false,
+    defer_peer_leave_disconnect: bool = false,
+    ignore_async_send_failure: bool = false,
+};
+
+pub fn transportHealthAction(state: TransportHealthState) TransportHealthAction {
+    switch (state.status) {
+        .busy => return .fail_extra_peer,
+        .missing_js => return .fail_missing_js,
+        .unavailable => return .unsupported,
+        .disconnected => if (state.ever_had_peer and !state.defer_peer_leave_disconnect) return .disconnected,
+        .connecting, .connected => {},
+    }
+
+    switch (state.last_error) {
+        .no_peer => if (state.ever_had_peer and !state.defer_peer_leave_disconnect) return .disconnected,
+        .packet_too_large => return .fail_packet_too_large,
+        .queue_full => return .fail_queue_full,
+        .send_failed => if (!state.ignore_async_send_failure) return .fail_send_failed,
+        else => {},
+    }
+
+    if (state.peer_leave_observed and !state.defer_peer_leave_disconnect) return .disconnected;
+    return .none;
+}
+
 pub const ResultCompletionState = struct {
     pending_remote_result: bool = false,
     sent_result: bool = false,
@@ -100,6 +227,9 @@ pub const PeerLeaveDisconnectState = struct {
     completion: ResultCompletionState = .{},
     pending_result_peer_leave_frames: u16 = 0,
     pending_result_peer_leave_grace_frames: u16 = 0,
+    late_final_packet_peer_leave_frames: u16 = 0,
+    late_final_packet_peer_leave_grace_frames: u16 = 0,
+    allow_late_final_packet_grace: bool = false,
 };
 
 pub fn shouldDeferPeerLeaveDisconnect(state: ResultCompletionState) bool {
@@ -113,6 +243,10 @@ pub fn peerLeaveDisconnectAction(state: PeerLeaveDisconnectState) PeerLeaveDisco
     if (state.completion.sent_result or state.completion.has_local_outcome or state.completion.result_drain_active) return .defer_disconnect;
     if (state.completion.pending_remote_result) {
         if (state.pending_result_peer_leave_frames >= state.pending_result_peer_leave_grace_frames) return .pending_result_timed_out;
+        return .defer_disconnect;
+    }
+    if (state.allow_late_final_packet_grace) {
+        if (state.late_final_packet_peer_leave_frames >= state.late_final_packet_peer_leave_grace_frames) return .disconnect_now;
         return .defer_disconnect;
     }
     return .disconnect_now;
@@ -679,6 +813,111 @@ test "lifecycle sender validation requires the expected remote slot" {
     try std.testing.expectError(error.InvalidLifecycleSenderSlot, validateLifecycleSender(.joiner, JoinerProtocolSlot));
 }
 
+test "result finish policy separates verified completion from unverified local outcome" {
+    try std.testing.expectEqual(ResultFinishAction.no_local_outcome, resultFinishAction(.{}));
+    try std.testing.expectEqual(ResultFinishAction.send_local_result, resultFinishAction(.{
+        .has_local_outcome = true,
+    }));
+    try std.testing.expectEqual(ResultFinishAction.wait_for_remote_result, resultFinishAction(.{
+        .has_local_outcome = true,
+        .sent_local_result = true,
+        .result_drain_frames_left = 1,
+    }));
+    try std.testing.expectEqual(ResultFinishAction.finish_unverified_timeout, resultFinishAction(.{
+        .has_local_outcome = true,
+        .sent_local_result = true,
+    }));
+    try std.testing.expectEqual(ResultFinishAction.finish_unverified_disconnect, resultFinishAction(.{
+        .has_local_outcome = true,
+        .sent_local_result = true,
+        .peer_left = true,
+    }));
+    try std.testing.expectEqual(ResultFinishAction.send_local_result, resultFinishAction(.{
+        .remote_result_status = .validated,
+        .has_local_outcome = true,
+    }));
+    try std.testing.expectEqual(ResultFinishAction.wait_for_verified_drain, resultFinishAction(.{
+        .remote_result_status = .validated,
+        .has_local_outcome = true,
+        .sent_local_result = true,
+        .result_drain_frames_left = 1,
+    }));
+    try std.testing.expectEqual(ResultFinishAction.finish_verified, resultFinishAction(.{
+        .remote_result_status = .validated,
+        .has_local_outcome = true,
+        .sent_local_result = true,
+    }));
+}
+
+test "terminal packet drain policy waits before room leave" {
+    try std.testing.expectEqual(TerminalDrainAction.disconnect_now, terminalDrainAction(.{}));
+    try std.testing.expectEqual(TerminalDrainAction.wait, terminalDrainAction(.{
+        .packet = .desync,
+        .frames_left = 2,
+    }));
+    try std.testing.expectEqual(TerminalDrainAction.wait, terminalDrainAction(.{
+        .packet = .disconnect,
+        .frames_left = 1,
+    }));
+    try std.testing.expectEqual(TerminalDrainAction.disconnect_now, terminalDrainAction(.{
+        .packet = .disconnect,
+        .frames_left = 0,
+    }));
+    try std.testing.expectEqual(TerminalDrainAction.no_op, terminalDrainAction(.{
+        .packet = .desync,
+        .frames_left = 10,
+        .disconnected = true,
+    }));
+}
+
+test "transport health policy maps terminal receive and send failures" {
+    try std.testing.expectEqual(TransportHealthAction.fail_queue_full, transportHealthAction(.{
+        .status = .connected,
+        .last_error = .queue_full,
+    }));
+    try std.testing.expectEqual(TransportHealthAction.fail_packet_too_large, transportHealthAction(.{
+        .status = .connected,
+        .last_error = .packet_too_large,
+    }));
+    try std.testing.expectEqual(TransportHealthAction.fail_send_failed, transportHealthAction(.{
+        .status = .connected,
+        .last_error = .send_failed,
+    }));
+    try std.testing.expectEqual(TransportHealthAction.none, transportHealthAction(.{
+        .status = .connected,
+        .last_error = .send_failed,
+        .ignore_async_send_failure = true,
+    }));
+    try std.testing.expectEqual(TransportHealthAction.disconnected, transportHealthAction(.{
+        .status = .connected,
+        .last_error = .no_peer,
+        .ever_had_peer = true,
+    }));
+    try std.testing.expectEqual(TransportHealthAction.none, transportHealthAction(.{
+        .status = .disconnected,
+        .ever_had_peer = true,
+        .defer_peer_leave_disconnect = true,
+    }));
+    try std.testing.expectEqual(TransportHealthAction.none, transportHealthAction(.{
+        .status = .connected,
+        .peer_leave_observed = true,
+        .defer_peer_leave_disconnect = true,
+    }));
+    try std.testing.expectEqual(TransportHealthAction.disconnected, transportHealthAction(.{
+        .status = .connected,
+        .peer_leave_observed = true,
+    }));
+    try std.testing.expectEqual(TransportHealthAction.disconnected, transportHealthAction(.{
+        .status = .connecting,
+        .last_error = .none,
+        .peer_leave_observed = true,
+    }));
+    try std.testing.expectEqual(TransportHealthAction.fail_extra_peer, transportHealthAction(.{
+        .status = .busy,
+        .last_error = .queue_full,
+    }));
+}
+
 test "result completion state defers peer-leave disconnects only while finishing" {
     try std.testing.expect(!shouldDeferPeerLeaveDisconnect(.{}));
     try std.testing.expect(shouldDeferPeerLeaveDisconnect(.{ .pending_remote_result = true }));
@@ -701,6 +940,60 @@ test "result completion state defers peer-leave disconnects only while finishing
         .completion = .{ .pending_remote_result = true, .has_local_outcome = true },
         .pending_result_peer_leave_frames = 2,
         .pending_result_peer_leave_grace_frames = 2,
+    }));
+}
+
+test "peer-leave no-peer starts late final packet grace without result state" {
+    try std.testing.expectEqual(PeerLeaveDisconnectAction.disconnect_now, peerLeaveDisconnectAction(.{}));
+    try std.testing.expectEqual(PeerLeaveDisconnectAction.disconnect_now, peerLeaveDisconnectAction(.{
+        .late_final_packet_peer_leave_frames = 1,
+        .late_final_packet_peer_leave_grace_frames = 3,
+    }));
+    try std.testing.expectEqual(PeerLeaveDisconnectAction.defer_disconnect, peerLeaveDisconnectAction(.{
+        .allow_late_final_packet_grace = true,
+        .late_final_packet_peer_leave_frames = 1,
+        .late_final_packet_peer_leave_grace_frames = 3,
+    }));
+    try std.testing.expectEqual(TransportHealthAction.none, transportHealthAction(.{
+        .status = .connected,
+        .last_error = .no_peer,
+        .ever_had_peer = true,
+        .defer_peer_leave_disconnect = true,
+    }));
+}
+
+test "late result during no-peer grace continues result validation path" {
+    try std.testing.expectEqual(PeerLeaveDisconnectAction.defer_disconnect, peerLeaveDisconnectAction(.{
+        .allow_late_final_packet_grace = true,
+        .late_final_packet_peer_leave_frames = 2,
+        .late_final_packet_peer_leave_grace_frames = 3,
+    }));
+    try std.testing.expectEqual(PeerLeaveDisconnectAction.defer_disconnect, peerLeaveDisconnectAction(.{
+        .completion = .{ .pending_remote_result = true },
+        .pending_result_peer_leave_frames = 1,
+        .pending_result_peer_leave_grace_frames = 4,
+        .allow_late_final_packet_grace = true,
+        .late_final_packet_peer_leave_frames = 3,
+        .late_final_packet_peer_leave_grace_frames = 3,
+    }));
+    try std.testing.expectEqual(PeerLeaveDisconnectAction.defer_disconnect, peerLeaveDisconnectAction(.{
+        .completion = .{ .sent_result = true },
+        .allow_late_final_packet_grace = true,
+        .late_final_packet_peer_leave_frames = 3,
+        .late_final_packet_peer_leave_grace_frames = 3,
+    }));
+}
+
+test "late final packet grace expires before peer-leave disconnect" {
+    try std.testing.expectEqual(PeerLeaveDisconnectAction.defer_disconnect, peerLeaveDisconnectAction(.{
+        .allow_late_final_packet_grace = true,
+        .late_final_packet_peer_leave_frames = 2,
+        .late_final_packet_peer_leave_grace_frames = 3,
+    }));
+    try std.testing.expectEqual(PeerLeaveDisconnectAction.disconnect_now, peerLeaveDisconnectAction(.{
+        .allow_late_final_packet_grace = true,
+        .late_final_packet_peer_leave_frames = 3,
+        .late_final_packet_peer_leave_grace_frames = 3,
     }));
 }
 
