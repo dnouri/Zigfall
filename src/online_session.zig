@@ -92,6 +92,17 @@ pub const RemoteResultStatus = enum {
     validated,
 };
 
+pub const RemoteResultPacketAction = enum {
+    accept,
+    ignore_duplicate,
+    reject_conflict,
+};
+
+pub fn remoteResultPacketAction(pending_remote_result: ?protocol.Result, incoming: protocol.Result) RemoteResultPacketAction {
+    const pending = pending_remote_result orelse return .accept;
+    return if (std.meta.eql(pending, incoming)) .ignore_duplicate else .reject_conflict;
+}
+
 pub const ResultFinishAction = enum {
     no_local_outcome,
     send_local_result,
@@ -560,14 +571,17 @@ pub fn displayCardFromProfilePacket(profile_packet: protocol.Profile) profile.Pr
 
 /// Decide whether a transport packet should be decoded as required gameplay /
 /// lifecycle data, decoded as optional profile metadata, or ignored as stale
-/// room noise. Profile packets are display-only, so callers can treat body
+/// room noise. When a current match id is known, raw wrong-match envelopes are
+/// ignored before version/type validation so stale future packets cannot poison
+/// the current room. Profile packets are display-only, so callers can treat body
 /// decode errors from `.decode_optional_profile` as nonfatal notices.
 pub fn packetDecodePolicyForKnownMatch(current_match_id: ?u64, bytes: []const u8) protocol.DecodeError!PacketDecodePolicy {
+    if (current_match_id) |match_id| {
+        if (bytes.len >= protocol.HeaderSize and (try protocol.peekMatchId(bytes)) != match_id) return .ignore_stale;
+    }
+
     const packet_type = try protocol.peekPacketType(bytes);
     if (packet_type == .profile and bytes.len < protocol.HeaderSize) return .decode_optional_profile;
-    if (current_match_id) |match_id| {
-        if ((try protocol.peekMatchId(bytes)) != match_id) return .ignore_stale;
-    }
     return if (packet_type == .profile) .decode_optional_profile else .decode_required;
 }
 
@@ -621,11 +635,12 @@ pub const ProfileRatingRecordAction = enum {
 pub const ProfileRatingRecordState = struct {
     verified_result: bool = false,
     has_local_outcome: bool = false,
+    final_counted_transition: bool = false,
     already_recorded: bool = false,
 };
 
 pub fn profileRatingRecordAction(state: ProfileRatingRecordState) ProfileRatingRecordAction {
-    if (!state.verified_result or !state.has_local_outcome or state.already_recorded) return .ignore;
+    if (!state.verified_result or !state.has_local_outcome or !state.final_counted_transition or state.already_recorded) return .ignore;
     return .record;
 }
 
@@ -897,6 +912,18 @@ test "known-match stale filter drops wrong-match malformed lifecycle before body
     try std.testing.expect(!(try packetMatchesKnownMatch(TestMatchId, encoded.slice())));
     try std.testing.expect(!(try packetMatchesKnownMatch(null, encoded.slice())));
     try std.testing.expect(!(try shouldIgnorePacketForKnownMatch(null, encoded.slice())));
+
+    var wrong_version = try encodeAckPacket(ack);
+    wrong_version.bytes[0] = protocol.ProtocolVersion + 1;
+    try std.testing.expectError(error.InvalidVersion, protocol.decode(wrong_version.slice()));
+    try std.testing.expectEqual(PacketDecodePolicy.ignore_stale, try packetDecodePolicyForKnownMatch(TestMatchId, wrong_version.slice()));
+    try std.testing.expect(try shouldIgnorePacketForKnownMatch(TestMatchId, wrong_version.slice()));
+
+    var unknown_type = try encodeAckPacket(ack);
+    unknown_type.bytes[1] = 0xff;
+    try std.testing.expectError(error.UnknownPacketType, protocol.decode(unknown_type.slice()));
+    try std.testing.expectEqual(PacketDecodePolicy.ignore_stale, try packetDecodePolicyForKnownMatch(TestMatchId, unknown_type.slice()));
+    try std.testing.expect(try shouldIgnorePacketForKnownMatch(TestMatchId, unknown_type.slice()));
 }
 
 test "profile decode policy keeps malformed profile metadata nonfatal" {
@@ -991,13 +1018,19 @@ test "profile rating record policy only records verified completed outcomes once
     try std.testing.expectEqual(ProfileRatingRecordAction.ignore, profileRatingRecordAction(.{
         .has_local_outcome = true,
     }));
+    try std.testing.expectEqual(ProfileRatingRecordAction.ignore, profileRatingRecordAction(.{
+        .verified_result = true,
+        .has_local_outcome = true,
+    }));
     try std.testing.expectEqual(ProfileRatingRecordAction.record, profileRatingRecordAction(.{
         .verified_result = true,
         .has_local_outcome = true,
+        .final_counted_transition = true,
     }));
     try std.testing.expectEqual(ProfileRatingRecordAction.ignore, profileRatingRecordAction(.{
         .verified_result = true,
         .has_local_outcome = true,
+        .final_counted_transition = true,
         .already_recorded = true,
     }));
 
@@ -1011,6 +1044,49 @@ test "profile rating record policy only records verified completed outcomes once
     var untrusted_remote = profile.ProfileCard.default();
     untrusted_remote.rating = profile.MaxRating;
     try std.testing.expectEqual(profile.DefaultRating, opponentRatingForProfileUpdate(untrusted_remote));
+}
+
+test "remote result packet policy ignores duplicates instead of advancing finish drain" {
+    const result = protocol.Result{
+        .match_id = TestMatchId,
+        .sender_slot = JoinerProtocolSlot,
+        .outcome = .p1_win,
+        .frame_cursor = 99,
+        .state_hash = 0x1234,
+    };
+    try std.testing.expectEqual(RemoteResultPacketAction.accept, remoteResultPacketAction(null, result));
+    try std.testing.expectEqual(RemoteResultPacketAction.ignore_duplicate, remoteResultPacketAction(result, result));
+
+    var conflict = result;
+    conflict.state_hash += 1;
+    try std.testing.expectEqual(RemoteResultPacketAction.reject_conflict, remoteResultPacketAction(result, conflict));
+}
+
+test "profile rating waits through verified drain until the counted terminal transition" {
+    try std.testing.expectEqual(ResultFinishAction.wait_for_verified_drain, resultFinishAction(.{
+        .remote_result_status = .validated,
+        .has_local_outcome = true,
+        .sent_local_result = true,
+        .result_drain_frames_left = 1,
+    }));
+    try std.testing.expectEqual(ProfileRatingRecordAction.ignore, profileRatingRecordAction(.{
+        .verified_result = true,
+        .has_local_outcome = true,
+    }));
+
+    // A late conflicting result, desync, or fatal packet before drain expiry
+    // moves the UI to a not-counted terminal path; only this final counted
+    // transition may mutate the browser-local profile.
+    try std.testing.expectEqual(ResultFinishAction.finish_verified, resultFinishAction(.{
+        .remote_result_status = .validated,
+        .has_local_outcome = true,
+        .sent_local_result = true,
+    }));
+    try std.testing.expectEqual(ProfileRatingRecordAction.record, profileRatingRecordAction(.{
+        .verified_result = true,
+        .has_local_outcome = true,
+        .final_counted_transition = true,
+    }));
 }
 
 test "result finish policy separates verified completion from unverified local outcome" {

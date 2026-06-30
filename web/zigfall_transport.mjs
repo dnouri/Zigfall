@@ -9,9 +9,9 @@ const MaxPacketSize = 512;
 const MaxQueuedPackets = 256;
 const MaxRoomIdLength = 128;
 const RetiringSelectedPeerDrainMs = 2000;
-const ProtocolVersion = 1;
+const ProtocolVersion = 2;
 const ProfilePacketType = 8;
-const AppId = "zigfall-trystero-v1";
+const AppId = "zigfall-trystero-v2";
 const PacketActionName = "pkt";
 const noop = () => {};
 
@@ -378,6 +378,10 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
     MaxQueuedPackets,
     MaxRoomIdLength,
     RetiringSelectedPeerDrainMs,
+    ProtocolVersion,
+    ProfilePacketType,
+    AppId,
+    PacketActionName,
     Status,
     ErrorCode,
     selfId: selfIdValue,
@@ -405,4 +409,4 @@ const api = createZigfallTransport();
 
 globalThis.ZigfallTransport = api;
 
-export { api as ZigfallTransport, Status, ErrorCode, createZigfallTransport };
+export { api as ZigfallTransport, AppId, ErrorCode, PacketActionName, ProfilePacketType, ProtocolVersion, Status, createZigfallTransport };

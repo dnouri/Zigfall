@@ -563,11 +563,13 @@ const OnlineState = struct {
     fn handleResult(self: *OnlineState, result: protocol.Result) void {
         const role = self.role orelse return;
         const peer = self.lockstepPeerConst() orelse return;
-        if (self.pending_remote_result) |pending| {
-            if (!std.meta.eql(pending, result)) {
+        switch (online_session.remoteResultPacketAction(self.pending_remote_result, result)) {
+            .accept => {},
+            .ignore_duplicate => return,
+            .reject_conflict => {
                 self.enterTerminal(.failed, .{ .disconnect = 11 }, "Opponent sent conflicting result packets.", .{});
                 return;
-            }
+            },
         }
 
         switch (online_session.validateRemoteResult(role, peer, result) catch |err| {
@@ -747,7 +749,7 @@ const OnlineState = struct {
                 if (self.result_drain_frames_left > 0) self.result_drain_frames_left -= 1;
             },
             .finish_verified => {
-                self.recordVerifiedProfileResult();
+                self.recordFinalVerifiedProfileResult();
                 if (self.profile_result_recorded and !self.profile_result_update_failed) {
                     self.enterTerminal(.finished, .none, "Match complete. Local rating {s}{d} -> {}{s}. Online rematch is not implemented yet.", .{
                         if (self.profile_rating_delta >= 0) "+" else "-",
@@ -778,7 +780,6 @@ const OnlineState = struct {
         }) {
             .accepted => {
                 self.verified_result = true;
-                self.recordVerifiedProfileResult();
                 return .validated;
             },
             .pending_local_result => return .pending_local_result,
@@ -790,10 +791,11 @@ const OnlineState = struct {
         return self.terminal == .none;
     }
 
-    fn recordVerifiedProfileResult(self: *OnlineState) void {
+    fn recordFinalVerifiedProfileResult(self: *OnlineState) void {
         if (online_session.profileRatingRecordAction(.{
             .verified_result = self.hasVerifiedResult(),
             .has_local_outcome = self.hasLocalOutcome(),
+            .final_counted_transition = true,
             .already_recorded = self.profile_result_recorded,
         }) != .record) return;
 

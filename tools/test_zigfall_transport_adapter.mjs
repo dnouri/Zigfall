@@ -63,6 +63,8 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
   assert.equal(transport.connect("adapter-test"), ErrorCode.none);
   const room = rooms[0];
   const action = room.action;
+  assert.equal(room.config.appId, "zigfall-trystero-v2", "transport app namespace must isolate protocol v2 clients");
+  assert.equal(transport.ProtocolVersion, 2, "transport profile fast-path must track the Zig wire protocol version");
 
   room.join("peer-a");
   assert.equal(transport.statusCode(), Status.connected);
@@ -209,7 +211,7 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
   assert.equal(transport.connect("profile-burst-test"), ErrorCode.none);
   rooms[0].join("peer-a");
   for (let i = 0; i < transport.MaxQueuedPackets; i += 1) {
-    rooms[0].action.emit(Uint8Array.from([1, 8, i & 0xff]), "peer-a");
+    rooms[0].action.emit(Uint8Array.from([transport.ProtocolVersion, transport.ProfilePacketType, i & 0xff]), "peer-a");
   }
   assert.equal(transport.errorCode(), ErrorCode.none, "profile metadata bursts must not poison the shared gameplay queue");
   assert.equal(transport.queuedPacketCount(), 1, "at most one optional profile packet should be pending");
@@ -227,7 +229,7 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
   for (let i = 0; i < transport.MaxQueuedPackets - 1; i += 1) {
     rooms[0].action.emit(Uint8Array.from([0x20, i & 0xff]), "peer-a");
   }
-  rooms[0].action.emit(Uint8Array.from([1, 8, 0xaa]), "peer-a");
+  rooms[0].action.emit(Uint8Array.from([transport.ProtocolVersion, transport.ProfilePacketType, 0xaa]), "peer-a");
   assert.equal(transport.queuedPacketCount(), transport.MaxQueuedPackets);
   rooms[0].action.emit(Uint8Array.from([0x21]), "peer-a");
   assert.equal(transport.errorCode(), ErrorCode.none, "optional profile should be evicted before reporting gameplay queue overflow");
@@ -250,7 +252,7 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
     action.emit(Uint8Array.from([i & 0xff]), "peer-a");
   }
   assert.equal(transport.queuedPacketCount(), transport.MaxQueuedPackets);
-  action.emit(Uint8Array.from([1, 8]), "peer-a");
+  action.emit(Uint8Array.from([transport.ProtocolVersion, transport.ProfilePacketType]), "peer-a");
   assert.equal(transport.errorCode(), ErrorCode.none, "optional profile metadata overflow must not poison gameplay health");
   assert.equal(transport.queuedPacketCount(), transport.MaxQueuedPackets, "profile overflow should not grow the bounded queue");
   action.emit(Uint8Array.from([0xee]), "peer-a");
@@ -267,8 +269,8 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
   room.join("peer-a");
 
   const oversizedProfile = new Uint8Array(transport.MaxPacketSize + 1);
-  oversizedProfile[0] = 1;
-  oversizedProfile[1] = 8;
+  oversizedProfile[0] = transport.ProtocolVersion;
+  oversizedProfile[1] = transport.ProfilePacketType;
   room.action.emit(oversizedProfile, "peer-a");
   assert.equal(transport.errorCode(), ErrorCode.none, "oversized profile metadata must be dropped without poisoning gameplay health");
   assert.equal(transport.queuedPacketCount(), 0, "oversized profile metadata is not queued");

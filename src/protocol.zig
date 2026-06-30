@@ -15,16 +15,18 @@
 //! have been simulated. Never serialize raw Zig structs or rely on native memory
 //! layout. Profile packets carry bounded display-only metadata; callers must not
 //! feed profile contents into match seeds, slots, state hashes, result authority,
-//! or lockstep state. JS/Trystero code should move gameplay and lifecycle
-//! packets as opaque bytes and queue asynchronous callbacks for Zig to poll;
-//! the only transport-level packet peek is a minimal type check to drop
-//! oversized display-only profile metadata without poisoning gameplay health.
+//! or lockstep state. Protocol v2 adds those profile packets and is paired with
+//! the web transport's v2 Trystero app namespace so mixed v1/v2 clients do not
+//! silently pair. JS/Trystero code should move gameplay and lifecycle packets
+//! as opaque bytes and queue asynchronous callbacks for Zig to poll; the only
+//! transport-level packet peek is a minimal type check to drop oversized
+//! display-only profile metadata without poisoning gameplay health.
 
 const std = @import("std");
 const input = @import("input");
 const profile = @import("profile");
 
-pub const ProtocolVersion: u8 = 1;
+pub const ProtocolVersion: u8 = 2;
 pub const MatchIdSize: usize = 8;
 pub const HeaderSize: usize = 2 + MatchIdSize;
 pub const MaxPacketSize: usize = 512;
@@ -859,7 +861,7 @@ test "setup packet round-trips" {
 
 test "setup packet has stable golden layout" {
     const expected = [_]u8{
-        1,
+        2,
         1,
         0xef,
         0xcd,
@@ -922,7 +924,7 @@ test "input batch packet has stable golden layout" {
         .{ .down_down = true, .hard_drop_pressed = true, .pause_pressed = true },
     }) };
     const expected = [_]u8{
-        1,
+        2,
         2,
         0xef,
         0xcd,
@@ -970,7 +972,7 @@ test "ack packet has stable golden layout" {
         .next_needed_frame = 321,
     } };
     const expected = [_]u8{
-        1,
+        2,
         3,
         0xef,
         0xcd,
@@ -1012,7 +1014,7 @@ test "state hash packet has stable golden layout" {
         .state_hash = 0x0123_4567_89ab_cdef,
     } };
     const expected = [_]u8{
-        1,
+        2,
         4,
         0xef,
         0xcd,
@@ -1065,7 +1067,7 @@ test "desync packet has stable golden layout" {
         .peer_hash = 0x1111_2222_3333_4444,
     } };
     const expected = [_]u8{
-        1,
+        2,
         5,
         0xef,
         0xcd,
@@ -1123,7 +1125,7 @@ test "disconnect packet has stable golden layout" {
         .last_frame_cursor = 999,
     } };
     const expected = [_]u8{
-        1,
+        2,
         6,
         0xef,
         0xcd,
@@ -1167,7 +1169,7 @@ test "result packet has stable golden layout" {
         .state_hash = 0xfedc_ba98_7654_3210,
     } };
     const expected = [_]u8{
-        1,
+        2,
         7,
         0xef,
         0xcd,
@@ -1206,7 +1208,7 @@ test "profile packet round-trips" {
 
 test "profile packet has stable golden layout" {
     const expected = [_]u8{
-        1,
+        2,
         8,
         0xef,
         0xcd,
@@ -1293,7 +1295,7 @@ test "profile packet rejects trailing bytes beyond declared field lengths" {
 
 test "decode rejects invalid version and packet type" {
     try std.testing.expectError(error.InvalidVersion, decode(&[_]u8{ 0, 3 }));
-    try std.testing.expectError(error.UnknownPacketType, decode(&[_]u8{ 1, 0xff }));
+    try std.testing.expectError(error.UnknownPacketType, decode(&[_]u8{ ProtocolVersion, 0xff }));
 }
 
 test "packet envelope peek validates only the header" {
@@ -1345,7 +1347,7 @@ test "overlarge packets are rejected" {
 
 test "input batch rejects too many inputs" {
     const bytes = [_]u8{
-        1,
+        2,
         2,
         0xef,
         0xcd,
@@ -1374,7 +1376,7 @@ test "input batch rejects too many inputs" {
 
 test "input batch rejects invalid input mask" {
     const bytes = [_]u8{
-        1,
+        2,
         2,
         0xef,
         0xcd,

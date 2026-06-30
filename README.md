@@ -163,7 +163,7 @@ small web-only transport footer and manually from the browser console:
 ZigfallTransport.connect("zigfall-phase5-local")
 ZigfallTransport.peerCount()
 ZigfallTransport.send(Uint8Array.from([
-  0x01, 0x02, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01, 0x00, 0x78, 0x00,
+  0x02, 0x02, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01, 0x00, 0x78, 0x00,
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x09, 0x00, 0x22, 0x00, 0x04, 0x06,
 ]))
 Array.from(ZigfallTransport.poll() ?? [])
@@ -183,8 +183,9 @@ rating of 1000; the opponent's self-reported rating is display-only. Local
 rating starts at 1000, uses K=32, is clamped to 0..4000, and updates only once
 after a verified completed online match. If browser storage fails, the UI marks
 the profile/rating update as memory-only and not saved. Missing or malformed
-opponent profiles fall back to safe labels/defaults. Protocol v1 profile packet
-(type 8) compatibility with older in-development clients is not guaranteed.
+opponent profiles fall back to safe labels/defaults. Protocol v2 carries profile
+packet type 8 and the web transport uses the matching `zigfall-trystero-v2` app
+namespace so older in-development v1 clients do not silently pair mid-match.
 
 The lower-level transport, invite, and profile seams are also available from the
 browser console:
