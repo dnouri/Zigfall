@@ -2,101 +2,149 @@
 
 **Play Zigfall in your browser: <https://dnouri.github.io/Zigfall/>**
 
-Zigfall is an ambitious falling-block puzzle game written in Zig with
-[raylib-zig](https://github.com/raylib-zig/raylib-zig).  The game
-keeps deterministic rules in `src/game.zig` so mechanics can be
-unit-tested without opening a window, while `src/main.zig` handles the
-raylib UI for desktop and web builds.
+Zigfall is a falling-block game with solo play, local two-player on one keyboard, and browser invite-link P2P. For online play, open the browser version, press `3` to host, copy the invite, and send it to another player. The match runs between the two browsers: Zigfall exchanges inputs, keeps both games deterministic, and cross-checks final state/results without a central game server.
+
+The same Zig game core also runs as a native desktop build with solo play and local two-player on one keyboard. Rendering uses [raylib-zig](https://github.com/raylib-zig/raylib-zig); the rules live separately so the core mechanics can be tested without opening a window.
 
 > [!IMPORTANT]
-> Zigfall is provided for non-commercial educational and research purposes only.  It is independent and is not affiliated with or endorsed by any game publisher or rights holder.
+> Zigfall is an independent open-source project and is not affiliated with or endorsed by any game publisher or rights holder.
 
-Zigfall (including this documentation) has been created mostly with a
-single prompt to GPT-5.5, using the Pi coding harness.  The prompt was
-as follows:
+## Play online with an invite link
 
-    I want you to build a ### clone, using ~/co/raylib and
-    specifically ~/co/raylib-zig/
+Open <https://dnouri.github.io/Zigfall/> in a browser. The host presses `3` to create an online room, then presses `C` to copy the invite URL. Send that link to the other player; opening a URL with `?join=<room>` puts the joiner into the match as player 2.
 
-    I want your ### clone to be technically advanced to the point
-    where it could be used for tournaments: think FPS, T-spins,
-    perfect clears, and combos.
+Online play is browser-only invite-link P2P. Native builds still do solo and local two-player, but they do not do online networking. The browser build uses public relays to find peers and WebRTC for the connection. Zigfall does not have accounts or matchmaking, and there is no lobby or central server running the match. It also does not bundle TURN, so some networks will not connect.
 
-    Divide your work up into logical units and delegate to subagents
-    for researching ~/co/raylib/ and ~/co/raylib-zig/
+## What else is in there?
 
-    Then create a plan with phases.  Then delegate each phase to a
-    "fresh context" subagent, with useful quality gates.  Make sure
-    every subagent uses our best practices, and that they are able to
-    actually test their results and do quality engineering as well,
-    before they handoff.  After each handoff, send a subagent to
-    review the code, and look for simplification opportunities, before
-    you hand over to the next subagent with "fresh context" to work on
-    the next phase.  Do not stop until you are done and satisfied with
-    the implementation.  Make sure you delegate and give agency and
-    useful context to subagents such that they can work efficiently
-    and you keep the overview of the project without losing focus.
+Solo play works on desktop and in the browser. Local two-player versus also works on one keyboard in both builds.
+
+Browsers also keep a small local profile card. It has a nickname, a random local player ID, Local rating, and W-L-D. It is display-only metadata stored in that browser, not a trusted identity and not a global ranking. Completed online matches update local stats only after both peers finish and their final-state/result reports agree. This is a deterministic peer cross-check, not anti-cheat and not a server-authenticated ranking. Disconnects, desyncs, and result disagreements/timeouts do not count.
+
+The board is 10x40, with 20 visible rows. Pieces come from a seven-bag randomizer with a five-piece queue. Hold, ghost, gravity, and lock delay are all in. Rotation has SRS-style kicks plus 180. Clears track T-spins, back-to-back, combos, and perfect clears. Versus play adds garbage.
 
 ## Controls
 
-- Left / Right: move piece, with DAS/ARR repeat
-- Down: soft drop
-- Space: hard drop
-- X or Up: rotate clockwise
-- Z: rotate counter-clockwise
-- A: rotate 180 degrees
-- C or Left Shift: hold
-- P: pause / resume
-- R: restart
-- Esc: close the desktop window
+| Action | Key(s) |
+| --- | --- |
+| Solo mode | `1` |
+| Local two-player mode | `2` |
+| Host browser online match | `3` |
+| Copy invite while hosting online | `C` |
+| Move | Left / Right |
+| Soft drop | Down |
+| Hard drop | Space |
+| Rotate clockwise | `X` or Up |
+| Rotate counter-clockwise | `Z` |
+| Rotate 180 degrees | `A` |
+| Hold | `C` or Left Shift |
+| Pause / resume | `P` |
+| Restart local game | `R` |
+| Close desktop window | Esc |
 
-## Game mechanics included
+In an online match both players use that single-player control set. `R` is deliberately a no-op online for now because there is no rematch flow yet.
 
-- 10x40 matrix with 20 visible rows and hidden spawn rows
-- Seven-bag randomizer, five-piece next queue, hold once per active piece
-- Ghost piece, hard drop, soft drop, gravity levels, lock delay, and move-reset cap
-- SRS-style wall kicks for JLSTZ, I, and O pieces, plus a simple 180 kick set
-- T-spin full/mini detection, back-to-back, combo counter, perfect clear detection
-- Line-clear scoring with soft/hard drop points and line-output metadata for display
-- Pause, restart, game-over handling, and status panels for score, level, combo, B2B, last clear, and output
+<details>
+<summary>Local two-player controls</summary>
+
+| Action | Player 1 | Player 2 |
+| --- | --- | --- |
+| Move | `A` / `D` | Left / Right |
+| Soft drop | `S` | Down |
+| Hard drop | Space | Enter |
+| Rotate clockwise | `W` | Up |
+| Rotate counter-clockwise | `Q` | `.` |
+| Rotate 180 degrees | `E` | `/` |
+| Hold | Left Shift | Right Shift |
+
+`P` pauses or resumes, `R` restarts, and Esc closes the desktop window.
+</details>
+
+## Current limitations
+
+- Online play is browser-only. Native builds do not support online networking.
+- There are no accounts or matchmaking. There is no global leaderboard or central match server.
+- There is no rematch flow yet.
+- Zigfall does not bundle TURN or a controlled signaling service. Browser matches depend on public relays, WebRTC/ICE, and the players' networks.
+- Local profile cards and Local rating are browser-local and display-only. They are not trusted, not anti-cheat, and not server-authenticated rankings. Only completed matches with matching peer final-state/result reports update local W-L-D; disconnects, desyncs, and result disagreements/timeouts do not.
+
+## How it works
+
+`src/game.zig` contains the deterministic game rules and can be unit-tested without opening a window. `src/main.zig` is the raylib-facing shell for native and Emscripten builds. The split is intentional: rendering and input should be boring wrappers around a game state that tests can drive directly.
+
+Native and web builds share the Zig core. The web artifact adds a custom shell and small JavaScript helpers. Those helpers handle invite links, browser-local profiles, and Trystero/WebRTC transport. They are copied as local static files by `build.zig` and loaded before WASM `main` starts.
+
+For online duels, the host is setup authority for the room and seed, then both browsers run a conservative lockstep match by exchanging inputs. Periodic state hashes are compared to catch desyncs. Match results are only applied to the local profile when both peers finish and the exchanged final outcome, frame cursor, and state hash agree. Extra peers are treated as a busy-room condition rather than silently joining the match.
 
 ## Requirements
 
 - Zig 0.16.0
-- Network access for the first dependency fetch; pinned dependencies are recorded in `build.zig.zon`
+- Network access for the first pinned dependency fetch; dependencies are recorded in `build.zig.zon`
+- The first wasm build may also fetch and cache the Emscripten SDK/toolchain through the pinned Zig/Emscripten dependency flow
+- Optional Node.js for JavaScript checks or intentional vendor-bundle regeneration
 
-No local raylib-zig checkout is required.
+No local raylib-zig checkout is required. Normal Zig native/web builds and deploys do not run npm; native builds also do not need Trystero or browser APIs.
 
 ## Build, run, and test
 
-Fetch pinned dependencies, format the source, then build and test the native desktop app:
+Fetch dependencies, format, test, and build the native desktop app:
 
 ```sh
 zig build --fetch=needed
-zig fmt build.zig src/*.zig
+zig fmt build.zig build.zig.zon src/*.zig
 zig build test
 zig build
 zig build -Doptimize=ReleaseFast
 zig build run
 ```
 
-Native builds install the executable to `zig-out/bin/zigfall` (`zig-out/bin/zigfall.exe` for Windows targets). For a short smoke test when a display is available:
+Native builds install the executable to `zig-out/bin/zigfall` (`zig-out/bin/zigfall.exe` for Windows targets). They also install the legal bundle under `zig-out/share/zigfall/`. That bundle contains the project license, third-party notices, tracked license snapshots, and the shared browser-vendor notice files.
+
+When a display is available, this is a quick smoke test:
 
 ```sh
 timeout 3 zig build run
 ```
 
-## Cross-target builds
-
-Cross-target builds use the same pinned dependency set. For example, to build a Windows executable:
+Cross-target builds use the same pinned dependency set. For example:
 
 ```sh
 zig build -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast
 ```
 
-The generated executable is installed under `zig-out/bin/`. Linux cross targets may also need a target sysroot or system libraries for raylib's OpenGL/X11 backend.
+Linux cross targets may also need a target sysroot or system libraries for raylib's OpenGL/X11 backend.
 
-## Web build
+<details>
+<summary>Maintainer CI/deployment checks</summary>
+
+These mirror the checks that are useful before publishing a Pages build:
+
+```sh
+zig fmt build.zig build.zig.zon src/*.zig --check
+zig build test --summary all
+zig build --summary all
+zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseSmall --summary all
+for file in web/zigfall_transport.mjs web/zigfall_transport_emscripten.js \
+  web/zigfall_invite.mjs web/zigfall_invite_emscripten.js \
+  web/zigfall_profile.mjs web/zigfall_profile_emscripten.js \
+  web/vendor/patch-trystero-bundle.mjs web/vendor/trystero-nostr.bundle.mjs \
+  tools/test_trystero_pkt_limit.mjs tools/test_zigfall_transport_adapter.mjs \
+  tools/test_zigfall_invite.mjs tools/test_zigfall_profile.mjs \
+  tools/test_emscripten_shims.mjs; do
+  node --check "$file"
+done
+node tools/test_trystero_pkt_limit.mjs
+node tools/test_zigfall_transport_adapter.mjs
+node tools/test_zigfall_invite.mjs
+node tools/test_zigfall_profile.mjs
+node tools/test_emscripten_shims.mjs
+(cd web/vendor && sha256sum -c trystero-nostr.bundle.mjs.sha256)
+```
+
+The Pages workflow also verifies the post-build web artifact manifest before upload.
+</details>
+
+## Web build and deployment
 
 Build the Emscripten HTML/WASM output with:
 
@@ -104,24 +152,24 @@ Build the Emscripten HTML/WASM output with:
 zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseSmall
 ```
 
-The generated web files are installed to `zig-out/web/`:
-
-- `zigfall.html`
-- `zigfall.js`
-- `zigfall.wasm`
-
-The web build uses a custom Zigfall shell with a GitHub link and a
-keyboard handler that keeps Space and the arrow keys from scrolling the
-browser page while the game is active.
-
-To launch with Emscripten's `emrun` helper:
+To launch it with Emscripten's `emrun` helper:
 
 ```sh
 zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseSmall run
 ```
 
-## License and third-party notices
+The generated web files are installed to `zig-out/web/`. The runtime pieces are `zigfall.html`, `zigfall.js`, `zigfall.wasm`, the three `zigfall_*.mjs` helpers, and the vendored Trystero bundle. The bundle checksum and vendor notices are copied with it. The same legal bundle is copied there too.
 
-Zigfall's project source is licensed under GPL-3.0-or-later; see
-`LICENSE`.  Third-party dependency notices are summarized in
-`THIRD_PARTY_NOTICES.md`.
+The GitHub Pages workflow prepares `zig-out/web` for upload. It creates `index.html`, adds `.nojekyll`, verifies the Trystero bundle checksum, and checks the runtime/legal file manifest.
+
+The production page imports bundled local JavaScript files, not a runtime CDN. Normal native `zig build` does not use Node or npm. It also does not load Trystero or browser APIs. After Zig dependencies have been fetched, native builds do not need network access. Runtime online play still depends on browser network access, public relays, and WebRTC/ICE/NAT behavior.
+
+The web shell also installs a keyboard handler so Space, Enter, arrow keys, and Slash (`/`) do not scroll the page or open quick-find while the game is active. Focused links and form controls are left alone.
+
+## License and notices
+
+Zigfall is GPL-3.0-or-later; see [`LICENSE`](LICENSE). Third-party component notices are summarized in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Packaged native and web artifacts also include the tracked `licenses/` snapshots and web `vendor/` notices.
+
+## Origin
+
+The original single-player/native Zig/raylib-zig baseline was AI-assisted and is preserved in Git history at [`cd6e23a`](https://github.com/dnouri/Zigfall/commit/cd6e23a757e0ba4f0dbc3fd5c5c8f23ea4a902a5). Browser multiplayer came after that, along with invite links, profile cards, deployment packaging, and notices.

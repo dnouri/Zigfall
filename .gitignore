@@ -6,6 +6,10 @@ zig-pkg/
 # Generated native and web build outputs
 zig-out/
 
+# Local scratch/tool state
+tmp/
+.playwright-cli/
+
 # Editor and OS noise
 .DS_Store
 Thumbs.db

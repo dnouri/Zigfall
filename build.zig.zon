@@ -21,7 +21,9 @@
         "LICENSE",
         "README.md",
         "src",
+        "third_party",
         "THIRD_PARTY_NOTICES.md",
+        "tools",
         "web",
     },
 }

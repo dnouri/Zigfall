@@ -180,14 +180,17 @@
     </section>
 
     <script>
-      const gameScrollCodes = new Set(["Space", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"]);
+      // Space, Enter, and arrows are game controls; Slash is Player 2's
+      // local-versus 180-rotate key. Prevent browser scroll/quick-find defaults
+      // when the game owns focus, but preserve normal focused UI controls/links.
+      const gameDefaultCodes = new Set(["Space", "Enter", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Slash"]);
 
-      function isEditableTarget(target) {
-        return target instanceof Element && target.closest("input, textarea, select, button, [contenteditable='true'], [contenteditable='']");
+      function isBrowserControlTarget(target) {
+        return target instanceof Element && target.closest("a[href], input, textarea, select, button, [contenteditable='true'], [contenteditable='']");
       }
 
       window.addEventListener("keydown", (event) => {
-        if (gameScrollCodes.has(event.code) && !isEditableTarget(event.target)) {
+        if (gameDefaultCodes.has(event.code) && !isBrowserControlTarget(event.target)) {
           event.preventDefault();
         }
       }, { capture: true });
@@ -210,6 +213,67 @@
           console.error.apply(console, arguments);
         },
         canvas: canvasElement,
+        preRun: [function() {
+          function hasTransport() {
+            return globalThis.ZigfallTransport && typeof globalThis.ZigfallTransport.statusCode === "function";
+          }
+
+          function hasInvite() {
+            return globalThis.ZigfallInvite && typeof globalThis.ZigfallInvite.createHostRoom === "function";
+          }
+
+          function hasProfile() {
+            return globalThis.ZigfallProfile && typeof globalThis.ZigfallProfile.card === "function";
+          }
+
+          if (hasTransport() && hasInvite() && hasProfile()) return;
+
+          var dependency = "zigfall_web_helpers";
+          var imports = [];
+          Module.addRunDependency(dependency);
+
+          if (!hasTransport()) {
+            imports.push(import("./zigfall_transport.mjs").then(function() {
+              if (!hasTransport()) {
+                throw new Error("zigfall_transport.mjs did not install globalThis.ZigfallTransport");
+              }
+            }).catch(function(err) {
+              globalThis.ZigfallTransportLoadError = err;
+              console.error("[ZigfallTransport] failed to load", err);
+              throw err;
+            }));
+          }
+
+          if (!hasInvite()) {
+            imports.push(import("./zigfall_invite.mjs").then(function() {
+              if (!hasInvite()) {
+                throw new Error("zigfall_invite.mjs did not install globalThis.ZigfallInvite");
+              }
+            }).catch(function(err) {
+              globalThis.ZigfallInviteLoadError = err;
+              console.error("[ZigfallInvite] failed to load", err);
+              throw err;
+            }));
+          }
+
+          if (!hasProfile()) {
+            imports.push(import("./zigfall_profile.mjs").then(function() {
+              if (!hasProfile()) {
+                throw new Error("zigfall_profile.mjs did not install globalThis.ZigfallProfile");
+              }
+            }).catch(function(err) {
+              globalThis.ZigfallProfileLoadError = err;
+              console.error("[ZigfallProfile] failed to load", err);
+              throw err;
+            }));
+          }
+
+          Promise.all(imports).catch(function() {
+            Module.setStatus("Web helpers failed to load; see JavaScript console.");
+          }).finally(function() {
+            Module.removeRunDependency(dependency);
+          });
+        }],
         setStatus: function(text) {
           if (!Module.setStatus.last) Module.setStatus.last = { time: Date.now(), text: "" };
           if (text === Module.setStatus.last.text) return;
@@ -249,6 +313,8 @@
         };
       };
     </script>
+
+    <!-- Module.preRun imports zigfall_transport.mjs, zigfall_invite.mjs, and zigfall_profile.mjs before WASM main starts. -->
 
     <!-- Emscripten replaces this token with the zigfall.js loader. -->
     {{{ SCRIPT }}}

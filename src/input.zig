@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const rules = @import("game");
+const state_hash = rules.DeterministicHash;
 
 pub const FixedFps: u16 = 60;
 pub const DasDelayFrames: u8 = 10;
@@ -82,6 +83,15 @@ pub const Controller = struct {
         self.horizontal_preference = null;
     }
 
+    /// Feed deterministic controller repeat/preference state into the match
+    /// state hash. Frame input itself is not stored here; only input-derived
+    /// DAS/ARR state that can affect future simulation is included.
+    pub fn feedDeterministicHash(self: *const Controller, hasher: *std.hash.XxHash64) void {
+        feedRepeatKeyHash(hasher, self.left);
+        feedRepeatKeyHash(hasher, self.right);
+        feedOptionalHorizontalDirectionHash(hasher, self.horizontal_preference);
+    }
+
     pub fn horizontalMoveThisFrame(self: *Controller, frame: FrameInput) i32 {
         self.updateHorizontalPreference(frame);
         const left_fired = self.left.update(frame.left_down);
@@ -94,10 +104,51 @@ pub const Controller = struct {
         };
     }
 
-    /// Deterministic input order for a fixed frame:
-    /// restart, pause, hold, one rotation (CCW/CW/180 priority), horizontal DAS/ARR,
-    /// hard drop, soft drop. The main loop then applies lock-delay ticking and
-    /// natural gravity only when no soft-drop cell moved this frame.
+    /// Apply gameplay controls for one fixed frame.
+    ///
+    /// This intentionally ignores shell-level pause/restart bits. Callers that
+    /// own a pause menu, restart policy, or match lifecycle must resolve those
+    /// before calling this helper.
+    pub fn applyGameplayToGame(self: *Controller, game: *rules.Game, frame: FrameInput) ApplyResult {
+        var result = ApplyResult{};
+
+        if (game.game_over) {
+            self.clearHorizontal();
+            return result;
+        }
+
+        if (frame.hold_pressed) _ = game.holdPiece();
+        if (frame.rotate_ccw_pressed) {
+            _ = game.tryRotate(.counter_clockwise);
+        } else if (frame.rotate_cw_pressed) {
+            _ = game.tryRotate(.clockwise);
+        } else if (frame.rotate_180_pressed) {
+            _ = game.tryRotate(.half_turn);
+        }
+
+        const dx = self.horizontalMoveThisFrame(frame);
+        if (dx != 0) _ = game.tryMove(dx, 0);
+
+        if (frame.hard_drop_pressed) {
+            if (game.hardDropAndLockDetailed()) |lock_result| {
+                result.hard_dropped = true;
+                result.lock_result = lock_result;
+            }
+            return result;
+        }
+
+        if (frame.down_down) {
+            result.soft_dropped = game.softDropCells(SoftDropCellsPerFrame) > 0;
+        }
+        return result;
+    }
+
+    /// Apply one-player shell policy before gameplay controls.
+    ///
+    /// Deterministic input order for a fixed frame: restart, pause, hold, one
+    /// rotation (CCW/CW/180 priority), horizontal DAS/ARR, hard drop, soft drop.
+    /// The main loop then applies lock-delay ticking and natural gravity only
+    /// when no soft-drop cell moved this frame.
     pub fn applyToGame(self: *Controller, game: *rules.Game, frame: FrameInput, paused: *bool, restart_seed: u64) ApplyResult {
         var result = ApplyResult{};
 
@@ -127,30 +178,7 @@ pub const Controller = struct {
             return result;
         }
 
-        if (frame.hold_pressed) _ = game.holdPiece();
-        if (frame.rotate_ccw_pressed) {
-            _ = game.tryRotate(.counter_clockwise);
-        } else if (frame.rotate_cw_pressed) {
-            _ = game.tryRotate(.clockwise);
-        } else if (frame.rotate_180_pressed) {
-            _ = game.tryRotate(.half_turn);
-        }
-
-        const dx = self.horizontalMoveThisFrame(frame);
-        if (dx != 0) _ = game.tryMove(dx, 0);
-
-        if (frame.hard_drop_pressed) {
-            if (game.hardDropAndLockDetailed()) |lock_result| {
-                result.hard_dropped = true;
-                result.lock_result = lock_result;
-            }
-            return result;
-        }
-
-        if (frame.down_down) {
-            result.soft_dropped = game.softDropCells(SoftDropCellsPerFrame) > 0;
-        }
-        return result;
+        return self.applyGameplayToGame(game, frame);
     }
 
     fn updateHorizontalPreference(self: *Controller, frame: FrameInput) void {
@@ -182,6 +210,45 @@ pub const Controller = struct {
         }
     }
 };
+
+fn feedRepeatKeyHash(hasher: *std.hash.XxHash64, key: RepeatKey) void {
+    state_hash.feedBool(hasher, key.down);
+    state_hash.feedU8(hasher, key.frames_until_repeat);
+}
+
+fn feedOptionalHorizontalDirectionHash(hasher: *std.hash.XxHash64, direction: ?HorizontalDirection) void {
+    if (direction) |value| {
+        state_hash.feedBool(hasher, true);
+        feedHorizontalDirectionHash(hasher, value);
+    } else {
+        state_hash.feedBool(hasher, false);
+    }
+}
+
+fn feedHorizontalDirectionHash(hasher: *std.hash.XxHash64, direction: HorizontalDirection) void {
+    state_hash.feedU8(hasher, switch (direction) {
+        .left => 0,
+        .right => 1,
+    });
+}
+
+fn testControllerDeterministicHash(controller: *const Controller) u64 {
+    var hasher = std.hash.XxHash64.init(0);
+    controller.feedDeterministicHash(&hasher);
+    return hasher.final();
+}
+
+test "controller deterministic hash tracks repeat and preference state" {
+    var left = Controller{};
+    var right = Controller{};
+    try std.testing.expectEqual(testControllerDeterministicHash(&left), testControllerDeterministicHash(&right));
+
+    _ = left.horizontalMoveThisFrame(.{ .left_down = true, .left_pressed = true });
+    try std.testing.expect(testControllerDeterministicHash(&left) != testControllerDeterministicHash(&right));
+
+    _ = right.horizontalMoveThisFrame(.{ .left_down = true, .left_pressed = true });
+    try std.testing.expectEqual(testControllerDeterministicHash(&left), testControllerDeterministicHash(&right));
+}
 
 test "DAS/ARR emits initial move then delayed repeats" {
     var controller = Controller{};
@@ -217,18 +284,17 @@ test "most recently pressed horizontal direction wins conflicts" {
 test "simultaneous rotation inputs use one deterministic priority action" {
     var controller = Controller{};
     var game = rules.Game.initNoSpawn(91);
-    var paused = false;
     game.active = .{
         .kind = .t,
         .rotation = .spawn,
         .pos = .{ .x = 3, .y = 30 },
     };
 
-    _ = controller.applyToGame(&game, .{
+    _ = controller.applyGameplayToGame(&game, .{
         .rotate_ccw_pressed = true,
         .rotate_cw_pressed = true,
         .rotate_180_pressed = true,
-    }, &paused, 91);
+    });
 
     try std.testing.expectEqual(rules.Rotation.left, game.active.?.rotation);
 }
@@ -245,17 +311,37 @@ test "pause input is ignored once the game is over" {
     try std.testing.expect(!result.paused_toggled);
 }
 
+test "gameplay-only input ignores shell pause and restart bits" {
+    var controller = Controller{};
+    var game = rules.Game.initNoSpawn(95);
+    game.active = .{
+        .kind = .o,
+        .rotation = .spawn,
+        .pos = .{ .x = 3, .y = 30 },
+    };
+
+    const result = controller.applyGameplayToGame(&game, .{
+        .pause_pressed = true,
+        .restart_pressed = true,
+        .hard_drop_pressed = true,
+    });
+
+    try std.testing.expect(!result.paused_toggled);
+    try std.testing.expect(!result.restarted);
+    try std.testing.expect(result.hard_dropped);
+    try std.testing.expectEqual(@as(u32, 1), game.pieces_locked);
+}
+
 test "soft drop reports moved cells for main loop gravity suppression" {
     var controller = Controller{};
     var game = rules.Game.initNoSpawn(92);
-    var paused = false;
     game.active = .{
         .kind = .o,
         .rotation = .spawn,
         .pos = .{ .x = 3, .y = rules.BoardHeightI - 3 },
     };
 
-    const result = controller.applyToGame(&game, .{ .down_down = true }, &paused, 92);
+    const result = controller.applyGameplayToGame(&game, .{ .down_down = true });
 
     try std.testing.expect(result.soft_dropped);
     try std.testing.expectEqual(@as(i32, rules.BoardHeightI - 2), game.active.?.pos.y);
@@ -267,7 +353,6 @@ test "soft drop reports moved cells for main loop gravity suppression" {
 test "hard drop keeps earlier soft drop points but skips same-frame soft drop" {
     var controller = Controller{};
     var game = rules.Game.initNoSpawn(93);
-    var paused = false;
     game.active = .{
         .kind = .o,
         .rotation = .spawn,
@@ -275,10 +360,10 @@ test "hard drop keeps earlier soft drop points but skips same-frame soft drop" {
     };
 
     try std.testing.expect(game.softDropOne());
-    const result = controller.applyToGame(&game, .{
+    const result = controller.applyGameplayToGame(&game, .{
         .down_down = true,
         .hard_drop_pressed = true,
-    }, &paused, 93);
+    });
 
     try std.testing.expect(result.hard_dropped);
     try std.testing.expect(!result.soft_dropped);
@@ -290,17 +375,16 @@ test "hard drop keeps earlier soft drop points but skips same-frame soft drop" {
 test "hard drop input locks immediately before soft drop" {
     var controller = Controller{};
     var game = rules.Game.initNoSpawn(90);
-    var paused = false;
     game.active = .{
         .kind = .o,
         .rotation = .spawn,
         .pos = .{ .x = 3, .y = 30 },
     };
 
-    const result = controller.applyToGame(&game, .{
+    const result = controller.applyGameplayToGame(&game, .{
         .down_down = true,
         .hard_drop_pressed = true,
-    }, &paused, 90);
+    });
 
     try std.testing.expect(result.hard_dropped);
     try std.testing.expect(!result.soft_dropped);

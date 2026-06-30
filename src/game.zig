@@ -2,6 +2,9 @@
 
 const std = @import("std");
 
+pub const DeterministicHash = @import("state_hash.zig");
+const state_hash = DeterministicHash;
+
 pub const BoardWidth: usize = 10;
 pub const BoardHeight: usize = 40;
 pub const VisibleHeight: usize = 20;
@@ -28,6 +31,29 @@ pub const PieceKind = enum(u3) {
     z,
     j,
     l,
+};
+
+pub const Cell = union(enum) {
+    piece: PieceKind,
+    garbage,
+
+    pub fn fromPiece(kind: PieceKind) Cell {
+        return .{ .piece = kind };
+    }
+
+    pub fn pieceKind(self: Cell) ?PieceKind {
+        return switch (self) {
+            .piece => |kind| kind,
+            .garbage => null,
+        };
+    }
+
+    pub fn isGarbage(self: Cell) bool {
+        return switch (self) {
+            .piece => false,
+            .garbage => true,
+        };
+    }
 };
 
 pub const Rotation = enum(u2) {
@@ -90,7 +116,54 @@ pub const StepResult = struct {
     lock_result: ?LockResult = null,
 };
 
-pub const Board = [BoardHeight][BoardWidth]?PieceKind;
+pub const GarbageInsertError = error{
+    HoleOutOfBounds,
+};
+
+pub const GarbageHole = enum(u4) {
+    c0 = 0,
+    c1 = 1,
+    c2 = 2,
+    c3 = 3,
+    c4 = 4,
+    c5 = 5,
+    c6 = 6,
+    c7 = 7,
+    c8 = 8,
+    c9 = 9,
+
+    pub fn init(hole_x: u8) GarbageInsertError!GarbageHole {
+        if (@as(usize, hole_x) >= BoardWidth) return error.HoleOutOfBounds;
+        return fromValidIndex(@as(usize, hole_x));
+    }
+
+    pub fn fromValidIndex(hole_x: usize) GarbageHole {
+        std.debug.assert(hole_x < BoardWidth);
+        return switch (hole_x) {
+            0 => .c0,
+            1 => .c1,
+            2 => .c2,
+            3 => .c3,
+            4 => .c4,
+            5 => .c5,
+            6 => .c6,
+            7 => .c7,
+            8 => .c8,
+            9 => .c9,
+            else => unreachable,
+        };
+    }
+
+    pub fn index(self: GarbageHole) usize {
+        return @as(usize, @intFromEnum(self));
+    }
+};
+
+comptime {
+    if (BoardWidth != 10) @compileError("GarbageHole enum must be updated when BoardWidth changes");
+}
+
+pub const Board = [BoardHeight][BoardWidth]?Cell;
 
 pub const all_piece_kinds = [_]PieceKind{ .i, .o, .t, .s, .z, .j, .l };
 
@@ -378,6 +451,68 @@ pub const Game = struct {
         return cleared;
     }
 
+    pub fn insertGarbageLine(self: *Game, hole_x: u8) GarbageInsertError!void {
+        try self.insertGarbageLines(&.{hole_x});
+    }
+
+    /// Insert garbage at the bottom, shifting existing board rows toward y = 0.
+    /// Occupied cells shifted out of row 0 top out the game. The active piece is
+    /// not moved or cleared; after the full batch is inserted, if the shifted
+    /// board overlaps it, `game_over` is set and `active` remains available for
+    /// post-frame inspection. Public hole values are validated for the whole
+    /// batch before any board mutation, so `HoleOutOfBounds` leaves the game
+    /// unchanged.
+    pub fn insertGarbageLines(self: *Game, holes: []const u8) GarbageInsertError!void {
+        for (holes) |hole_x| {
+            _ = try GarbageHole.init(hole_x);
+        }
+        if (self.game_over or holes.len == 0) return;
+
+        var top_out = false;
+        for (holes) |hole_x| {
+            self.insertGarbageLineUnchecked(GarbageHole.fromValidIndex(@as(usize, hole_x)), &top_out);
+        }
+
+        self.finishGarbageInsertion(top_out);
+    }
+
+    /// Infallible insertion for holes that were already validated or generated
+    /// by deterministic match state.
+    pub fn insertGarbageLineAt(self: *Game, hole: GarbageHole) void {
+        self.insertGarbageLinesAt(&.{hole});
+    }
+
+    /// Infallible batch insertion for bounded hole values. Like the public
+    /// checked wrapper, active-piece collision is evaluated once after the full
+    /// batch is inserted.
+    pub fn insertGarbageLinesAt(self: *Game, holes: []const GarbageHole) void {
+        if (self.game_over or holes.len == 0) return;
+
+        var top_out = false;
+        for (holes) |hole| {
+            self.insertGarbageLineUnchecked(hole, &top_out);
+        }
+
+        self.finishGarbageInsertion(top_out);
+    }
+
+    fn insertGarbageLineUnchecked(self: *Game, hole: GarbageHole, top_out: *bool) void {
+        if (rowOccupied(&self.board[0])) top_out.* = true;
+        var y: usize = 0;
+        while (y < BoardHeight - 1) : (y += 1) {
+            self.board[y] = self.board[y + 1];
+        }
+        self.board[BoardHeight - 1] = garbageRow(hole);
+    }
+
+    fn finishGarbageInsertion(self: *Game, top_out: bool) void {
+        var did_top_out = top_out;
+        if (self.active) |piece| {
+            if (self.collides(piece)) did_top_out = true;
+        }
+        if (did_top_out) self.game_over = true;
+    }
+
     pub fn collides(self: *const Game, piece: ActivePiece) bool {
         const blocks = blockPositions(piece);
         for (blocks) |point| {
@@ -426,6 +561,35 @@ pub const Game = struct {
 
     pub fn gravityIntervalFrames(self: *const Game) u16 {
         return gravityIntervalFramesForLevel(self.level);
+    }
+
+    /// Feed only deterministic gameplay state into a stable hash stream.
+    ///
+    /// This deliberately hashes fields one-by-one instead of hashing the raw
+    /// `Game` struct, so padding, enum layout, and native pointer details never
+    /// affect lockstep desync checks.
+    pub fn feedDeterministicHash(self: *const Game, hasher: *std.hash.XxHash64) void {
+        feedBoardHash(hasher, &self.board);
+        feedSevenBagHash(hasher, &self.randomizer);
+        feedPieceKindArrayHash(NextQueueLength, hasher, &self.next);
+        feedOptionalPieceKindHash(hasher, self.hold);
+        state_hash.feedBool(hasher, self.held_this_piece);
+        feedOptionalActivePieceHash(hasher, self.active);
+        state_hash.feedBool(hasher, self.game_over);
+        state_hash.feedU32(hasher, self.total_lines_cleared);
+        state_hash.feedU32(hasher, self.pieces_locked);
+        state_hash.feedU32(hasher, self.score);
+        state_hash.feedU8(hasher, self.level);
+        state_hash.feedI32(hasher, self.combo_counter);
+        state_hash.feedBool(hasher, self.back_to_back_active);
+        feedOptionalLockResultHash(hasher, self.last_lock_result);
+        state_hash.feedU16(hasher, self.lock_delay_frames);
+        state_hash.feedU8(hasher, self.max_lock_move_resets);
+        state_hash.feedU16(hasher, self.lock_delay_elapsed);
+        state_hash.feedU8(hasher, self.lock_move_resets_used);
+        state_hash.feedU32(hasher, self.soft_drop_points_pending);
+        feedLastPieceActionHash(hasher, self.last_piece_action);
+        feedOptionalRotationEventHash(hasher, self.last_successful_rotation);
     }
 
     fn moveActive(self: *Game, dx: i32, dy: i32, action: LastPieceAction, soft_drop_scoring: bool) bool {
@@ -478,7 +642,7 @@ pub const Game = struct {
             const x: usize = @intCast(point.x);
             const y: usize = @intCast(point.y);
             if (y < HiddenRows) top_out = true;
-            self.board[y][x] = piece.kind;
+            self.board[y][x] = Cell.fromPiece(piece.kind);
         }
 
         self.active = null;
@@ -644,6 +808,169 @@ pub const Game = struct {
         return true;
     }
 };
+
+fn feedBoardHash(hasher: *std.hash.XxHash64, board: *const Board) void {
+    for (board.*) |row| {
+        for (row) |cell| {
+            feedOptionalCellHash(hasher, cell);
+        }
+    }
+}
+
+fn feedOptionalCellHash(hasher: *std.hash.XxHash64, cell: ?Cell) void {
+    if (cell) |filled| {
+        switch (filled) {
+            .piece => |kind| {
+                state_hash.feedU8(hasher, 1);
+                feedPieceKindHash(hasher, kind);
+            },
+            .garbage => state_hash.feedU8(hasher, 2),
+        }
+    } else {
+        state_hash.feedU8(hasher, 0);
+    }
+}
+
+fn feedSevenBagHash(hasher: *std.hash.XxHash64, bag: *const SevenBag) void {
+    state_hash.feedU64(hasher, bag.rng.state);
+    feedPieceKindArrayHash(PieceCount, hasher, &bag.bag);
+    std.debug.assert(bag.index <= PieceCount);
+    state_hash.feedU8(hasher, @intCast(bag.index));
+}
+
+fn feedPieceKindArrayHash(comptime len: usize, hasher: *std.hash.XxHash64, pieces: *const [len]PieceKind) void {
+    for (pieces.*) |kind| {
+        feedPieceKindHash(hasher, kind);
+    }
+}
+
+fn feedOptionalPieceKindHash(hasher: *std.hash.XxHash64, piece_kind: ?PieceKind) void {
+    if (piece_kind) |kind| {
+        state_hash.feedBool(hasher, true);
+        feedPieceKindHash(hasher, kind);
+    } else {
+        state_hash.feedBool(hasher, false);
+    }
+}
+
+fn feedOptionalActivePieceHash(hasher: *std.hash.XxHash64, active: ?ActivePiece) void {
+    if (active) |piece| {
+        state_hash.feedBool(hasher, true);
+        feedActivePieceHash(hasher, piece);
+    } else {
+        state_hash.feedBool(hasher, false);
+    }
+}
+
+fn feedActivePieceHash(hasher: *std.hash.XxHash64, piece: ActivePiece) void {
+    feedPieceKindHash(hasher, piece.kind);
+    feedRotationHash(hasher, piece.rotation);
+    feedPointHash(hasher, piece.pos);
+}
+
+fn feedPointHash(hasher: *std.hash.XxHash64, point: Point) void {
+    state_hash.feedI32(hasher, point.x);
+    state_hash.feedI32(hasher, point.y);
+}
+
+fn feedOptionalLockResultHash(hasher: *std.hash.XxHash64, result: ?LockResult) void {
+    if (result) |lock_result| {
+        state_hash.feedBool(hasher, true);
+        feedLockResultHash(hasher, lock_result);
+    } else {
+        state_hash.feedBool(hasher, false);
+    }
+}
+
+fn feedLockResultHash(hasher: *std.hash.XxHash64, result: LockResult) void {
+    feedPieceKindHash(hasher, result.piece_kind);
+    state_hash.feedU8(hasher, result.lines_cleared);
+    feedTSpinKindHash(hasher, result.t_spin_kind);
+    state_hash.feedBool(hasher, result.perfect_clear);
+    state_hash.feedI32(hasher, result.combo_after_lock);
+    state_hash.feedBool(hasher, result.back_to_back_active_after_lock);
+    state_hash.feedBool(hasher, result.back_to_back_bonus_applied);
+    state_hash.feedBool(hasher, result.difficult_clear);
+    state_hash.feedU32(hasher, result.base_score_points);
+    state_hash.feedU32(hasher, result.back_to_back_bonus_points);
+    state_hash.feedU32(hasher, result.combo_bonus_points);
+    state_hash.feedU32(hasher, result.perfect_clear_bonus_points);
+    state_hash.feedU32(hasher, result.hard_drop_cells);
+    state_hash.feedU32(hasher, result.hard_drop_points);
+    state_hash.feedU32(hasher, result.soft_drop_points);
+    state_hash.feedU32(hasher, result.score_delta);
+    state_hash.feedU32(hasher, result.total_score_after_lock);
+    state_hash.feedU8(hasher, result.attack_lines);
+}
+
+fn feedOptionalRotationEventHash(hasher: *std.hash.XxHash64, event: ?RotationEvent) void {
+    if (event) |rotation_event| {
+        state_hash.feedBool(hasher, true);
+        feedRotationEventHash(hasher, rotation_event);
+    } else {
+        state_hash.feedBool(hasher, false);
+    }
+}
+
+fn feedRotationEventHash(hasher: *std.hash.XxHash64, event: RotationEvent) void {
+    feedPieceKindHash(hasher, event.piece_kind);
+    feedRotationHash(hasher, event.from);
+    feedRotationHash(hasher, event.to);
+    feedRotationDirectionHash(hasher, event.direction);
+    state_hash.feedU8(hasher, event.kick_index);
+    feedPointHash(hasher, event.kick);
+}
+
+fn feedPieceKindHash(hasher: *std.hash.XxHash64, kind: PieceKind) void {
+    state_hash.feedU8(hasher, switch (kind) {
+        .i => 0,
+        .o => 1,
+        .t => 2,
+        .s => 3,
+        .z => 4,
+        .j => 5,
+        .l => 6,
+    });
+}
+
+fn feedRotationHash(hasher: *std.hash.XxHash64, rotation: Rotation) void {
+    state_hash.feedU8(hasher, switch (rotation) {
+        .spawn => 0,
+        .right => 1,
+        .reverse => 2,
+        .left => 3,
+    });
+}
+
+fn feedRotationDirectionHash(hasher: *std.hash.XxHash64, direction: RotationDirection) void {
+    state_hash.feedU8(hasher, switch (direction) {
+        .clockwise => 0,
+        .counter_clockwise => 1,
+        .half_turn => 2,
+    });
+}
+
+fn feedTSpinKindHash(hasher: *std.hash.XxHash64, kind: TSpinKind) void {
+    state_hash.feedU8(hasher, switch (kind) {
+        .none => 0,
+        .mini => 1,
+        .full => 2,
+    });
+}
+
+fn feedLastPieceActionHash(hasher: *std.hash.XxHash64, action: LastPieceAction) void {
+    state_hash.feedU8(hasher, switch (action) {
+        .none => 0,
+        .move => 1,
+        .rotate => 2,
+    });
+}
+
+fn testGameDeterministicHash(game: *const Game) u64 {
+    var hasher = std.hash.XxHash64.init(0);
+    game.feedDeterministicHash(&hasher);
+    return hasher.final();
+}
 
 pub fn levelForLines(total_lines_cleared: u32) u8 {
     const uncapped_level = 1 + total_lines_cleared / 10;
@@ -895,18 +1222,31 @@ fn comboAttack(combo_after_lock: i32) u8 {
 }
 
 fn emptyBoard() Board {
-    return [_][BoardWidth]?PieceKind{emptyRow()} ** BoardHeight;
+    return [_][BoardWidth]?Cell{emptyRow()} ** BoardHeight;
 }
 
-fn emptyRow() [BoardWidth]?PieceKind {
-    return [_]?PieceKind{null} ** BoardWidth;
+fn emptyRow() [BoardWidth]?Cell {
+    return [_]?Cell{null} ** BoardWidth;
 }
 
-fn rowFull(row: *const [BoardWidth]?PieceKind) bool {
+fn garbageRow(hole: GarbageHole) [BoardWidth]?Cell {
+    var row = [_]?Cell{Cell.garbage} ** BoardWidth;
+    row[hole.index()] = null;
+    return row;
+}
+
+fn rowFull(row: *const [BoardWidth]?Cell) bool {
     for (row.*) |cell| {
         if (cell == null) return false;
     }
     return true;
+}
+
+fn rowOccupied(row: *const [BoardWidth]?Cell) bool {
+    for (row.*) |cell| {
+        if (cell != null) return true;
+    }
+    return false;
 }
 
 fn boardEmpty(board: *const Board) bool {
@@ -931,7 +1271,7 @@ fn fillRowExcept(game: *Game, y: usize, gaps: []const usize, kind: PieceKind) vo
                 break;
             }
         }
-        game.board[y][x] = if (is_gap) null else kind;
+        game.board[y][x] = if (is_gap) null else Cell.fromPiece(kind);
     }
 }
 
@@ -946,6 +1286,40 @@ fn markLastRotationForTest(game: *Game, piece: ActivePiece, from: Rotation, kick
         .kick_index = kick_index,
         .kick = pt(0, 0),
     };
+}
+
+fn expectPieceCell(expected: PieceKind, cell: ?Cell) !void {
+    try std.testing.expect(cell != null);
+    const actual = cell.?.pieceKind() orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqual(expected, actual);
+}
+
+fn expectGarbageCell(cell: ?Cell) !void {
+    try std.testing.expect(cell != null);
+    try std.testing.expect(cell.?.isGarbage());
+}
+
+test "game deterministic hash is stable for equal fresh games" {
+    const left = Game.init(0x1234_5678);
+    const right = Game.init(0x1234_5678);
+
+    try std.testing.expectEqual(testGameDeterministicHash(&left), testGameDeterministicHash(&right));
+}
+
+test "game deterministic hash changes for board and gameplay metadata" {
+    const base = Game.init(0x1234_5678);
+    const base_hash = testGameDeterministicHash(&base);
+
+    var board_changed = base;
+    board_changed.board[BoardHeight - 1][0] = Cell.fromPiece(.i);
+    try std.testing.expect(testGameDeterministicHash(&board_changed) != base_hash);
+
+    var lock_metadata_changed = base;
+    _ = lock_metadata_changed.hardDropAndLockDetailed();
+    try std.testing.expect(testGameDeterministicHash(&lock_metadata_changed) != base_hash);
 }
 
 test "seven bag produces one of each tetromino before repeat" {
@@ -979,7 +1353,7 @@ test "SRS kicks use JLSTZ and I tables" {
         .rotation = .spawn,
         .pos = .{ .x = 3, .y = 24 },
     };
-    t_game.board[24][4] = .z;
+    t_game.board[24][4] = Cell.fromPiece(.z);
 
     try std.testing.expect(t_game.tryRotate(.clockwise));
     try std.testing.expectEqual(Rotation.right, t_game.active.?.rotation);
@@ -994,7 +1368,7 @@ test "SRS kicks use JLSTZ and I tables" {
         .rotation = .spawn,
         .pos = .{ .x = 3, .y = 24 },
     };
-    i_game.board[24][5] = .z;
+    i_game.board[24][5] = Cell.fromPiece(.z);
 
     try std.testing.expect(i_game.tryRotate(.clockwise));
     try std.testing.expectEqual(Rotation.right, i_game.active.?.rotation);
@@ -1049,8 +1423,8 @@ test "collision and locking stop a piece at the floor" {
     const cleared = game.lockActive();
     try std.testing.expectEqual(@as(u8, 0), cleared);
     try std.testing.expectEqual(@as(u32, 1), game.pieces_locked);
-    try std.testing.expectEqual(PieceKind.o, game.board[BoardHeight - 1][5].?);
-    try std.testing.expectEqual(PieceKind.o, game.board[BoardHeight - 2][6].?);
+    try expectPieceCell(.o, game.board[BoardHeight - 1][5]);
+    try expectPieceCell(.o, game.board[BoardHeight - 2][6]);
     try std.testing.expect(game.active != null);
     try std.testing.expect(!game.game_over);
 }
@@ -1058,7 +1432,7 @@ test "collision and locking stop a piece at the floor" {
 test "locking a piece clears completed lines" {
     var game = Game.initNoSpawn(2);
     for (0..BoardWidth) |x| {
-        game.board[BoardHeight - 1][x] = .t;
+        game.board[BoardHeight - 1][x] = Cell.fromPiece(.t);
     }
     game.board[BoardHeight - 1][4] = null;
     game.board[BoardHeight - 1][5] = null;
@@ -1071,10 +1445,144 @@ test "locking a piece clears completed lines" {
     const cleared = game.lockActive();
     try std.testing.expectEqual(@as(u8, 1), cleared);
     try std.testing.expectEqual(@as(u32, 1), game.total_lines_cleared);
-    try std.testing.expectEqual(PieceKind.o, game.board[BoardHeight - 1][4].?);
-    try std.testing.expectEqual(PieceKind.o, game.board[BoardHeight - 1][5].?);
+    try expectPieceCell(.o, game.board[BoardHeight - 1][4]);
+    try expectPieceCell(.o, game.board[BoardHeight - 1][5]);
     try std.testing.expect(game.board[BoardHeight - 1][0] == null);
     try std.testing.expect(!game.game_over);
+}
+
+test "garbage insertion appends bottom row with hole and shifts cells upward" {
+    var game = Game.initNoSpawn(60);
+    game.board[BoardHeight - 1][0] = Cell.fromPiece(.i);
+    game.board[BoardHeight - 2][2] = Cell.fromPiece(.t);
+
+    try game.insertGarbageLine(3);
+
+    try expectPieceCell(.i, game.board[BoardHeight - 2][0]);
+    try expectPieceCell(.t, game.board[BoardHeight - 3][2]);
+    try std.testing.expect(game.board[BoardHeight - 1][3] == null);
+    for (0..BoardWidth) |x| {
+        if (x == 3) continue;
+        try expectGarbageCell(game.board[BoardHeight - 1][x]);
+    }
+    try std.testing.expect(!game.game_over);
+}
+
+test "garbage insertion rejects holes outside the board" {
+    var game = Game.initNoSpawn(61);
+    const before = game.board;
+
+    try std.testing.expectError(error.HoleOutOfBounds, game.insertGarbageLine(@intCast(BoardWidth)));
+
+    try std.testing.expectEqualDeep(before, game.board);
+    try std.testing.expect(!game.game_over);
+}
+
+test "external garbage insertion validates full batch before mutating" {
+    var game = Game.initNoSpawn(65);
+    game.board[BoardHeight - 1][0] = Cell.fromPiece(.i);
+    const before = game.board;
+    const holes = [_]u8{ 3, @intCast(BoardWidth), 2 };
+
+    try std.testing.expectError(error.HoleOutOfBounds, game.insertGarbageLines(&holes));
+
+    try std.testing.expectEqualDeep(before, game.board);
+    try std.testing.expect(!game.game_over);
+}
+
+// Public wrappers reject arbitrary bytes, while bounded garbage holes are
+// valid-by-construction for deterministic generated insertion.
+test "bounded garbage hole insertion is infallible once constructed" {
+    try std.testing.expectError(error.HoleOutOfBounds, GarbageHole.init(@intCast(BoardWidth)));
+
+    var game = Game.initNoSpawn(67);
+    const hole = try GarbageHole.init(2);
+    game.insertGarbageLineAt(hole);
+
+    try std.testing.expect(game.board[BoardHeight - 1][2] == null);
+    try expectGarbageCell(game.board[BoardHeight - 1][0]);
+    try std.testing.expect(!game.game_over);
+}
+
+test "bounded garbage insertion finalizes top-out internally" {
+    var ejection = Game.initNoSpawn(68);
+    ejection.board[0][1] = Cell.fromPiece(.s);
+    ejection.insertGarbageLineAt(GarbageHole.fromValidIndex(0));
+    try std.testing.expect(ejection.game_over);
+
+    var collision = Game.initNoSpawn(69);
+    const active_piece = ActivePiece{
+        .kind = .o,
+        .rotation = .spawn,
+        .pos = .{ .x = 3, .y = BoardHeightI - 2 },
+    };
+    collision.active = active_piece;
+    collision.insertGarbageLinesAt(&.{GarbageHole.fromValidIndex(0)});
+    try std.testing.expect(collision.game_over);
+    try std.testing.expectEqual(active_piece, collision.active.?);
+    try std.testing.expect(collision.collides(active_piece));
+}
+
+test "multi-line garbage collision uses final batch state" {
+    var game = Game.initNoSpawn(66);
+    const active_piece = ActivePiece{
+        .kind = .i,
+        .rotation = .right,
+        .pos = .{ .x = 2, .y = BoardHeightI - 6 },
+    };
+    game.active = active_piece;
+    game.board[BoardHeight - 2][4] = Cell.fromPiece(.s);
+
+    try std.testing.expect(!game.collides(active_piece));
+    try game.insertGarbageLines(&.{ 4, 4, 4, 4, 4 });
+
+    try std.testing.expect(!game.game_over);
+    try std.testing.expect(!game.collides(active_piece));
+    try expectPieceCell(.s, game.board[BoardHeight - 7][4]);
+}
+
+test "garbage insertion top-outs when row zero ejects occupied cells" {
+    var game = Game.initNoSpawn(62);
+    game.board[0][1] = Cell.fromPiece(.s);
+
+    try game.insertGarbageLine(0);
+
+    try std.testing.expect(game.game_over);
+    try std.testing.expect(game.board[0][1] == null);
+    try std.testing.expect(game.board[BoardHeight - 1][0] == null);
+    try expectGarbageCell(game.board[BoardHeight - 1][1]);
+}
+
+test "garbage insertion top-outs when shifted board collides with active piece" {
+    var game = Game.initNoSpawn(63);
+    const active_piece = ActivePiece{
+        .kind = .o,
+        .rotation = .spawn,
+        .pos = .{ .x = 3, .y = BoardHeightI - 2 },
+    };
+    game.active = active_piece;
+
+    try std.testing.expect(!game.collides(active_piece));
+    try game.insertGarbageLine(0);
+
+    try std.testing.expect(game.game_over);
+    try std.testing.expectEqual(active_piece, game.active.?);
+    try std.testing.expect(game.collides(active_piece));
+}
+
+test "line clearing treats piece cells and garbage cells as occupied" {
+    var game = Game.initNoSpawn(64);
+    game.board[BoardHeight - 2][0] = Cell.fromPiece(.l);
+    for (0..BoardWidth) |x| {
+        game.board[BoardHeight - 1][x] = if (x == 4) Cell.fromPiece(.t) else Cell.garbage;
+    }
+
+    const cleared = game.clearFullLines();
+
+    try std.testing.expectEqual(@as(u8, 1), cleared);
+    try std.testing.expectEqual(@as(u32, 1), game.total_lines_cleared);
+    try expectPieceCell(.l, game.board[BoardHeight - 1][0]);
+    try std.testing.expect(game.board[BoardHeight - 2][0] == null);
 }
 
 test "hold can be used only once per active piece" {
@@ -1109,7 +1617,7 @@ test "game over when spawn is blocked or a piece locks in hidden rows" {
     for (blockPositions(spawn_piece)) |block| {
         const x: usize = @intCast(block.x);
         const y: usize = @intCast(block.y);
-        blocked.board[y][x] = .z;
+        blocked.board[y][x] = Cell.fromPiece(.z);
     }
 
     try std.testing.expect(!blocked.spawnNext());
@@ -1129,9 +1637,9 @@ test "game over when spawn is blocked or a piece locks in hidden rows" {
 test "T-spin single double triple and mini are detected" {
     var single = Game.initNoSpawn(20);
     fillRowExcept(&single, 36, &.{ 3, 4, 5 }, .j);
-    single.board[35][3] = .j;
-    single.board[35][5] = .j;
-    single.board[37][3] = .j;
+    single.board[35][3] = Cell.fromPiece(.j);
+    single.board[35][5] = Cell.fromPiece(.j);
+    single.board[37][3] = Cell.fromPiece(.j);
     markLastRotationForTest(&single, .{
         .kind = .t,
         .rotation = .spawn,
@@ -1146,7 +1654,7 @@ test "T-spin single double triple and mini are detected" {
     var double = Game.initNoSpawn(21);
     fillRowExcept(&double, 35, &.{4}, .j);
     fillRowExcept(&double, 36, &.{ 3, 4, 5 }, .j);
-    double.board[37][3] = .j;
+    double.board[37][3] = Cell.fromPiece(.j);
     markLastRotationForTest(&double, .{
         .kind = .t,
         .rotation = .spawn,
@@ -1173,9 +1681,9 @@ test "T-spin single double triple and mini are detected" {
 
     var mini = Game.initNoSpawn(23);
     fillRowExcept(&mini, 36, &.{ 3, 4, 5 }, .j);
-    mini.board[35][3] = .j;
-    mini.board[37][3] = .j;
-    mini.board[37][5] = .j;
+    mini.board[35][3] = Cell.fromPiece(.j);
+    mini.board[37][3] = Cell.fromPiece(.j);
+    mini.board[37][5] = Cell.fromPiece(.j);
     markLastRotationForTest(&mini, .{
         .kind = .t,
         .rotation = .spawn,
@@ -1189,7 +1697,7 @@ test "T-spin single double triple and mini are detected" {
 
 test "combo counter back-to-back and scoring metadata" {
     var combo = Game.initNoSpawn(30);
-    combo.board[0][0] = .i;
+    combo.board[0][0] = Cell.fromPiece(.i);
     fillRowExcept(&combo, BoardHeight - 1, &.{ 4, 5 }, .j);
     combo.active = .{
         .kind = .o,
@@ -1202,7 +1710,7 @@ test "combo counter back-to-back and scoring metadata" {
     try std.testing.expectEqual(@as(u32, 0), first.combo_bonus_points);
 
     combo.board = emptyBoard();
-    combo.board[0][0] = .i;
+    combo.board[0][0] = Cell.fromPiece(.i);
     fillRowExcept(&combo, BoardHeight - 1, &.{ 4, 5 }, .j);
     combo.active = .{
         .kind = .o,
@@ -1214,7 +1722,7 @@ test "combo counter back-to-back and scoring metadata" {
     try std.testing.expectEqual(@as(u32, 50), second.combo_bonus_points);
 
     combo.board = emptyBoard();
-    combo.board[0][0] = .i;
+    combo.board[0][0] = Cell.fromPiece(.i);
     combo.active = .{
         .kind = .o,
         .rotation = .spawn,
@@ -1225,7 +1733,7 @@ test "combo counter back-to-back and scoring metadata" {
     try std.testing.expectEqual(@as(i32, -1), miss.combo_after_lock);
 
     var b2b = Game.initNoSpawn(31);
-    b2b.board[0][0] = .i;
+    b2b.board[0][0] = Cell.fromPiece(.i);
     for (36..40) |y| fillRowExcept(&b2b, y, &.{4}, .j);
     b2b.active = .{
         .kind = .i,
@@ -1240,7 +1748,7 @@ test "combo counter back-to-back and scoring metadata" {
     try std.testing.expectEqual(@as(u32, 800), first_quad.base_score_points);
 
     b2b.board = emptyBoard();
-    b2b.board[0][0] = .i;
+    b2b.board[0][0] = Cell.fromPiece(.i);
     for (36..40) |y| fillRowExcept(&b2b, y, &.{4}, .j);
     b2b.active = .{
         .kind = .i,
@@ -1290,7 +1798,7 @@ test "pure drop distance and ghost piece do not mutate active piece" {
     try std.testing.expectEqual(@as(i32, 38), ghost.pos.y);
     try std.testing.expectEqual(before, game.active.?);
 
-    game.board[BoardHeight - 1][4] = .i;
+    game.board[BoardHeight - 1][4] = Cell.fromPiece(.i);
     try std.testing.expectEqual(@as(u32, 7), game.activeDropDistance());
     const blocked_ghost = game.ghostPiece().?;
     try std.testing.expectEqual(@as(i32, 37), blocked_ghost.pos.y);

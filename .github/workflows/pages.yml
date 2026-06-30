@@ -3,20 +3,19 @@ name: Deploy GitHub Pages
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
-  group: pages
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Build web artifact
+    name: Build and check web artifact
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -27,28 +26,150 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Cache Zig packages and build cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/zig
-            .zig-cache
-            zig-cache
-            zig-pkg
-          key: ${{ runner.os }}-zig-0.16.0-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**/*.zig') }}
-          restore-keys: |
-            ${{ runner.os }}-zig-0.16.0-
+      - name: Install native raylib system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxi-dev \
+            libxcursor-dev
+
+      - name: Check formatting
+        run: zig fmt build.zig build.zig.zon src/*.zig --check
 
       - name: Run tests
         run: zig build test
 
+      - name: Run web JavaScript transport tests
+        run: |
+          set -eu
+          check_files=(
+            web/zigfall_transport.mjs
+            web/zigfall_transport_emscripten.js
+            web/zigfall_invite.mjs
+            web/zigfall_invite_emscripten.js
+            web/zigfall_profile.mjs
+            web/zigfall_profile_emscripten.js
+            web/vendor/patch-trystero-bundle.mjs
+            web/vendor/trystero-nostr.bundle.mjs
+            tools/test_trystero_pkt_limit.mjs
+            tools/test_zigfall_transport_adapter.mjs
+            tools/test_zigfall_invite.mjs
+            tools/test_zigfall_profile.mjs
+            tools/test_emscripten_shims.mjs
+          )
+          for file in "${check_files[@]}"; do
+            node --check "$file"
+          done
+
+          test_files=(
+            tools/test_trystero_pkt_limit.mjs
+            tools/test_zigfall_transport_adapter.mjs
+            tools/test_zigfall_invite.mjs
+            tools/test_zigfall_profile.mjs
+            tools/test_emscripten_shims.mjs
+          )
+          for file in "${test_files[@]}"; do
+            node "$file"
+          done
+
+      - name: Verify vendored Trystero bundle checksum
+        run: |
+          set -eu
+          checksum_file=web/vendor/trystero-nostr.bundle.mjs.sha256
+          checksum_count="$(grep -Ec '^[0-9a-f]{64}  trystero-nostr\.bundle\.mjs$' "$checksum_file" || true)"
+          if [ "$checksum_count" -ne 1 ]; then
+            echo "Expected exactly one trystero-nostr.bundle.mjs checksum in $checksum_file" >&2
+            exit 1
+          fi
+          (cd web/vendor && sha256sum -c trystero-nostr.bundle.mjs.sha256)
+
+      - name: Build native
+        run: zig build
+
       - name: Build web release
-        run: zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseSmall
+        run: |
+          rm -rf zig-out/web
+          zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseSmall
 
       - name: Prepare Pages artifact
         run: |
+          rm -f zig-out/web/zigfall.wasm.map
           cp zig-out/web/zigfall.html zig-out/web/index.html
           touch zig-out/web/.nojekyll
+
+      - name: Verify Pages artifact manifest
+        run: |
+          set -eu
+          actual_files="$(mktemp "${RUNNER_TEMP:-/tmp}/zigfall-pages-manifest.XXXXXX")"
+          cd zig-out/web
+          find . -type f -printf '%P\n' | sort > "$actual_files"
+          cat <<'EOF' | sort | diff -u - "$actual_files"
+          .nojekyll
+          LICENSE
+          THIRD_PARTY_NOTICES.md
+          index.html
+          licenses/AUTHORS-emscripten.txt
+          licenses/LICENSE-emsdk.txt
+          licenses/LICENSE-emscripten-compiler-rt.txt
+          licenses/LICENSE-emscripten-musl.txt
+          licenses/LICENSE-emscripten.txt
+          licenses/LICENSE-raygui.txt
+          licenses/LICENSE-raylib-external.txt
+          licenses/LICENSE-raylib-zig.txt
+          licenses/LICENSE-raylib.txt
+          licenses/LICENSE-zemscripten.txt
+          licenses/LICENSE-zig.txt
+          licenses/README.md
+          vendor/LICENSE-esbuild.txt
+          vendor/LICENSE-noble-secp256k1.txt
+          vendor/LICENSE-trystero.txt
+          vendor/README.md
+          vendor/trystero-nostr.bundle.mjs
+          vendor/trystero-nostr.bundle.mjs.sha256
+          zigfall.html
+          zigfall.js
+          zigfall.wasm
+          zigfall_invite.mjs
+          zigfall_profile.mjs
+          zigfall_transport.mjs
+          EOF
+          rm -f "$actual_files"
+          cmp -s zigfall.html index.html
+          (cd vendor && sha256sum -c trystero-nostr.bundle.mjs.sha256)
+
+      - name: Upload checked web artifact for Pages deploy
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: zigfall-pages-web
+          path: zig-out/web
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  deploy:
+    name: Deploy to GitHub Pages
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download checked web artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: zigfall-pages-web
+          path: zig-out/web
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
@@ -58,14 +179,6 @@ jobs:
         with:
           path: zig-out/web
 
-  deploy:
-    name: Deploy to GitHub Pages
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
       - name: Deploy Pages artifact
         id: deployment
         uses: actions/deploy-pages@v4
