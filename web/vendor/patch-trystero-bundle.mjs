@@ -140,4 +140,199 @@ source = replaceOnce(
   "Zigfall receive-hardening test hooks",
 );
 
+source = replaceOnce(
+  source,
+  `var roomFrameVersion = 1;
+var roomPresenceFrameVersion = 2;
+var wrapRoomFrame = (roomToken, data) => {
+`,
+  `var roomFrameVersion = 1;
+var roomPresenceFrameVersion = 2;
+var zigfallRoomTokenBytes = 64;
+var zigfallRoomFrameMaxPayloadBytes = 64 * 1024;
+var zigfallSharedPendingRoomTokenLimit = 16;
+var zigfallSharedPendingRoomFramesPerTokenLimit = 4;
+var zigfallSharedPendingRoomBytesLimit = 256 * 1024;
+var zigfallSharedRemoteRoomTokenLimit = 64;
+var zigfallNullProto = () => Object.create(null);
+var zigfallIsLowerHexByte = (byte) => byte >= 48 && byte <= 57 || byte >= 97 && byte <= 102;
+var zigfallIsRoomTokenBytes = (tokenBytes) => tokenBytes.byteLength === zigfallRoomTokenBytes && tokenBytes.every(zigfallIsLowerHexByte);
+var zigfallRoomPendingBytes = (pendingDataByToken) => {
+  let total = 0;
+  pendingDataByToken.forEach((frames) => frames.forEach((payload) => {
+    total += payload.byteLength ?? 0;
+  }));
+  return total;
+};
+var wrapRoomFrame = (roomToken, data) => {
+`,
+  "Zigfall shared-peer room-frame constants and helpers",
+);
+
+source = replaceOnce(
+  source,
+  `var unwrapFrame = (data) => {
+  const buffer = new Uint8Array(data);
+  if (buffer.byteLength < 3) return null;
+  if (buffer[0] === roomFrameVersion) {
+    const tokenSize2 = (buffer[1] ?? 0) << 8 | (buffer[2] ?? 0);
+    const headerSize2 = 3 + tokenSize2;
+    if (tokenSize2 <= 0 || buffer.byteLength < headerSize2) return null;
+    return {
+      type: "room",
+      roomToken: decodeBytes(buffer.subarray(3, headerSize2)),
+      payload: buffer.subarray(headerSize2).slice().buffer
+    };
+  }
+  if (buffer[0] !== roomPresenceFrameVersion || buffer.byteLength < 4) return null;
+  const tokenSize = (buffer[2] ?? 0) << 8 | (buffer[3] ?? 0);
+  const headerSize = 4 + tokenSize;
+  if (tokenSize <= 0 || buffer.byteLength < headerSize) return null;
+  return {
+    type: "presence",
+    roomToken: decodeBytes(buffer.subarray(4, headerSize)),
+    isPresent: buffer[1] === 1
+  };
+};
+`,
+  `var unwrapFrame = (data) => {
+  const buffer = data instanceof ArrayBuffer ? new Uint8Array(data) : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null;
+  if (!buffer || buffer.byteLength < 3) return null;
+  if (buffer[0] === roomFrameVersion) {
+    const tokenSize2 = (buffer[1] ?? 0) << 8 | (buffer[2] ?? 0);
+    const headerSize2 = 3 + tokenSize2;
+    if (tokenSize2 !== zigfallRoomTokenBytes || buffer.byteLength < headerSize2) return null;
+    const tokenBytes = buffer.subarray(3, headerSize2);
+    if (!zigfallIsRoomTokenBytes(tokenBytes)) return null;
+    const payloadSize = buffer.byteLength - headerSize2;
+    if (payloadSize > zigfallRoomFrameMaxPayloadBytes) return null;
+    return {
+      type: "room",
+      roomToken: decodeBytes(tokenBytes),
+      payload: buffer.subarray(headerSize2).slice().buffer
+    };
+  }
+  if (buffer[0] !== roomPresenceFrameVersion || buffer.byteLength < 4) return null;
+  const presenceFlag = buffer[1];
+  if (presenceFlag !== 0 && presenceFlag !== 1) return null;
+  const tokenSize = (buffer[2] ?? 0) << 8 | (buffer[3] ?? 0);
+  const headerSize = 4 + tokenSize;
+  if (tokenSize !== zigfallRoomTokenBytes || buffer.byteLength !== headerSize) return null;
+  const tokenBytes = buffer.subarray(4, headerSize);
+  if (!zigfallIsRoomTokenBytes(tokenBytes)) return null;
+  return {
+    type: "presence",
+    roomToken: decodeBytes(tokenBytes),
+    isPresent: presenceFlag === 1
+  };
+};
+`,
+  "Zigfall shared-peer room-frame unwrap guard",
+);
+
+source = replaceOnce(
+  source,
+  `  constructor() {
+    __publicField(this, "byApp", {});
+    __publicField(this, "roomPresenceHandlers", {});
+  }
+`,
+  `  constructor() {
+    __publicField(this, "byApp", zigfallNullProto());
+    __publicField(this, "roomPresenceHandlers", zigfallNullProto());
+  }
+`,
+  "Zigfall shared-peer manager null-prototype roots",
+);
+
+source = replaceOnce(
+  source,
+  `    return (_a = this.byApp)[appId] ?? (_a[appId] = {});
+`,
+  `    return (_a = this.byApp)[appId] ?? (_a[appId] = zigfallNullProto());
+`,
+  "Zigfall shared-peer app map null-prototype allocation",
+);
+
+source = replaceOnce(
+  source,
+  `    shared.bindings = {};
+    shared.bindingsByToken = {};
+`,
+  `    shared.bindings = zigfallNullProto();
+    shared.bindingsByToken = /* @__PURE__ */ new Map();
+`,
+  "Zigfall shared-peer clear null-prototype bindings",
+);
+
+source = replaceOnce(
+  source,
+  `      bindings: {},
+      bindingsByToken: {},
+`,
+  `      bindings: zigfallNullProto(),
+      bindingsByToken: /* @__PURE__ */ new Map(),
+`,
+  "Zigfall shared-peer register token map",
+);
+
+source = replaceOnce(
+  source,
+  `      if (binding.roomToken && shared.bindingsByToken[binding.roomToken] === binding) delete shared.bindingsByToken[binding.roomToken];
+`,
+  `      if (binding.roomToken && shared.bindingsByToken.get(binding.roomToken) === binding) shared.bindingsByToken.delete(binding.roomToken);
+`,
+  "Zigfall shared-peer detach token map cleanup",
+);
+
+source = replaceOnce(
+  source,
+  `      shared.bindingsByToken[roomToken] = binding;
+`,
+  `      shared.bindingsByToken.set(roomToken, binding);
+`,
+  "Zigfall shared-peer bind token map store",
+);
+
+source = replaceOnce(
+  source,
+  `    if (decoded.type === "presence") {
+      if (decoded.isPresent) shared.remoteRoomTokens.add(decoded.roomToken);
+      else shared.remoteRoomTokens.delete(decoded.roomToken);
+      this.roomPresenceHandlers[shared.appId]?.(shared.peerId, decoded.roomToken, decoded.isPresent);
+      return;
+    }
+    const binding = shared.bindingsByToken[decoded.roomToken];
+    if (!binding) {
+      const pending = shared.pendingDataByToken.get(decoded.roomToken) ?? [];
+      pending.push(decoded.payload);
+      shared.pendingDataByToken.set(decoded.roomToken, pending);
+      return;
+    }
+`,
+  `    if (decoded.type === "presence") {
+      if (decoded.isPresent) {
+        if (!shared.remoteRoomTokens.has(decoded.roomToken) && shared.remoteRoomTokens.size >= zigfallSharedRemoteRoomTokenLimit) return;
+        shared.remoteRoomTokens.add(decoded.roomToken);
+      } else {
+        shared.remoteRoomTokens.delete(decoded.roomToken);
+        shared.pendingDataByToken.delete(decoded.roomToken);
+      }
+      this.roomPresenceHandlers[shared.appId]?.(shared.peerId, decoded.roomToken, decoded.isPresent);
+      return;
+    }
+    const binding = shared.bindingsByToken.get(decoded.roomToken);
+    if (!binding) {
+      const pending = shared.pendingDataByToken.get(decoded.roomToken) ?? [];
+      if (!shared.pendingDataByToken.has(decoded.roomToken) && shared.pendingDataByToken.size >= zigfallSharedPendingRoomTokenLimit) return;
+      if (pending.length >= zigfallSharedPendingRoomFramesPerTokenLimit) return;
+      if (zigfallRoomPendingBytes(shared.pendingDataByToken) + decoded.payload.byteLength > zigfallSharedPendingRoomBytesLimit) return;
+      pending.push(decoded.payload);
+      shared.pendingDataByToken.set(decoded.roomToken, pending);
+      return;
+    }
+`,
+  "Zigfall shared-peer pending room data and presence caps",
+);
+
 await writeFile(bundlePath, source);

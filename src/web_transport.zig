@@ -137,9 +137,19 @@ pub fn lastError() ErrorCode {
     return enumFromCode(ErrorCode, js.zigfall_transport_last_error()) orelse .missing_js;
 }
 
+pub fn healthError() ErrorCode {
+    if (comptime !is_web) return .unavailable;
+    return enumFromCode(ErrorCode, js.zigfall_transport_health_error()) orelse .missing_js;
+}
+
 pub fn peerCount() u8 {
     if (comptime !is_web) return 0;
     return js.zigfall_transport_peer_count();
+}
+
+pub fn hadPeer() bool {
+    if (comptime !is_web) return false;
+    return js.zigfall_transport_had_peer() != 0;
 }
 
 pub fn queuedPacketCount() u16 {
@@ -198,12 +208,14 @@ fn enumFromCode(comptime Enum: type, code: u8) ?Enum {
 const js = if (is_web) struct {
     extern fn zigfall_transport_status() u8;
     extern fn zigfall_transport_last_error() u8;
+    extern fn zigfall_transport_health_error() u8;
     extern fn zigfall_transport_connect(room_ptr: [*]const u8, room_len: usize) u8;
     extern fn zigfall_transport_disconnect() void;
     extern fn zigfall_transport_send(packet_ptr: [*]const u8, packet_len: usize) u8;
     extern fn zigfall_transport_send_best_effort(packet_ptr: [*]const u8, packet_len: usize) u8;
     extern fn zigfall_transport_poll(out_ptr: [*]u8, out_cap: usize) i32;
     extern fn zigfall_transport_peer_count() u8;
+    extern fn zigfall_transport_had_peer() u8;
     extern fn zigfall_transport_queued_packet_count() u16;
 } else struct {};
 
@@ -212,7 +224,9 @@ test "native transport status is unavailable" {
 
     try std.testing.expectEqual(Status.unavailable, status());
     try std.testing.expectEqual(ErrorCode.unavailable, lastError());
+    try std.testing.expectEqual(ErrorCode.unavailable, healthError());
     try std.testing.expectEqual(@as(u8, 0), peerCount());
+    try std.testing.expect(!hadPeer());
     try std.testing.expectEqual(@as(u16, 0), queuedPacketCount());
 }
 

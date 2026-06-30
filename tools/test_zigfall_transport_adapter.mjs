@@ -78,6 +78,7 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
   room.join("peer-a");
   assert.equal(transport.statusCode(), Status.connected);
   assert.equal(transport.selectedPeerId(), "peer-a");
+  assert.equal(transport.hadPeer(), true);
   assert.equal(transport.extraPeerCount(), 0);
 
   assert.equal(transport.send(Uint8Array.from([1, 2, 3])), ErrorCode.none);
@@ -245,6 +246,7 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
   assert.equal(transport.queuedPacketCount(), transport.MaxQueuedPackets);
   rooms[0].action.emit(Uint8Array.from([0x22]), "peer-a");
   assert.equal(transport.errorCode(), ErrorCode.queueFull, "overflow remains fatal when the full queue has no optional profile to evict");
+  assert.equal(transport.healthErrorCode(), ErrorCode.queueFull, "queue overflow must stick in fatal transport health");
 }
 
 {
@@ -266,6 +268,7 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
   assert.equal(transport.queuedPacketCount(), transport.MaxQueuedPackets, "profile overflow should not grow the bounded queue");
   action.emit(Uint8Array.from([0xee]), "peer-a");
   assert.equal(transport.errorCode(), ErrorCode.queueFull);
+  assert.equal(transport.healthErrorCode(), ErrorCode.queueFull);
   assert.equal(transport.queuedPacketCount(), transport.MaxQueuedPackets, "overflow should not grow the bounded queue");
 }
 
@@ -286,7 +289,17 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
 
   room.action.emit(new Uint8Array(transport.MaxPacketSize + 1), "peer-a");
   assert.equal(transport.errorCode(), ErrorCode.packetTooLarge, "oversized selected-peer gameplay/lifecycle packets must be terminal to Zig");
+  assert.equal(transport.healthErrorCode(), ErrorCode.packetTooLarge, "oversized selected-peer packets must stick in fatal transport health");
   assert.equal(transport.queuedPacketCount(), 0, "oversized packets are dropped rather than queued");
+
+  room.join("peer-b");
+  assert.equal(transport.errorCode(), ErrorCode.busy, "transient extra-peer errors may update the last error");
+  assert.equal(transport.healthErrorCode(), ErrorCode.packetTooLarge, "transient busy/noPeer status must not hide sticky fatal health");
+
+  assert.equal(transport.connect("oversize-test"), ErrorCode.none);
+  assert.equal(transport.healthErrorCode(), ErrorCode.packetTooLarge, "same-room connect refresh must not clear fatal health");
+  assert.equal(transport.connect("oversize-new-room"), ErrorCode.none);
+  assert.equal(transport.healthErrorCode(), ErrorCode.none, "new room connection clears fatal health");
 }
 
 {
@@ -375,10 +388,21 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
     rejectGameplaySend(new Error("gameplay send failed"));
     await Promise.resolve();
     assert.equal(transport.errorCode(), ErrorCode.sendFailed, "gameplay async rejection remains fatal to Zig");
+    assert.equal(transport.healthErrorCode(), ErrorCode.sendFailed, "gameplay async rejection remains sticky fatal health");
+    rooms[0].join("peer-b");
+    assert.equal(transport.errorCode(), ErrorCode.busy, "later transient room state can update last error");
+    assert.equal(transport.healthErrorCode(), ErrorCode.sendFailed, "later transient room state must not hide sticky send failure");
+
+    rooms[0].action.emit(new Uint8Array(transport.MaxPacketSize + 1), "peer-a");
+    assert.equal(transport.errorCode(), ErrorCode.packetTooLarge, "later selected-peer receive fatal updates last error");
+    assert.equal(transport.healthErrorCode(), ErrorCode.packetTooLarge, "receive fatal must override an ignored sticky send failure");
+    rooms[0].action.emit(Uint8Array.from([0x99]), "peer-a");
+    assert.deepEqual(Array.from(transport.poll()), [0x99], "queued packets remain pollable after the receive fatal is latched");
+    assert.equal(transport.healthErrorCode(), ErrorCode.packetTooLarge, "result/health checks must still see the receive fatal first");
     assert.equal(warnings.length, 1);
   } finally {
     console.warn = originalWarn;
   }
 }
 
-console.log("ok: Zigfall transport adapter selects one peer, targets sends, drops extras, drains late final packets, bounds backlog, scopes async send failures, and keeps best-effort sends nonfatal");
+console.log("ok: Zigfall transport adapter selects one peer, targets sends, drops extras, drains late final packets, bounds backlog, prioritizes receive health, scopes async send failures, and keeps best-effort sends nonfatal");

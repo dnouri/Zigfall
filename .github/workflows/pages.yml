@@ -3,20 +3,19 @@ name: Deploy GitHub Pages
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
-  group: pages
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Build web artifact
+    name: Build and check web artifact
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -46,22 +45,36 @@ jobs:
 
       - name: Run web JavaScript transport tests
         run: |
-          node --check web/zigfall_transport.mjs
-          node --check web/zigfall_transport_emscripten.js
-          node --check web/zigfall_invite.mjs
-          node --check web/zigfall_invite_emscripten.js
-          node --check web/zigfall_profile.mjs
-          node --check web/zigfall_profile_emscripten.js
-          node --check web/vendor/patch-trystero-bundle.mjs
-          node --check web/vendor/trystero-nostr.bundle.mjs
-          node --check tools/test_trystero_pkt_limit.mjs
-          node --check tools/test_zigfall_transport_adapter.mjs
-          node --check tools/test_zigfall_invite.mjs
-          node --check tools/test_zigfall_profile.mjs
-          node tools/test_trystero_pkt_limit.mjs
-          node tools/test_zigfall_transport_adapter.mjs
-          node tools/test_zigfall_invite.mjs
-          node tools/test_zigfall_profile.mjs
+          set -eu
+          check_files=(
+            web/zigfall_transport.mjs
+            web/zigfall_transport_emscripten.js
+            web/zigfall_invite.mjs
+            web/zigfall_invite_emscripten.js
+            web/zigfall_profile.mjs
+            web/zigfall_profile_emscripten.js
+            web/vendor/patch-trystero-bundle.mjs
+            web/vendor/trystero-nostr.bundle.mjs
+            tools/test_trystero_pkt_limit.mjs
+            tools/test_zigfall_transport_adapter.mjs
+            tools/test_zigfall_invite.mjs
+            tools/test_zigfall_profile.mjs
+            tools/test_emscripten_shims.mjs
+          )
+          for file in "${check_files[@]}"; do
+            node --check "$file"
+          done
+
+          test_files=(
+            tools/test_trystero_pkt_limit.mjs
+            tools/test_zigfall_transport_adapter.mjs
+            tools/test_zigfall_invite.mjs
+            tools/test_zigfall_profile.mjs
+            tools/test_emscripten_shims.mjs
+          )
+          for file in "${test_files[@]}"; do
+            node "$file"
+          done
 
       - name: Verify vendored Trystero bundle checksum
         run: |
@@ -84,6 +97,7 @@ jobs:
 
       - name: Prepare Pages artifact
         run: |
+          rm -f zig-out/web/zigfall.wasm.map
           cp zig-out/web/zigfall.html zig-out/web/index.html
           touch zig-out/web/.nojekyll
 
@@ -127,6 +141,36 @@ jobs:
           cmp -s zigfall.html index.html
           (cd vendor && sha256sum -c trystero-nostr.bundle.mjs.sha256)
 
+      - name: Upload checked web artifact for Pages deploy
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: zigfall-pages-web
+          path: zig-out/web
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  deploy:
+    name: Deploy to GitHub Pages
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download checked web artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: zigfall-pages-web
+          path: zig-out/web
+
       - name: Configure Pages
         uses: actions/configure-pages@v5
 
@@ -135,14 +179,6 @@ jobs:
         with:
           path: zig-out/web
 
-  deploy:
-    name: Deploy to GitHub Pages
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
       - name: Deploy Pages artifact
         id: deployment
         uses: actions/deploy-pages@v4

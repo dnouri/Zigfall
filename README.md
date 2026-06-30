@@ -2,7 +2,7 @@
 
 **Play Zigfall in your browser: <https://dnouri.github.io/Zigfall/>**
 
-Zigfall is a falling-block game with solo play, local two-player on one keyboard, and browser invite-link P2P. For online play, open the browser version, press `3` to host, copy the invite, and send it to another player. The match runs between the two browsers: Zigfall exchanges inputs, keeps both games deterministic, and verifies the result without a central game server.
+Zigfall is a falling-block game with solo play, local two-player on one keyboard, and browser invite-link P2P. For online play, open the browser version, press `3` to host, copy the invite, and send it to another player. The match runs between the two browsers: Zigfall exchanges inputs, keeps both games deterministic, and cross-checks final state/results without a central game server.
 
 The same Zig game core also runs as a native desktop build with solo play and local two-player on one keyboard. Rendering uses [raylib-zig](https://github.com/raylib-zig/raylib-zig); the rules live separately so the core mechanics can be tested without opening a window.
 
@@ -19,7 +19,7 @@ Online play is browser-only invite-link P2P. Native builds still do solo and loc
 
 Solo play works on desktop and in the browser. Local two-player versus also works on one keyboard in both builds.
 
-Browsers also keep a small local profile card. It has a nickname, a random local player ID, Local rating, and W-L-D. It is display-only metadata stored in that browser, not a trusted identity and not a global ranking. Completed online matches update the local stats only after both peers report matching verified results. Disconnects, desyncs, and unverified results do not count.
+Browsers also keep a small local profile card. It has a nickname, a random local player ID, Local rating, and W-L-D. It is display-only metadata stored in that browser, not a trusted identity and not a global ranking. Completed online matches update local stats only after both peers finish and their final-state/result reports agree. This is a deterministic peer cross-check, not anti-cheat and not a server-authenticated ranking. Disconnects, desyncs, and result disagreements/timeouts do not count.
 
 The board is 10x40, with 20 visible rows. Pieces come from a seven-bag randomizer with a five-piece queue. Hold, ghost, gravity, and lock delay are all in. Rotation has SRS-style kicks plus 180. Clears track T-spins, back-to-back, combos, and perfect clears. Versus play adds garbage.
 
@@ -66,7 +66,7 @@ In an online match both players use that single-player control set. `R` is delib
 - There are no accounts or matchmaking. There is no global leaderboard or central match server.
 - There is no rematch flow yet.
 - Zigfall does not bundle TURN or a controlled signaling service. Browser matches depend on public relays, WebRTC/ICE, and the players' networks.
-- Local profile cards and Local rating are browser-local and display-only. They are not trusted. Verified completed matches update local W-L-D; disconnects, desyncs, and unverified results do not.
+- Local profile cards and Local rating are browser-local and display-only. They are not trusted, not anti-cheat, and not server-authenticated rankings. Only completed matches with matching peer final-state/result reports update local W-L-D; disconnects, desyncs, and result disagreements/timeouts do not.
 
 ## How it works
 
@@ -74,7 +74,7 @@ In an online match both players use that single-player control set. `R` is delib
 
 Native and web builds share the Zig core. The web artifact adds a custom shell and small JavaScript helpers. Those helpers handle invite links, browser-local profiles, and Trystero/WebRTC transport. They are copied as local static files by `build.zig` and loaded before WASM `main` starts.
 
-For online duels, the host is setup authority for the room and seed, then both browsers run a conservative lockstep match by exchanging inputs. Periodic state hashes are compared to catch desyncs. Match results are only applied to the local profile when both peers finish and the reported result validates. Extra peers are treated as a busy-room condition rather than silently joining the match.
+For online duels, the host is setup authority for the room and seed, then both browsers run a conservative lockstep match by exchanging inputs. Periodic state hashes are compared to catch desyncs. Match results are only applied to the local profile when both peers finish and the exchanged final outcome, frame cursor, and state hash agree. Extra peers are treated as a busy-room condition rather than silently joining the match.
 
 ## Requirements
 
@@ -129,13 +129,15 @@ for file in web/zigfall_transport.mjs web/zigfall_transport_emscripten.js \
   web/zigfall_profile.mjs web/zigfall_profile_emscripten.js \
   web/vendor/patch-trystero-bundle.mjs web/vendor/trystero-nostr.bundle.mjs \
   tools/test_trystero_pkt_limit.mjs tools/test_zigfall_transport_adapter.mjs \
-  tools/test_zigfall_invite.mjs tools/test_zigfall_profile.mjs; do
+  tools/test_zigfall_invite.mjs tools/test_zigfall_profile.mjs \
+  tools/test_emscripten_shims.mjs; do
   node --check "$file"
 done
 node tools/test_trystero_pkt_limit.mjs
 node tools/test_zigfall_transport_adapter.mjs
 node tools/test_zigfall_invite.mjs
 node tools/test_zigfall_profile.mjs
+node tools/test_emscripten_shims.mjs
 (cd web/vendor && sha256sum -c trystero-nostr.bundle.mjs.sha256)
 ```
 
@@ -164,36 +166,10 @@ The production page imports bundled local JavaScript files, not a runtime CDN. N
 
 The web shell also installs a keyboard handler so Space, Enter, arrow keys, and Slash (`/`) do not scroll the page or open quick-find while the game is active. Focused links and form controls are left alone.
 
+## License and notices
+
+Zigfall is GPL-3.0-or-later; see [`LICENSE`](LICENSE). Third-party component notices are summarized in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Packaged native and web artifacts also include the tracked `licenses/` snapshots and web `vendor/` notices.
+
 ## Origin
 
-The original single-player/native Zig/raylib-zig version was created mostly from one GPT-5.5 prompt in Pi. That baseline is preserved in Git history at [`cd6e23a`](https://github.com/dnouri/Zigfall/commit/cd6e23a757e0ba4f0dbc3fd5c5c8f23ea4a902a5).
-
-Browser multiplayer came after that, along with invite links, profile cards, deployment packaging, and the checks around them.
-
-<details>
-<summary>The original prompt</summary>
-
-```text
-I want you to build a ### clone, using ~/co/raylib and
-specifically ~/co/raylib-zig/
-
-I want your ### clone to be technically advanced to the point
-where it could be used for tournaments: think FPS, T-spins,
-perfect clears, and combos.
-
-Divide your work up into logical units and delegate to subagents
-for researching ~/co/raylib/ and ~/co/raylib-zig/
-
-Then create a plan with phases. Then delegate each phase to a
-"fresh context" subagent, with useful quality gates. Make sure
-every subagent uses our best practices, and that they are able to
-actually test their results and do quality engineering as well,
-before they handoff. After each handoff, send a subagent to
-review the code, and look for simplification opportunities, before
-you hand over to the next subagent with "fresh context" to work on
-the next phase. Do not stop until you are done and satisfied with
-the implementation. Make sure you delegate and give agency and
-useful context to subagents such that they can work efficiently
-and you keep the overview of the project without losing focus.
-```
-</details>
+The original single-player/native Zig/raylib-zig baseline was AI-assisted and is preserved in Git history at [`cd6e23a`](https://github.com/dnouri/Zigfall/commit/cd6e23a757e0ba4f0dbc3fd5c5c8f23ea4a902a5). Browser multiplayer came after that, along with invite links, profile cards, deployment packaging, and notices.

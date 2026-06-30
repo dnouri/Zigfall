@@ -33,6 +33,12 @@ mergeInto(LibraryManager.library, {
     return transport ? transport.errorCode() : ZigfallTransportShim.ErrorCode.missingJs;
   },
 
+  zigfall_transport_health_error__deps: ["$ZigfallTransportShim"],
+  zigfall_transport_health_error: function() {
+    var transport = ZigfallTransportShim.transport();
+    return transport && typeof transport.healthErrorCode === "function" ? transport.healthErrorCode() : ZigfallTransportShim.ErrorCode.missingJs;
+  },
+
   zigfall_transport_connect__deps: ["$ZigfallTransportShim"],
   zigfall_transport_connect: function(roomPtr, roomLen) {
     var transport = ZigfallTransportShim.transport();
@@ -73,6 +79,12 @@ mergeInto(LibraryManager.library, {
   zigfall_transport_peer_count: function() {
     var transport = ZigfallTransportShim.transport();
     return transport ? transport.peerCount() : 0;
+  },
+
+  zigfall_transport_had_peer__deps: ["$ZigfallTransportShim"],
+  zigfall_transport_had_peer: function() {
+    var transport = ZigfallTransportShim.transport();
+    return transport && typeof transport.hadPeer === "function" && transport.hadPeer() ? 1 : 0;
   },
 
   zigfall_transport_queued_packet_count__deps: ["$ZigfallTransportShim"],

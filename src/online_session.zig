@@ -106,6 +106,7 @@ pub const ResultFinishAction = enum {
     no_local_outcome,
     send_local_result,
     wait_for_remote_result,
+    start_verified_drain,
     wait_for_verified_drain,
     finish_verified,
     finish_unverified_disconnect,
@@ -116,7 +117,9 @@ pub const ResultFinishState = struct {
     remote_result_status: RemoteResultStatus = .none,
     has_local_outcome: bool = false,
     sent_local_result: bool = false,
-    result_drain_frames_left: u16 = 0,
+    remote_result_wait_frames_left: u16 = 0,
+    verified_result_drain_started: bool = false,
+    verified_result_drain_frames_left: u16 = 0,
     peer_left: bool = false,
 };
 
@@ -124,12 +127,13 @@ pub fn resultFinishAction(state: ResultFinishState) ResultFinishAction {
     if (!state.has_local_outcome) return .no_local_outcome;
     if (state.remote_result_status == .validated) {
         if (!state.sent_local_result) return .send_local_result;
-        if (state.result_drain_frames_left > 0) return .wait_for_verified_drain;
+        if (!state.verified_result_drain_started) return .start_verified_drain;
+        if (state.verified_result_drain_frames_left > 0) return .wait_for_verified_drain;
         return .finish_verified;
     }
 
     if (!state.sent_local_result) return .send_local_result;
-    if (state.result_drain_frames_left > 0) return .wait_for_remote_result;
+    if (state.remote_result_wait_frames_left > 0) return .wait_for_remote_result;
     return if (state.peer_left) .finish_unverified_disconnect else .finish_unverified_timeout;
 }
 
@@ -199,9 +203,17 @@ pub const PacketDecodePolicy = enum {
     ignore_stale,
 };
 
+fn packetTypeIsRuntimeOrResult(packet_type: protocol.PacketType) bool {
+    return switch (packet_type) {
+        .input_batch, .state_hash, .desync, .result => true,
+        .setup, .ack, .disconnect, .profile => false,
+    };
+}
+
 pub const TransportHealthState = struct {
     status: TransportStatus = .disconnected,
     last_error: TransportError = .none,
+    health_error: TransportError = .none,
     ever_had_peer: bool = false,
     peer_leave_observed: bool = false,
     defer_peer_leave_disconnect: bool = false,
@@ -209,6 +221,19 @@ pub const TransportHealthState = struct {
 };
 
 pub fn transportHealthAction(state: TransportHealthState) TransportHealthAction {
+    switch (state.health_error) {
+        .packet_too_large => return .fail_packet_too_large,
+        .queue_full => return .fail_queue_full,
+        .send_failed => if (!state.ignore_async_send_failure) return .fail_send_failed,
+        else => {},
+    }
+    switch (state.last_error) {
+        .packet_too_large => return .fail_packet_too_large,
+        .queue_full => return .fail_queue_full,
+        .send_failed => if (!state.ignore_async_send_failure) return .fail_send_failed,
+        else => {},
+    }
+
     switch (state.status) {
         .busy => return .fail_extra_peer,
         .missing_js => return .fail_missing_js,
@@ -219,9 +244,6 @@ pub fn transportHealthAction(state: TransportHealthState) TransportHealthAction 
 
     switch (state.last_error) {
         .no_peer => if (state.ever_had_peer and !state.defer_peer_leave_disconnect) return .disconnected,
-        .packet_too_large => return .fail_packet_too_large,
-        .queue_full => return .fail_queue_full,
-        .send_failed => if (!state.ignore_async_send_failure) return .fail_send_failed,
         else => {},
     }
 
@@ -235,6 +257,22 @@ pub const ResultCompletionState = struct {
     has_local_outcome: bool = false,
     result_drain_active: bool = false,
 };
+
+pub fn resultCompletionInProgress(state: ResultCompletionState) bool {
+    return state.pending_remote_result or
+        state.sent_result or
+        state.has_local_outcome or
+        state.result_drain_active;
+}
+
+pub const OnlineFreshModeState = struct {
+    terminal: bool = false,
+    completion: ResultCompletionState = .{},
+};
+
+pub fn canSwitchToFreshModeFromOnline(state: OnlineFreshModeState) bool {
+    return state.terminal or !resultCompletionInProgress(state.completion);
+}
 
 pub const PeerLeaveDisconnectAction = enum {
     disconnect_now,
@@ -252,10 +290,7 @@ pub const PeerLeaveDisconnectState = struct {
 };
 
 pub fn shouldDeferPeerLeaveDisconnect(state: ResultCompletionState) bool {
-    return state.pending_remote_result or
-        state.sent_result or
-        state.has_local_outcome or
-        state.result_drain_active;
+    return resultCompletionInProgress(state);
 }
 
 pub fn peerLeaveDisconnectAction(state: PeerLeaveDisconnectState) PeerLeaveDisconnectAction {
@@ -411,12 +446,20 @@ pub const Session = struct {
         };
     }
 
-    /// Encode the joiner ack and mark the joiner's local handshake complete.
-    pub fn encodeJoinerAck(self: *Session) OnlineSessionError!EncodedPacket {
+    /// Encode the joiner ack without mutating session state; callers should
+    /// mark the joiner playing only after the transport accepts the ack send.
+    pub fn encodeJoinerAck(self: *const Session) OnlineSessionError!EncodedPacket {
         const ack = try self.buildJoinerAck();
-        const encoded = try encodeAckPacket(ack);
-        self.state = .playing;
-        return encoded;
+        return try encodeAckPacket(ack);
+    }
+
+    pub fn markJoinerAckSent(self: *Session) OnlineSessionError!void {
+        if (self.role != .joiner) return error.WrongRole;
+        switch (self.state) {
+            .setup_received => self.state = .playing,
+            .playing => {},
+            .waiting_for_setup, .waiting_for_ack => return error.UnexpectedAck,
+        }
     }
 
     pub fn acceptAck(self: *Session, ack: protocol.Ack) OnlineSessionError!void {
@@ -572,16 +615,26 @@ pub fn displayCardFromProfilePacket(profile_packet: protocol.Profile) profile.Pr
 /// lifecycle data, decoded as optional profile metadata, or ignored as stale
 /// room noise. When a current match id is known, raw wrong-match envelopes are
 /// ignored before version/type validation so stale future packets cannot poison
-/// the current room. Profile packets are display-only, so callers can treat body
-/// decode errors from `.decode_optional_profile` as nonfatal notices.
+/// the current room. Runtime/result packets received before the session is
+/// playing are also ignored after envelope peeking, before body decode. Profile
+/// packets are display-only, so callers can treat body decode errors from
+/// `.decode_optional_profile` as nonfatal notices.
 pub fn packetDecodePolicyForKnownMatch(current_match_id: ?u64, bytes: []const u8) protocol.DecodeError!PacketDecodePolicy {
+    return packetDecodePolicyForSessionState(current_match_id, null, bytes);
+}
+
+pub fn packetDecodePolicyForSessionState(current_match_id: ?u64, session_state: ?State, bytes: []const u8) protocol.DecodeError!PacketDecodePolicy {
     if (current_match_id) |match_id| {
         if (bytes.len >= protocol.HeaderSize and (try protocol.peekMatchId(bytes)) != match_id) return .ignore_stale;
     }
 
     const packet_type = try protocol.peekPacketType(bytes);
     if (packet_type == .profile and bytes.len < protocol.HeaderSize) return .decode_optional_profile;
-    return if (packet_type == .profile) .decode_optional_profile else .decode_required;
+    if (packet_type == .profile) return .decode_optional_profile;
+    if (session_state) |state| {
+        if (state != .playing and packetTypeIsRuntimeOrResult(packet_type)) return .ignore_stale;
+    }
+    return .decode_required;
 }
 
 /// Return true only when a caller already knows the active match id and this
@@ -757,8 +810,11 @@ test "joiner sends valid ack" {
     try expectSessionState(&joiner, .setup_received);
 
     const encoded = try joiner.encodeJoinerAck();
-    try expectSessionState(&joiner, .playing);
+    try expectSessionState(&joiner, .setup_received);
     try std.testing.expectEqualDeep(ack, try decodeAckPacket(encoded.slice()));
+
+    try joiner.markJoinerAckSent();
+    try expectSessionState(&joiner, .playing);
 }
 
 test "host accepts correct ack and rejects wrong-slot and wrong-match ack" {
@@ -925,6 +981,36 @@ test "known-match stale filter drops wrong-match malformed lifecycle before body
     try std.testing.expect(try shouldIgnorePacketForKnownMatch(TestMatchId, unknown_type.slice()));
 }
 
+test "pre-playing phase gate ignores runtime and result bodies before full decode" {
+    const result = protocol.Result{
+        .match_id = TestMatchId,
+        .sender_slot = JoinerProtocolSlot,
+        .outcome = .p1_win,
+        .frame_cursor = 1,
+        .state_hash = 2,
+    };
+    const encoded_result = try encodePacket(.{ .result = result });
+    const truncated_result = encoded_result.bytes[0 .. protocol.ResultPacketSize - 1];
+    try std.testing.expectError(error.TruncatedPacket, protocol.decode(truncated_result));
+    try std.testing.expectEqual(PacketDecodePolicy.ignore_stale, try packetDecodePolicyForSessionState(TestMatchId, .waiting_for_ack, truncated_result));
+    try std.testing.expectEqual(PacketDecodePolicy.decode_required, try packetDecodePolicyForSessionState(TestMatchId, .playing, truncated_result));
+
+    const input_batch = try protocol.InputBatch.init(TestMatchId, JoinerProtocolSlot, 0, &[_]input.FrameInput{.{}});
+    const encoded_input = try encodePacket(.{ .input_batch = input_batch });
+    const truncated_input = encoded_input.bytes[0 .. protocol.InputBatchPrefixSize - 1];
+    try std.testing.expectError(error.TruncatedPacket, protocol.decode(truncated_input));
+    try std.testing.expectEqual(PacketDecodePolicy.ignore_stale, try packetDecodePolicyForSessionState(TestMatchId, .setup_received, truncated_input));
+
+    var malformed_ack = try encodeAckPacket(.{
+        .match_id = TestMatchId,
+        .sender_slot = JoinerProtocolSlot,
+        .acked_slot = HostProtocolSlot,
+        .next_needed_frame = 0,
+    });
+    malformed_ack.bytes[protocol.HeaderSize] = 2;
+    try std.testing.expectEqual(PacketDecodePolicy.decode_required, try packetDecodePolicyForSessionState(TestMatchId, .waiting_for_ack, malformed_ack.slice()));
+}
+
 test "profile decode policy keeps malformed profile metadata nonfatal" {
     const local_card = try profile.ProfileCard.init("p_remote", "Ada");
     var current_profile = try encodeProfilePacket(TestMatchId, JoinerProtocolSlot, local_card);
@@ -1009,7 +1095,7 @@ test "malformed profile contents fall back without rejecting the match" {
     try std.testing.expectEqual(@as(u32, 7), card.draws);
 }
 
-test "profile rating record policy only records verified completed outcomes once" {
+test "profile rating record policy only records peer-agreed completed outcomes once" {
     try std.testing.expectEqual(ProfileRatingRecordAction.ignore, profileRatingRecordAction(.{}));
     try std.testing.expectEqual(ProfileRatingRecordAction.ignore, profileRatingRecordAction(.{
         .verified_result = true,
@@ -1061,12 +1147,18 @@ test "remote result packet policy ignores duplicates instead of advancing finish
     try std.testing.expectEqual(RemoteResultPacketAction.reject_conflict, remoteResultPacketAction(result, conflict));
 }
 
-test "profile rating waits through verified drain until the counted terminal transition" {
+test "profile rating waits through peer-agreed drain until the counted terminal transition" {
+    try std.testing.expectEqual(ResultFinishAction.start_verified_drain, resultFinishAction(.{
+        .remote_result_status = .validated,
+        .has_local_outcome = true,
+        .sent_local_result = true,
+    }));
     try std.testing.expectEqual(ResultFinishAction.wait_for_verified_drain, resultFinishAction(.{
         .remote_result_status = .validated,
         .has_local_outcome = true,
         .sent_local_result = true,
-        .result_drain_frames_left = 1,
+        .verified_result_drain_started = true,
+        .verified_result_drain_frames_left = 1,
     }));
     try std.testing.expectEqual(ProfileRatingRecordAction.ignore, profileRatingRecordAction(.{
         .verified_result = true,
@@ -1080,15 +1172,22 @@ test "profile rating waits through verified drain until the counted terminal tra
         .remote_result_status = .validated,
         .has_local_outcome = true,
         .sent_local_result = true,
+        .verified_result_drain_started = true,
     }));
     try std.testing.expectEqual(ProfileRatingRecordAction.record, profileRatingRecordAction(.{
         .verified_result = true,
         .has_local_outcome = true,
         .final_counted_transition = true,
     }));
+    try std.testing.expectEqual(ProfileRatingRecordAction.ignore, profileRatingRecordAction(.{
+        .verified_result = true,
+        .has_local_outcome = true,
+        .final_counted_transition = true,
+        .already_recorded = true,
+    }));
 }
 
-test "result finish policy separates verified completion from unverified local outcome" {
+test "result finish policy separates peer-agreed completion from unagreed local outcome" {
     try std.testing.expectEqual(ResultFinishAction.no_local_outcome, resultFinishAction(.{}));
     try std.testing.expectEqual(ResultFinishAction.send_local_result, resultFinishAction(.{
         .has_local_outcome = true,
@@ -1096,7 +1195,7 @@ test "result finish policy separates verified completion from unverified local o
     try std.testing.expectEqual(ResultFinishAction.wait_for_remote_result, resultFinishAction(.{
         .has_local_outcome = true,
         .sent_local_result = true,
-        .result_drain_frames_left = 1,
+        .remote_result_wait_frames_left = 1,
     }));
     try std.testing.expectEqual(ResultFinishAction.finish_unverified_timeout, resultFinishAction(.{
         .has_local_outcome = true,
@@ -1111,16 +1210,61 @@ test "result finish policy separates verified completion from unverified local o
         .remote_result_status = .validated,
         .has_local_outcome = true,
     }));
+    try std.testing.expectEqual(ResultFinishAction.start_verified_drain, resultFinishAction(.{
+        .remote_result_status = .validated,
+        .has_local_outcome = true,
+        .sent_local_result = true,
+    }));
     try std.testing.expectEqual(ResultFinishAction.wait_for_verified_drain, resultFinishAction(.{
         .remote_result_status = .validated,
         .has_local_outcome = true,
         .sent_local_result = true,
-        .result_drain_frames_left = 1,
+        .verified_result_drain_started = true,
+        .verified_result_drain_frames_left = 1,
     }));
     try std.testing.expectEqual(ResultFinishAction.finish_verified, resultFinishAction(.{
         .remote_result_status = .validated,
         .has_local_outcome = true,
         .sent_local_result = true,
+        .verified_result_drain_started = true,
+    }));
+}
+
+test "timeout-edge peer result starts a fresh post-agreement drain" {
+    try std.testing.expectEqual(ResultFinishAction.start_verified_drain, resultFinishAction(.{
+        .remote_result_status = .validated,
+        .has_local_outcome = true,
+        .sent_local_result = true,
+        .remote_result_wait_frames_left = 0,
+        .verified_result_drain_started = false,
+    }));
+    try std.testing.expectEqual(ResultFinishAction.wait_for_verified_drain, resultFinishAction(.{
+        .remote_result_status = .validated,
+        .has_local_outcome = true,
+        .sent_local_result = true,
+        .remote_result_wait_frames_left = 0,
+        .verified_result_drain_started = true,
+        .verified_result_drain_frames_left = 2,
+    }));
+}
+
+test "fresh mode is locked while result completion can still receive terminal packets" {
+    try std.testing.expect(canSwitchToFreshModeFromOnline(.{}));
+    try std.testing.expect(!canSwitchToFreshModeFromOnline(.{
+        .completion = .{ .has_local_outcome = true },
+    }));
+    try std.testing.expect(!canSwitchToFreshModeFromOnline(.{
+        .completion = .{ .sent_result = true },
+    }));
+    try std.testing.expect(!canSwitchToFreshModeFromOnline(.{
+        .completion = .{ .pending_remote_result = true },
+    }));
+    try std.testing.expect(!canSwitchToFreshModeFromOnline(.{
+        .completion = .{ .result_drain_active = true },
+    }));
+    try std.testing.expect(canSwitchToFreshModeFromOnline(.{
+        .terminal = true,
+        .completion = .{ .result_drain_active = true },
     }));
 }
 
@@ -1148,20 +1292,31 @@ test "terminal packet drain policy waits before room leave" {
 test "transport health policy maps terminal receive and send failures" {
     try std.testing.expectEqual(TransportHealthAction.fail_queue_full, transportHealthAction(.{
         .status = .connected,
-        .last_error = .queue_full,
+        .health_error = .queue_full,
+    }));
+    try std.testing.expectEqual(TransportHealthAction.fail_packet_too_large, transportHealthAction(.{
+        .status = .connected,
+        .health_error = .packet_too_large,
+    }));
+    try std.testing.expectEqual(TransportHealthAction.fail_send_failed, transportHealthAction(.{
+        .status = .connected,
+        .health_error = .send_failed,
+    }));
+    try std.testing.expectEqual(TransportHealthAction.none, transportHealthAction(.{
+        .status = .connected,
+        .health_error = .send_failed,
+        .ignore_async_send_failure = true,
     }));
     try std.testing.expectEqual(TransportHealthAction.fail_packet_too_large, transportHealthAction(.{
         .status = .connected,
         .last_error = .packet_too_large,
-    }));
-    try std.testing.expectEqual(TransportHealthAction.fail_send_failed, transportHealthAction(.{
-        .status = .connected,
-        .last_error = .send_failed,
-    }));
-    try std.testing.expectEqual(TransportHealthAction.none, transportHealthAction(.{
-        .status = .connected,
-        .last_error = .send_failed,
+        .health_error = .send_failed,
         .ignore_async_send_failure = true,
+    }));
+    try std.testing.expectEqual(TransportHealthAction.fail_queue_full, transportHealthAction(.{
+        .status = .connected,
+        .last_error = .queue_full,
+        .health_error = .missing_js,
     }));
     try std.testing.expectEqual(TransportHealthAction.disconnected, transportHealthAction(.{
         .status = .connected,
@@ -1187,9 +1342,13 @@ test "transport health policy maps terminal receive and send failures" {
         .last_error = .none,
         .peer_leave_observed = true,
     }));
+    try std.testing.expectEqual(TransportHealthAction.fail_queue_full, transportHealthAction(.{
+        .status = .busy,
+        .health_error = .queue_full,
+    }));
     try std.testing.expectEqual(TransportHealthAction.fail_extra_peer, transportHealthAction(.{
         .status = .busy,
-        .last_error = .queue_full,
+        .last_error = .busy,
     }));
 }
 
@@ -1365,6 +1524,7 @@ test "small fake packet exchange through two peers keeps state hashes equal" {
     const setup_bytes = try host.encodeSetupPacket();
     try joiner.acceptSetupBytes(setup_bytes.slice());
     const ack_bytes = try joiner.encodeJoinerAck();
+    try joiner.markJoinerAckSent();
     try host.acceptAckBytes(ack_bytes.slice());
 
     const p1 = if (host.peer) |*peer| peer else return error.PeerUnavailable;

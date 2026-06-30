@@ -10,12 +10,21 @@ const exportBlock = "export {\n  joinRoom,\n  selfId\n};";
 const instrumented = source.replace(
   exportBlock,
   "export {\n" +
+    "  SharedPeerManager,\n" +
     "  createActionWireManager,\n" +
     "  nonceIndex,\n" +
     "  payloadIndex,\n" +
     "  progressIndex,\n" +
     "  tagIndex,\n" +
     "  typeIndex,\n" +
+    "  unwrapFrame,\n" +
+    "  wrapRoomFrame,\n" +
+    "  wrapRoomPresenceFrame,\n" +
+    "  zigfallRoomFrameMaxPayloadBytes,\n" +
+    "  zigfallSharedPendingRoomBytesLimit,\n" +
+    "  zigfallSharedPendingRoomFramesPerTokenLimit,\n" +
+    "  zigfallSharedPendingRoomTokenLimit,\n" +
+    "  zigfallSharedRemoteRoomTokenLimit,\n" +
     "  joinRoom,\n" +
     "  selfId\n" +
     "};",
@@ -25,12 +34,21 @@ assert.notEqual(instrumented, source, "expected Trystero bundle export block was
 
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(instrumented).toString("base64")}`;
 const {
+  SharedPeerManager,
   createActionWireManager,
   nonceIndex,
   payloadIndex,
   progressIndex,
   tagIndex,
   typeIndex,
+  unwrapFrame,
+  wrapRoomFrame,
+  wrapRoomPresenceFrame,
+  zigfallRoomFrameMaxPayloadBytes,
+  zigfallSharedPendingRoomBytesLimit,
+  zigfallSharedPendingRoomFramesPerTokenLimit,
+  zigfallSharedPendingRoomTokenLimit,
+  zigfallSharedRemoteRoomTokenLimit,
 } = await import(moduleUrl);
 
 const encoder = new TextEncoder();
@@ -38,6 +56,7 @@ const peerId = "peer-a";
 const actionType = "pkt";
 const controlActionType = "@_signal";
 const nonce = 0x1234;
+const validRoomToken = "a".repeat(64);
 const BinaryTag = 1 << 2;
 const LastTag = 1;
 const MetaTag = 1 << 1;
@@ -87,6 +106,41 @@ function makeFrame({
     frame.set(payloadBytes, payloadIndex);
   }
   return frame;
+}
+
+function makeSharedPeerFixture() {
+  const manager = new SharedPeerManager();
+  const peer = {
+    created: 1,
+    isDead: false,
+    connection: { connectionState: "connected", iceConnectionState: "connected" },
+    channel: { readyState: "open" },
+    offerPromise: Promise.resolve(),
+    handlers: null,
+    sent: [],
+    setHandlers(handlers) {
+      this.handlers = handlers;
+    },
+    sendData(data) {
+      this.sent.push(data);
+    },
+    destroy() {
+      this.isDead = true;
+    },
+    getOffer() {},
+    signal() {},
+    addStream() {},
+    removeStream() {},
+    addTrack() {},
+    removeTrack() {},
+    replaceTrack() {},
+  };
+  const shared = manager.register("zigfall-test-app", "peer-a", peer, 60_000);
+  return { manager, peer, shared };
+}
+
+function hexToken(index) {
+  return index.toString(16).padStart(64, "0");
 }
 
 {
@@ -460,4 +514,111 @@ function makeFrame({
   assert.equal(deliveries.length, 0);
 }
 
-console.log("ok: Trystero receive hardening preserves 512-byte pkt delivery and bounds hostile pkt/control chunk buffering");
+{
+  const payload = Uint8Array.from([1, 2, 3]);
+  const decoded = unwrapFrame(wrapRoomFrame(validRoomToken, payload));
+  assert.equal(decoded.type, "room");
+  assert.equal(decoded.roomToken, validRoomToken);
+  assert.deepEqual(Array.from(new Uint8Array(decoded.payload)), [1, 2, 3]);
+
+  assert.equal(unwrapFrame(wrapRoomFrame("__proto__", payload)), null, "prototype-looking room tokens must be rejected before object lookup");
+  assert.equal(unwrapFrame(wrapRoomFrame("A".repeat(64), payload)), null, "room tokens must be canonical lowercase hex");
+  assert.equal(unwrapFrame(wrapRoomFrame("a".repeat(63), payload)), null, "short room tokens must be rejected");
+  assert.equal(
+    unwrapFrame(wrapRoomFrame(validRoomToken, new Uint8Array(zigfallRoomFrameMaxPayloadBytes + 1))),
+    null,
+    "oversized room-frame payloads must be dropped before payload copy/retention",
+  );
+
+  const presence = unwrapFrame(wrapRoomPresenceFrame(validRoomToken, true));
+  assert.equal(presence.type, "presence");
+  assert.equal(presence.roomToken, validRoomToken);
+  assert.equal(presence.isPresent, true);
+
+  const badFlag = wrapRoomPresenceFrame(validRoomToken, true);
+  badFlag[1] = 2;
+  assert.equal(unwrapFrame(badFlag), null, "presence flags other than 0/1 must be rejected");
+
+  const trailingPresence = new Uint8Array(badFlag.byteLength + 1);
+  trailingPresence.set(wrapRoomPresenceFrame(validRoomToken, false));
+  assert.equal(unwrapFrame(trailingPresence), null, "presence frames must not carry trailing payload bytes");
+}
+
+{
+  const { manager, shared } = makeSharedPeerFixture();
+  assert.doesNotThrow(() => {
+    manager.dispatchData(shared, wrapRoomFrame("__proto__", Uint8Array.from([0x99])));
+  }, "prototype-looking room tokens must not throw in shared-peer dispatch");
+  assert.equal(shared.pendingDataByToken.size, 0);
+}
+
+{
+  const { manager, shared } = makeSharedPeerFixture();
+  for (let i = 0; i < zigfallSharedPendingRoomTokenLimit + 5; i += 1) {
+    manager.dispatchData(shared, wrapRoomFrame(hexToken(i), Uint8Array.from([i & 0xff])));
+  }
+  assert.equal(
+    shared.pendingDataByToken.size,
+    zigfallSharedPendingRoomTokenLimit,
+    "unknown room-token pending queues must be capped globally",
+  );
+
+  const perToken = hexToken(0x4000);
+  const { manager: perTokenManager, shared: perTokenShared } = makeSharedPeerFixture();
+  for (let i = 0; i < zigfallSharedPendingRoomFramesPerTokenLimit + 5; i += 1) {
+    perTokenManager.dispatchData(perTokenShared, wrapRoomFrame(perToken, Uint8Array.from([i & 0xff])));
+  }
+  assert.equal(
+    perTokenShared.pendingDataByToken.get(perToken).length,
+    zigfallSharedPendingRoomFramesPerTokenLimit,
+    "unknown room-token pending queues must be capped per token",
+  );
+
+  const bytesManagerFixture = makeSharedPeerFixture();
+  const largePayload = new Uint8Array(Math.min(zigfallRoomFrameMaxPayloadBytes, 64 * 1024));
+  for (let i = 0; i < 16; i += 1) {
+    bytesManagerFixture.manager.dispatchData(bytesManagerFixture.shared, wrapRoomFrame(hexToken(0x5000 + i), largePayload));
+  }
+  let pendingBytes = 0;
+  bytesManagerFixture.shared.pendingDataByToken.forEach((frames) => frames.forEach((frame) => {
+    pendingBytes += frame.byteLength;
+  }));
+  assert(pendingBytes <= zigfallSharedPendingRoomBytesLimit, "unknown room-token pending payload bytes must be capped");
+}
+
+{
+  const { manager, shared } = makeSharedPeerFixture();
+  for (let i = 0; i < zigfallSharedRemoteRoomTokenLimit + 5; i += 1) {
+    manager.dispatchData(shared, wrapRoomPresenceFrame(hexToken(0x6000 + i), true));
+  }
+  assert.equal(
+    shared.remoteRoomTokens.size,
+    zigfallSharedRemoteRoomTokenLimit,
+    "remote presence tokens must be capped globally",
+  );
+
+  const pendingToken = hexToken(0x7000);
+  manager.dispatchData(shared, wrapRoomFrame(pendingToken, Uint8Array.from([1])));
+  assert.equal(shared.pendingDataByToken.has(pendingToken), true);
+  manager.dispatchData(shared, wrapRoomPresenceFrame(pendingToken, false));
+  assert.equal(shared.pendingDataByToken.has(pendingToken), false, "presence leave should clear unknown-token pending data");
+}
+
+{
+  const { manager, shared } = makeSharedPeerFixture();
+  const deliveries = [];
+  const { proxy } = manager.bind("room-a", Promise.resolve(validRoomToken), shared, { onDetach: () => {} });
+  proxy.setHandlers({
+    data(payload) {
+      deliveries.push(Array.from(new Uint8Array(payload)));
+    },
+  });
+  manager.dispatchData(shared, wrapRoomFrame(validRoomToken, Uint8Array.from([7, 8, 9])));
+  assert.equal(shared.pendingDataByToken.get(validRoomToken).length, 1);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(deliveries, [[7, 8, 9]], "bounded unknown-token data should flush when the matching room token resolves");
+  assert.equal(shared.pendingDataByToken.has(validRoomToken), false);
+}
+
+console.log("ok: Trystero receive hardening preserves 512-byte pkt delivery and bounds hostile pkt/control/shared-room buffering");

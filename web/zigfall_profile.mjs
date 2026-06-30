@@ -304,7 +304,11 @@ function createZigfallProfile({
   function saveCurrentProfile() {
     if (!storage) return false;
     try {
-      storage.setItem(StorageKey, serializeProfileCard(profile));
+      const serialized = serializeProfileCard(profile);
+      storage.setItem(StorageKey, serialized);
+      if (storage.getItem(StorageKey) !== serialized) {
+        throw profileError(ErrorCode.storageFailed, "localStorage profile save verification failed");
+      }
       return true;
     } catch (err) {
       markMemoryOnly(`localStorage profile save failed: ${errorMessage(err)}`);

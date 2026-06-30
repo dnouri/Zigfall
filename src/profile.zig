@@ -6,8 +6,8 @@
 //! display-only metadata: callers must not feed player IDs, nicknames, ratings,
 //! or stats into deterministic match seeds, slots, state hashes, result
 //! authority, or lockstep state. Rating/stat mutation is exposed only through a
-//! verified completed-result helper; disconnects, desyncs, and unverified results
-//! have no result variant here.
+//! completed-result helper for peer-agreed outcomes; disconnects, desyncs, and
+//! incomplete result exchanges have no result variant here.
 
 const std = @import("std");
 
@@ -249,7 +249,7 @@ test "rating updates clamp to explicit local rating bounds" {
     try std.testing.expectEqual(@as(u32, 1), low.losses);
 }
 
-test "verified result helper increments exactly one stat per call" {
+test "completed result helper increments exactly one stat per call" {
     var win_card = ProfileCard.default();
     win_card.applyVerifiedResult(DefaultRating, .win);
     try std.testing.expectEqual(@as(u32, 1), win_card.wins);
@@ -269,7 +269,7 @@ test "verified result helper increments exactly one stat per call" {
     try std.testing.expectEqual(@as(u32, 1), draw_card.draws);
 }
 
-test "only verified gameplay outcomes are modeled for stat updates" {
+test "only completed gameplay outcomes are modeled for stat updates" {
     try std.testing.expectEqual(@as(usize, 3), std.meta.fields(VerifiedResult).len);
     try std.testing.expectEqual(@as(u8, 1), @intFromEnum(VerifiedResult.win));
     try std.testing.expectEqual(@as(u8, 2), @intFromEnum(VerifiedResult.loss));

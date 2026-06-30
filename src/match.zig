@@ -447,8 +447,7 @@ pub const Match = struct {
         var attack_lines_by_attacker = [_]u32{0} ** PlayerCount;
         var incoming_lines_by_recipient = [_]u32{0} ** PlayerCount;
 
-        // Option B phase order:
-        // - snapshot generated attacks before mutating pending queues;
+        // Resolve same-frame garbage from immutable attack snapshots:
         // - cancel only each attacker's pre-existing pending garbage;
         // - queue remainders for recipients before non-clearing insertion.
         // Same-frame remainders can insert immediately but cannot cross-cancel.

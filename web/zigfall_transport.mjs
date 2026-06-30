@@ -70,21 +70,48 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
   let currentStatus = Status.disconnected;
   let lastError = ErrorCode.none;
   let lastErrorMessage = "";
+  let healthError = ErrorCode.none;
+  let healthErrorMessage = "";
   let connectionGeneration = 0;
 
   function setStatus(status) {
     currentStatus = status;
   }
 
+  function isReceiveFatalHealthError(code) {
+    return code === ErrorCode.packetTooLarge || code === ErrorCode.queueFull;
+  }
+
+  function isFatalHealthError(code) {
+    return isReceiveFatalHealthError(code) || code === ErrorCode.sendFailed;
+  }
+
+  function shouldLatchHealthError(code) {
+    if (!isFatalHealthError(code)) return false;
+    if (healthError === ErrorCode.none) return true;
+    return healthError === ErrorCode.sendFailed && isReceiveFatalHealthError(code);
+  }
+
   function setError(code, message = "") {
+    const text = String(message || "");
     lastError = code;
-    lastErrorMessage = String(message || "");
+    lastErrorMessage = text;
+    if (shouldLatchHealthError(code)) {
+      healthError = code;
+      healthErrorMessage = text;
+    }
     return code;
   }
 
   function clearError() {
     lastError = ErrorCode.none;
     lastErrorMessage = "";
+  }
+
+  function clearAllErrors() {
+    clearError();
+    healthError = ErrorCode.none;
+    healthErrorMessage = "";
   }
 
   function hasSelectedPeer() {
@@ -245,7 +272,7 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
     hasSelectedPeerOnce = false;
     incoming = [];
     setStatus(Status.disconnected);
-    clearError();
+    clearAllErrors();
   }
 
   function connect(nextRoomId) {
@@ -403,9 +430,13 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
     errorCode: () => lastError,
     errorName,
     errorMessage: () => lastErrorMessage,
+    healthErrorCode: () => healthError,
+    healthErrorName: () => errorName(healthError),
+    healthErrorMessage: () => healthErrorMessage,
     peerCount: () => peers.size,
     peerIds: () => Array.from(peers),
     selectedPeerId: () => selectedPeerId,
+    hadPeer: () => hasSelectedPeerOnce,
     extraPeerCount,
     queuedPacketCount: () => incoming.length,
     roomId: () => roomId,

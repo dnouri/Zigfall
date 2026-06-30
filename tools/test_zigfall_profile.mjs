@@ -70,6 +70,17 @@ function storageThatFailsAfterInitialSave() {
   };
 }
 
+function lyingStorage() {
+  return {
+    getItem() {
+      return null;
+    },
+    setItem() {
+      // Deliberately ignore writes.
+    },
+  };
+}
+
 function freshMemoryOnlyProfile() {
   return createZigfallProfile({ storageImpl: null, cryptoImpl: deterministicCrypto() });
 }
@@ -140,6 +151,16 @@ function freshMemoryOnlyProfile() {
   assert.equal(profile.statusCode(), Status.memoryOnly, "mutation-time save failure must be visible to Zig/UI");
   assert.match(profile.lastErrorMessage(), /save failed|quota exceeded/i);
   assert.equal(storage.snapshot(), persistedBeforeMutation, "failed mutation must not be reported as persisted");
+}
+
+{
+  const profile = createZigfallProfile({ storageImpl: lyingStorage(), cryptoImpl: deterministicCrypto() });
+
+  assert.equal(profile.statusCode(), Status.memoryOnly, "storage write verification failure must not claim durability");
+  assert.match(profile.lastErrorMessage(), /save verification failed/i);
+  const card = profile.setNickname("Verified In Memory");
+  assert.equal(card.nickname, "Verified In Memory");
+  assert.equal(profile.statusCode(), Status.memoryOnly);
 }
 
 {

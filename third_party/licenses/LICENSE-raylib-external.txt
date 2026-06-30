@@ -4,14 +4,14 @@ Raylib embedded/external component notices
 Source and scope
 ----------------
 
-This tracked notice snapshot is copied from the pinned raylib 6.0 Zig package
-used through raylib-zig:
-
-  zig-pkg/raylib-6.0.0-whq8uCSwLgWWeF3ec3dbG6Rr36SLFL-s2WJ1Q_2E22Bb/
+This tracked notice snapshot summarizes upstream license notices from the
+`src/external` tree of the pinned raylib 6.0 package used through raylib-zig.
+It is portable provenance rather than a reference to any local package cache.
 
 It covers raylib `src/external` components that the default raylib-zig build can
 compile into Zigfall native artifacts and/or the web WASM build through raylib's
-default modules and platform support. The source files remain authoritative.
+default modules and platform support. The upstream source files and their license
+headers remain authoritative.
 
 Covered raylib external source paths include:
 
