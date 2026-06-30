@@ -12,6 +12,13 @@ const RetiringSelectedPeerDrainMs = 2000;
 const ProtocolVersion = 2;
 const ProfilePacketType = 8;
 const AppId = "zigfall-trystero-v2";
+const TrysteroRelayUrls = Object.freeze([
+  "wss://nostr.sathoarder.com",
+  "wss://nostr.vulpem.com",
+  "wss://relay.libernet.app",
+  "wss://nostr.data.haus",
+  "wss://strfry.shock.network",
+]);
 const PacketActionName = "pkt";
 const noop = () => {};
 
@@ -258,7 +265,7 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
 
     try {
       const generation = connectionGeneration;
-      const nextRoom = joinRoomImpl({ appId: AppId }, validatedRoomId);
+      const nextRoom = joinRoomImpl({ appId: AppId, relayConfig: { urls: TrysteroRelayUrls } }, validatedRoomId);
       const nextPacketAction = nextRoom.makeAction(PacketActionName);
 
       room = nextRoom;
@@ -409,4 +416,4 @@ const api = createZigfallTransport();
 
 globalThis.ZigfallTransport = api;
 
-export { api as ZigfallTransport, AppId, ErrorCode, PacketActionName, ProfilePacketType, ProtocolVersion, Status, createZigfallTransport };
+export { api as ZigfallTransport, AppId, ErrorCode, PacketActionName, ProfilePacketType, ProtocolVersion, Status, TrysteroRelayUrls, createZigfallTransport };

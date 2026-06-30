@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import assert from "node:assert/strict";
-import { createZigfallTransport, ErrorCode, Status } from "../web/zigfall_transport.mjs";
+import { createZigfallTransport, ErrorCode, Status, TrysteroRelayUrls } from "../web/zigfall_transport.mjs";
 
 function makeFakeAction({ sendImpl = null } = {}) {
   return {
@@ -64,6 +64,15 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
   const room = rooms[0];
   const action = room.action;
   assert.equal(room.config.appId, "zigfall-trystero-v2", "transport app namespace must isolate protocol v2 clients");
+  assert.equal(room.config.relayConfig.urls, TrysteroRelayUrls, "transport must pass the curated Nostr relay list to Trystero");
+  assert.deepEqual(TrysteroRelayUrls, [
+    "wss://nostr.sathoarder.com",
+    "wss://nostr.vulpem.com",
+    "wss://relay.libernet.app",
+    "wss://nostr.data.haus",
+    "wss://strfry.shock.network",
+  ]);
+  assert.equal(Object.isFrozen(TrysteroRelayUrls), true, "relay list should remain centralized and immutable");
   assert.equal(transport.ProtocolVersion, 2, "transport profile fast-path must track the Zig wire protocol version");
 
   room.join("peer-a");
