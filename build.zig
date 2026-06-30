@@ -5,6 +5,33 @@ const rlz = @import("raylib_zig");
 
 const emsdk = rlz.emsdk;
 
+const InstallCopy = struct {
+    src_path: []const u8,
+    dest_path: []const u8,
+};
+
+const third_party_license_artifacts = [_]InstallCopy{
+    .{ .src_path = "third_party/licenses/README.md", .dest_path = "README.md" },
+    .{ .src_path = "third_party/licenses/AUTHORS-emscripten.txt", .dest_path = "AUTHORS-emscripten.txt" },
+    .{ .src_path = "third_party/licenses/LICENSE-emsdk.txt", .dest_path = "LICENSE-emsdk.txt" },
+    .{ .src_path = "third_party/licenses/LICENSE-emscripten.txt", .dest_path = "LICENSE-emscripten.txt" },
+    .{ .src_path = "third_party/licenses/LICENSE-emscripten-compiler-rt.txt", .dest_path = "LICENSE-emscripten-compiler-rt.txt" },
+    .{ .src_path = "third_party/licenses/LICENSE-emscripten-musl.txt", .dest_path = "LICENSE-emscripten-musl.txt" },
+    .{ .src_path = "third_party/licenses/LICENSE-raygui.txt", .dest_path = "LICENSE-raygui.txt" },
+    .{ .src_path = "third_party/licenses/LICENSE-raylib.txt", .dest_path = "LICENSE-raylib.txt" },
+    .{ .src_path = "third_party/licenses/LICENSE-raylib-external.txt", .dest_path = "LICENSE-raylib-external.txt" },
+    .{ .src_path = "third_party/licenses/LICENSE-raylib-zig.txt", .dest_path = "LICENSE-raylib-zig.txt" },
+    .{ .src_path = "third_party/licenses/LICENSE-zemscripten.txt", .dest_path = "LICENSE-zemscripten.txt" },
+    .{ .src_path = "third_party/licenses/LICENSE-zig.txt", .dest_path = "LICENSE-zig.txt" },
+};
+
+const browser_vendor_notice_artifacts = [_]InstallCopy{
+    .{ .src_path = "web/vendor/README.md", .dest_path = "README.md" },
+    .{ .src_path = "web/vendor/LICENSE-trystero.txt", .dest_path = "LICENSE-trystero.txt" },
+    .{ .src_path = "web/vendor/LICENSE-noble-secp256k1.txt", .dest_path = "LICENSE-noble-secp256k1.txt" },
+    .{ .src_path = "web/vendor/LICENSE-esbuild.txt", .dest_path = "LICENSE-esbuild.txt" },
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -165,14 +192,12 @@ pub fn build(b: *std.Build) void {
             .install_dir = install_dir,
         });
         b.getInstallStep().dependOn(emcc_step);
-        installWebArtifact(b, install_dir, "web/zigfall_transport.mjs", "zigfall_transport.mjs");
-        installWebArtifact(b, install_dir, "web/zigfall_invite.mjs", "zigfall_invite.mjs");
-        installWebArtifact(b, install_dir, "web/zigfall_profile.mjs", "zigfall_profile.mjs");
-        installWebArtifact(b, install_dir, "web/vendor/trystero-nostr.bundle.mjs", "vendor/trystero-nostr.bundle.mjs");
-        installWebArtifact(b, install_dir, "web/vendor/README.md", "vendor/README.md");
-        installWebArtifact(b, install_dir, "web/vendor/LICENSE-trystero.txt", "vendor/LICENSE-trystero.txt");
-        installWebArtifact(b, install_dir, "web/vendor/LICENSE-noble-secp256k1.txt", "vendor/LICENSE-noble-secp256k1.txt");
-        installWebArtifact(b, install_dir, "web/vendor/LICENSE-esbuild.txt", "vendor/LICENSE-esbuild.txt");
+        installFileArtifact(b, install_dir, "web/zigfall_transport.mjs", "zigfall_transport.mjs");
+        installFileArtifact(b, install_dir, "web/zigfall_invite.mjs", "zigfall_invite.mjs");
+        installFileArtifact(b, install_dir, "web/zigfall_profile.mjs", "zigfall_profile.mjs");
+        installFileArtifact(b, install_dir, "web/vendor/trystero-nostr.bundle.mjs", "vendor/trystero-nostr.bundle.mjs");
+        installFileArtifact(b, install_dir, "web/vendor/trystero-nostr.bundle.mjs.sha256", "vendor/trystero-nostr.bundle.mjs.sha256");
+        installLegalArtifacts(b, install_dir, "");
 
         const emrun_step = emsdk.emrunStep(
             b,
@@ -194,6 +219,7 @@ pub fn build(b: *std.Build) void {
             exe.use_lld = false;
         }
         b.installArtifact(exe);
+        installLegalArtifacts(b, .prefix, "share/zigfall");
 
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(b.getInstallStep());
@@ -262,7 +288,22 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_web_profile_tests.step);
 }
 
-fn installWebArtifact(
+fn installLegalArtifacts(b: *std.Build, install_dir: std.Build.InstallDir, dest_root: []const u8) void {
+    installFileArtifact(b, install_dir, "LICENSE", joinInstallPath(b, dest_root, "LICENSE"));
+    installFileArtifact(b, install_dir, "THIRD_PARTY_NOTICES.md", joinInstallPath(b, dest_root, "THIRD_PARTY_NOTICES.md"));
+
+    const licenses_dest = joinInstallPath(b, dest_root, "licenses");
+    for (third_party_license_artifacts) |artifact| {
+        installFileArtifact(b, install_dir, artifact.src_path, joinInstallPath(b, licenses_dest, artifact.dest_path));
+    }
+
+    const vendor_dest = joinInstallPath(b, dest_root, "vendor");
+    for (browser_vendor_notice_artifacts) |artifact| {
+        installFileArtifact(b, install_dir, artifact.src_path, joinInstallPath(b, vendor_dest, artifact.dest_path));
+    }
+}
+
+fn installFileArtifact(
     b: *std.Build,
     install_dir: std.Build.InstallDir,
     src_path: []const u8,
@@ -270,6 +311,11 @@ fn installWebArtifact(
 ) void {
     const install_file = b.addInstallFileWithDir(b.path(src_path), install_dir, dest_path);
     b.getInstallStep().dependOn(&install_file.step);
+}
+
+fn joinInstallPath(b: *std.Build, prefix: []const u8, suffix: []const u8) []const u8 {
+    if (prefix.len == 0) return suffix;
+    return b.fmt("{s}/{s}", .{ prefix, suffix });
 }
 
 fn fileSha256Hex(b: *std.Build, path: []const u8) []const u8 {

@@ -10,4 +10,5 @@ printf 'npm %s\n' "$(npm --version)"
 npm ci
 npm run build
 npm run test:pkt-limit
-sha256sum trystero-nostr.bundle.mjs
+sha256sum trystero-nostr.bundle.mjs > trystero-nostr.bundle.mjs.sha256
+cat trystero-nostr.bundle.mjs.sha256

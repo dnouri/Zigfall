@@ -16,9 +16,9 @@ pub const DefaultPlayerId = "anonymous";
 
 pub const MaxNicknameBytes: usize = 24;
 pub const MaxPlayerIdBytes: usize = 64;
-/// Kept well below the current protocol packet cap for a later display-only
-/// profile-card exchange. This module does not import protocol to stay pure and
-/// reusable in browser storage tests.
+/// Kept well below the current protocol packet cap for display-only profile-card
+/// exchange. This module does not import protocol to stay pure and reusable in
+/// browser storage tests.
 pub const MaxSerializedCardBytes: usize = 256;
 
 pub const MinRating: Rating = 0;

@@ -2,12 +2,11 @@
 
 //! Browser-free online match setup/ack session layer.
 //!
-//! This module owns only the Phase 6 lifecycle handshake around the existing
-//! deterministic protocol and lockstep peer. It does not import raylib or any
-//! browser API. Transport code should move encoded `protocol.Setup` and
-//! `protocol.Ack` packets as opaque bytes, then hand decoded lifecycle packets
-//! to `Session` before runtime input/state-hash packets are routed to
-//! `lockstep.Peer`.
+//! This module owns browser-free online lifecycle policy around the deterministic
+//! protocol and lockstep peer. It does not import raylib or any browser API.
+//! Transport code should move encoded setup/ack/profile/result/control packets
+//! as opaque bytes, then hand decoded lifecycle packets to `Session` before
+//! runtime input/state-hash packets are routed to `lockstep.Peer`.
 
 const std = @import("std");
 const input = @import("input");

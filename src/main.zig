@@ -1408,6 +1408,8 @@ fn onlineMatchIdForRoom(room_id: []const u8) u64 {
 
 fn onlineSeed(comptime label: []const u8, room_id: []const u8) u64 {
     var hasher = std.hash.XxHash64.init(online_hash_seed);
+    // Legacy stable domain separator: do not rename for phase labels, because
+    // it would alter deterministic online match IDs and seeds for invite rooms.
     hasher.update("Zigfall.Phase6.Online.");
     hasher.update(label);
     hasher.update(".");

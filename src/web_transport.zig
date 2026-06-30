@@ -5,7 +5,7 @@
 //! Native builds intentionally expose stubs and never reference browser or
 //! Emscripten JS symbols. Web builds link `web/zigfall_transport_emscripten.js`,
 //! which forwards these extern calls to `globalThis.ZigfallTransport` from
-//! `web/zigfall_transport.mjs`. Packets are opaque Phase 4 protocol bytes.
+//! `web/zigfall_transport.mjs`. Packets are opaque Zigfall protocol bytes.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -219,7 +219,7 @@ test "native transport status is unavailable" {
 test "native transport stubs do not require browser JS" {
     if (is_web) return error.SkipZigTest;
 
-    try std.testing.expectError(error.Unavailable, connect("zigfall-phase5-local"));
+    try std.testing.expectError(error.Unavailable, connect("zigfall-transport-local-test"));
     disconnect();
 
     var packet = [_]u8{0} ** MaxPacketSize;

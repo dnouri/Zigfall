@@ -49,7 +49,7 @@ pub const InputMaskBits = struct {
     pub const restart_pressed: u16 = 1 << 11;
 };
 
-/// Version 1 reserves bits 12..15; decoders reject them instead of ignoring
+/// Protocol v2 reserves bits 12..15; decoders reject them instead of ignoring
 /// unknown future inputs.
 pub const KnownInputMask: u16 = 0x0fff;
 pub const NullInitialHole: u8 = 255;

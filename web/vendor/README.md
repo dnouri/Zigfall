@@ -1,12 +1,12 @@
 # Vendored Trystero browser bundle
 
-`trystero-nostr.bundle.mjs` is a checked-in browser ESM bundle used by Zigfall's web-only transport adapter. Production web builds copy this local file into `zig-out/web/vendor/`, so the deployed game does not import Trystero from a runtime CDN and native builds do not need Node/npm/Trystero.
+`trystero-nostr.bundle.mjs` is a checked-in browser ESM bundle used by Zigfall's web-only transport adapter. Production web builds copy this local file into `zig-out/web/vendor/`, so the deployed game does not import Trystero from a runtime CDN and native builds do not need Node/npm/Trystero. The bundle remains Trystero's Nostr strategy; Zigfall supplies its curated public Nostr relay URLs from `web/zigfall_transport.mjs` at runtime instead of relying on upstream defaults.
 
 ## Source versions
 
 Runtime bundle inputs are pinned by `package.json` and `package-lock.json`:
 
-- `trystero@0.25.2` (default Nostr strategy)
+- `trystero@0.25.2` (Nostr strategy bundle entry)
 - `@trystero-p2p/nostr@0.25.2`
 - `@trystero-p2p/core@0.25.2`
 - `@noble/secp256k1@3.1.0`
@@ -47,16 +47,17 @@ The script runs:
 npm ci
 npm run build
 npm run test:pkt-limit
-sha256sum trystero-nostr.bundle.mjs
+sha256sum trystero-nostr.bundle.mjs > trystero-nostr.bundle.mjs.sha256
+cat trystero-nostr.bundle.mjs.sha256
 ```
 
-Current generated artifact:
+Current generated artifact checksum is tracked in `trystero-nostr.bundle.mjs.sha256`:
 
 ```text
 3723fa68011b856f05cc47f35e1dba4581abb588b9236f3fe16309b5151f2063  trystero-nostr.bundle.mjs
 ```
 
-If the bundle changes intentionally, update this checksum, keep the lockfile in sync, and re-run the JavaScript regression plus the normal Zigfall native/web build checks.
+If the bundle changes intentionally, update `trystero-nostr.bundle.mjs.sha256`, keep the lockfile in sync, and re-run the JavaScript regression plus the normal Zigfall native/web build checks. The Pages workflow verifies this checksum in source and again after the bundle is copied into the web artifact.
 
 ## Licenses
 
