@@ -50,14 +50,18 @@ jobs:
           node --check web/zigfall_transport_emscripten.js
           node --check web/zigfall_invite.mjs
           node --check web/zigfall_invite_emscripten.js
+          node --check web/zigfall_profile.mjs
+          node --check web/zigfall_profile_emscripten.js
           node --check web/vendor/patch-trystero-bundle.mjs
           node --check web/vendor/trystero-nostr.bundle.mjs
           node --check tools/test_trystero_pkt_limit.mjs
           node --check tools/test_zigfall_transport_adapter.mjs
           node --check tools/test_zigfall_invite.mjs
+          node --check tools/test_zigfall_profile.mjs
           node tools/test_trystero_pkt_limit.mjs
           node tools/test_zigfall_transport_adapter.mjs
           node tools/test_zigfall_invite.mjs
+          node tools/test_zigfall_profile.mjs
 
       - name: Build native
         run: zig build

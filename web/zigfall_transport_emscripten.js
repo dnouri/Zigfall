@@ -54,6 +54,14 @@ mergeInto(LibraryManager.library, {
     return transport.send(packet);
   },
 
+  zigfall_transport_send_best_effort__deps: ["$ZigfallTransportShim"],
+  zigfall_transport_send_best_effort: function(packetPtr, packetLen) {
+    var transport = ZigfallTransportShim.transport();
+    if (!transport || typeof transport.sendBestEffort !== "function") return ZigfallTransportShim.ErrorCode.missingJs;
+    var packet = new Uint8Array(HEAPU8.subarray(packetPtr, packetPtr + packetLen));
+    return transport.sendBestEffort(packet);
+  },
+
   zigfall_transport_poll__deps: ["$ZigfallTransportShim"],
   zigfall_transport_poll: function(outPtr, outCap) {
     var transport = ZigfallTransportShim.transport();

@@ -250,7 +250,7 @@ pub const Peer = struct {
                 } };
                 return error.StateHashMismatch;
             },
-            .setup, .ack, .disconnect, .result => {},
+            .setup, .ack, .disconnect, .result, .profile => {},
         }
     }
 

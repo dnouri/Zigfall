@@ -13,6 +13,7 @@ const std = @import("std");
 const input = @import("input");
 const lockstep = @import("lockstep");
 const match_mod = @import("match");
+const profile = @import("profile");
 const protocol = @import("protocol");
 
 pub const DefaultInputDelayFrames: u16 = 8;
@@ -45,6 +46,7 @@ pub const LifecycleError = error{
     InvalidInputDelay,
     InvalidLifecycleSenderSlot,
     InvalidResultSenderSlot,
+    InvalidProfileSenderSlot,
     WrongMatchId,
     WrongRole,
     UnexpectedSetup,
@@ -74,7 +76,8 @@ pub const OnlineSessionError = LifecycleError ||
     match_mod.InvalidGarbageSettings ||
     lockstep.LockstepError ||
     protocol.EncodeError ||
-    protocol.DecodeError;
+    protocol.DecodeError ||
+    protocol.ProfileInitError;
 
 pub const EncodedPacket = lockstep.EncodedPacket;
 
@@ -178,6 +181,12 @@ pub const TransportHealthAction = enum {
     fail_packet_too_large,
     fail_queue_full,
     fail_send_failed,
+};
+
+pub const PacketDecodePolicy = enum {
+    decode_required,
+    decode_optional_profile,
+    ignore_stale,
 };
 
 pub const TransportHealthState = struct {
@@ -509,6 +518,59 @@ pub fn validateLifecycleSender(role: Role, sender_slot: u8) LifecycleError!void 
     if (sender_slot != remoteProtocolSlotForRole(role)) return error.InvalidLifecycleSenderSlot;
 }
 
+pub fn profilePacketFromCard(match_id: u64, sender_slot: u8, card: profile.ProfileCard) protocol.ProfileInitError!protocol.Profile {
+    return protocol.Profile.init(
+        match_id,
+        sender_slot,
+        card.playerId(),
+        card.nicknameText(),
+        card.rating,
+        card.wins,
+        card.losses,
+        card.draws,
+    );
+}
+
+pub fn encodeProfilePacket(match_id: u64, sender_slot: u8, card: profile.ProfileCard) OnlineSessionError!EncodedPacket {
+    return encodePacket(.{ .profile = try profilePacketFromCard(match_id, sender_slot, card) });
+}
+
+pub fn validateRemoteProfile(role: Role, match_id: u64, profile_packet: protocol.Profile) LifecycleError!void {
+    if (profile_packet.match_id != match_id) return error.WrongMatchId;
+    if (profile_packet.sender_slot != remoteProtocolSlotForRole(role)) return error.InvalidProfileSenderSlot;
+}
+
+pub fn acceptRemoteProfile(role: Role, match_id: u64, profile_packet: protocol.Profile) LifecycleError!profile.ProfileCard {
+    try validateRemoteProfile(role, match_id, profile_packet);
+    return displayCardFromProfilePacket(profile_packet);
+}
+
+pub fn displayCardFromProfilePacket(profile_packet: protocol.Profile) profile.ProfileCard {
+    var card = profile.ProfileCard.default();
+    if (profile.isValidPlayerId(profile_packet.playerId())) {
+        card.setPlayerId(profile_packet.playerId()) catch {};
+    }
+    card.setNickname(profile_packet.nicknameBytes()) catch {};
+    if (profile_packet.rating <= profile.MaxRating) card.rating = profile_packet.rating;
+    card.wins = profile_packet.wins;
+    card.losses = profile_packet.losses;
+    card.draws = profile_packet.draws;
+    return card;
+}
+
+/// Decide whether a transport packet should be decoded as required gameplay /
+/// lifecycle data, decoded as optional profile metadata, or ignored as stale
+/// room noise. Profile packets are display-only, so callers can treat body
+/// decode errors from `.decode_optional_profile` as nonfatal notices.
+pub fn packetDecodePolicyForKnownMatch(current_match_id: ?u64, bytes: []const u8) protocol.DecodeError!PacketDecodePolicy {
+    const packet_type = try protocol.peekPacketType(bytes);
+    if (packet_type == .profile and bytes.len < protocol.HeaderSize) return .decode_optional_profile;
+    if (current_match_id) |match_id| {
+        if ((try protocol.peekMatchId(bytes)) != match_id) return .ignore_stale;
+    }
+    return if (packet_type == .profile) .decode_optional_profile else .decode_required;
+}
+
 /// Return true only when a caller already knows the active match id and this
 /// packet envelope belongs to it. A missing local match id is deliberately not
 /// treated as a match; joiners waiting for the first setup must handle that
@@ -523,8 +585,7 @@ pub fn packetMatchesKnownMatch(current_match_id: ?u64, bytes: []const u8) protoc
 /// packets. Once a match exists, nonmatching envelopes are stale room noise and
 /// should be ignored before body decoding can make wrong-match packets fatal.
 pub fn shouldIgnorePacketForKnownMatch(current_match_id: ?u64, bytes: []const u8) protocol.DecodeError!bool {
-    const match_id = current_match_id orelse return false;
-    return (try protocol.peekMatchId(bytes)) != match_id;
+    return (try packetDecodePolicyForKnownMatch(current_match_id, bytes)) == .ignore_stale;
 }
 
 pub fn resultOutcomeFromMatchOutcome(outcome: match_mod.MatchOutcome) protocol.ResultOutcome {
@@ -535,6 +596,37 @@ pub fn resultOutcomeFromMatchOutcome(outcome: match_mod.MatchOutcome) protocol.R
         },
         .draw => .draw,
     };
+}
+
+pub fn profileResultForLocalRole(role: Role, outcome: match_mod.MatchOutcome) profile.VerifiedResult {
+    return switch (outcome) {
+        .draw => .draw,
+        .winner => |winner| switch (role) {
+            .host => if (winner == HostPlayerIndex) .win else .loss,
+            .joiner => if (winner == JoinerPlayerIndex) .win else .loss,
+        },
+    };
+}
+
+pub fn opponentRatingForProfileUpdate(remote_card: ?profile.ProfileCard) profile.Rating {
+    _ = remote_card;
+    return profile.DefaultRating;
+}
+
+pub const ProfileRatingRecordAction = enum {
+    ignore,
+    record,
+};
+
+pub const ProfileRatingRecordState = struct {
+    verified_result: bool = false,
+    has_local_outcome: bool = false,
+    already_recorded: bool = false,
+};
+
+pub fn profileRatingRecordAction(state: ProfileRatingRecordState) ProfileRatingRecordAction {
+    if (!state.verified_result or !state.has_local_outcome or state.already_recorded) return .ignore;
+    return .record;
 }
 
 pub fn validateRemoteResult(role: Role, peer: *const lockstep.Peer, result: protocol.Result) (LifecycleError || ResultValidationError)!ResultValidationStatus {
@@ -800,10 +892,45 @@ test "known-match stale filter drops wrong-match malformed lifecycle before body
     encoded.bytes[protocol.HeaderSize] = 2;
 
     try std.testing.expectError(error.InvalidPlayerSlot, protocol.decode(encoded.slice()));
+    try std.testing.expectEqual(PacketDecodePolicy.ignore_stale, try packetDecodePolicyForKnownMatch(TestMatchId, encoded.slice()));
     try std.testing.expect(try shouldIgnorePacketForKnownMatch(TestMatchId, encoded.slice()));
     try std.testing.expect(!(try packetMatchesKnownMatch(TestMatchId, encoded.slice())));
     try std.testing.expect(!(try packetMatchesKnownMatch(null, encoded.slice())));
     try std.testing.expect(!(try shouldIgnorePacketForKnownMatch(null, encoded.slice())));
+}
+
+test "profile decode policy keeps malformed profile metadata nonfatal" {
+    const local_card = try profile.ProfileCard.init("p_remote", "Ada");
+    var current_profile = try encodeProfilePacket(TestMatchId, JoinerProtocolSlot, local_card);
+    const profile_len = current_profile.len;
+    try std.testing.expectEqual(PacketDecodePolicy.decode_optional_profile, try packetDecodePolicyForKnownMatch(TestMatchId, current_profile.slice()));
+
+    current_profile.bytes[profile_len] = 0xaa;
+    try std.testing.expectError(error.TrailingBytes, protocol.decode(current_profile.bytes[0 .. profile_len + 1]));
+    try std.testing.expectEqual(PacketDecodePolicy.decode_optional_profile, try packetDecodePolicyForKnownMatch(TestMatchId, current_profile.bytes[0 .. profile_len + 1]));
+
+    var stale_profile = try encodeProfilePacket(OtherMatchId, JoinerProtocolSlot, local_card);
+    stale_profile.bytes[protocol.HeaderSize + 1] = protocol.MaxProfilePlayerIdBytes + 1;
+    try std.testing.expectError(error.ProfilePayloadTooLarge, protocol.decode(stale_profile.slice()));
+    try std.testing.expectEqual(PacketDecodePolicy.ignore_stale, try packetDecodePolicyForKnownMatch(TestMatchId, stale_profile.slice()));
+
+    const truncated_profile = current_profile.bytes[0 .. protocol.ProfilePacketPrefixSize - 1];
+    try std.testing.expectError(error.TruncatedPacket, protocol.decode(truncated_profile));
+    try std.testing.expectEqual(PacketDecodePolicy.decode_optional_profile, try packetDecodePolicyForKnownMatch(TestMatchId, truncated_profile));
+
+    const short_profile = [_]u8{ protocol.ProtocolVersion, @intFromEnum(protocol.PacketType.profile) };
+    try std.testing.expectError(error.TruncatedPacket, protocol.decode(&short_profile));
+    try std.testing.expectEqual(PacketDecodePolicy.decode_optional_profile, try packetDecodePolicyForKnownMatch(TestMatchId, &short_profile));
+
+    var malformed_ack = try encodeAckPacket(.{
+        .match_id = TestMatchId,
+        .sender_slot = JoinerProtocolSlot,
+        .acked_slot = HostProtocolSlot,
+        .next_needed_frame = 0,
+    });
+    malformed_ack.bytes[protocol.HeaderSize] = 2;
+    try std.testing.expectEqual(PacketDecodePolicy.decode_required, try packetDecodePolicyForKnownMatch(TestMatchId, malformed_ack.slice()));
+    try std.testing.expectError(error.InvalidPlayerSlot, protocol.decode(malformed_ack.slice()));
 }
 
 test "lifecycle sender validation requires the expected remote slot" {
@@ -811,6 +938,79 @@ test "lifecycle sender validation requires the expected remote slot" {
     try validateLifecycleSender(.joiner, HostProtocolSlot);
     try std.testing.expectError(error.InvalidLifecycleSenderSlot, validateLifecycleSender(.host, HostProtocolSlot));
     try std.testing.expectError(error.InvalidLifecycleSenderSlot, validateLifecycleSender(.joiner, JoinerProtocolSlot));
+}
+
+test "profile packets convert local cards and validate remote sender and match" {
+    const local_card = try profile.ProfileCard.init("p_local", "Ada Lovelace");
+    const packet = try profilePacketFromCard(TestMatchId, HostProtocolSlot, local_card);
+    try std.testing.expectEqual(TestMatchId, packet.match_id);
+    try std.testing.expectEqual(HostProtocolSlot, packet.sender_slot);
+    try std.testing.expectEqualStrings("p_local", packet.playerId());
+    try std.testing.expectEqualStrings("Ada Lovelace", packet.nicknameBytes());
+
+    const remote_packet = try profilePacketFromCard(TestMatchId, JoinerProtocolSlot, local_card);
+    const accepted = try acceptRemoteProfile(.host, TestMatchId, remote_packet);
+    try std.testing.expectEqualStrings(local_card.playerId(), accepted.playerId());
+    try std.testing.expectEqualStrings(local_card.nicknameText(), accepted.nicknameText());
+
+    var wrong_sender = remote_packet;
+    wrong_sender.sender_slot = HostProtocolSlot;
+    try std.testing.expectError(error.InvalidProfileSenderSlot, acceptRemoteProfile(.host, TestMatchId, wrong_sender));
+
+    var wrong_match = remote_packet;
+    wrong_match.match_id = OtherMatchId;
+    try std.testing.expectError(error.WrongMatchId, acceptRemoteProfile(.host, TestMatchId, wrong_match));
+}
+
+test "malformed profile contents fall back without rejecting the match" {
+    const raw = try protocol.Profile.init(
+        TestMatchId,
+        JoinerProtocolSlot,
+        "bad id!",
+        "\x00\xffAda!!!",
+        65535,
+        5,
+        6,
+        7,
+    );
+
+    const card = try acceptRemoteProfile(.host, TestMatchId, raw);
+    try std.testing.expectEqualStrings(profile.DefaultPlayerId, card.playerId());
+    try std.testing.expectEqualStrings("Ada", card.nicknameText());
+    try std.testing.expectEqual(profile.DefaultRating, card.rating);
+    try std.testing.expectEqual(@as(u32, 5), card.wins);
+    try std.testing.expectEqual(@as(u32, 6), card.losses);
+    try std.testing.expectEqual(@as(u32, 7), card.draws);
+}
+
+test "profile rating record policy only records verified completed outcomes once" {
+    try std.testing.expectEqual(ProfileRatingRecordAction.ignore, profileRatingRecordAction(.{}));
+    try std.testing.expectEqual(ProfileRatingRecordAction.ignore, profileRatingRecordAction(.{
+        .verified_result = true,
+    }));
+    try std.testing.expectEqual(ProfileRatingRecordAction.ignore, profileRatingRecordAction(.{
+        .has_local_outcome = true,
+    }));
+    try std.testing.expectEqual(ProfileRatingRecordAction.record, profileRatingRecordAction(.{
+        .verified_result = true,
+        .has_local_outcome = true,
+    }));
+    try std.testing.expectEqual(ProfileRatingRecordAction.ignore, profileRatingRecordAction(.{
+        .verified_result = true,
+        .has_local_outcome = true,
+        .already_recorded = true,
+    }));
+
+    try std.testing.expectEqual(profile.VerifiedResult.win, profileResultForLocalRole(.host, .{ .winner = .p1 }));
+    try std.testing.expectEqual(profile.VerifiedResult.loss, profileResultForLocalRole(.host, .{ .winner = .p2 }));
+    try std.testing.expectEqual(profile.VerifiedResult.loss, profileResultForLocalRole(.joiner, .{ .winner = .p1 }));
+    try std.testing.expectEqual(profile.VerifiedResult.win, profileResultForLocalRole(.joiner, .{ .winner = .p2 }));
+    try std.testing.expectEqual(profile.VerifiedResult.draw, profileResultForLocalRole(.host, .draw));
+    try std.testing.expectEqual(profile.DefaultRating, opponentRatingForProfileUpdate(null));
+
+    var untrusted_remote = profile.ProfileCard.default();
+    untrusted_remote.rating = profile.MaxRating;
+    try std.testing.expectEqual(profile.DefaultRating, opponentRatingForProfileUpdate(untrusted_remote));
 }
 
 test "result finish policy separates verified completion from unverified local outcome" {

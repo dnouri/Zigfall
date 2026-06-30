@@ -9,6 +9,8 @@ const MaxPacketSize = 512;
 const MaxQueuedPackets = 256;
 const MaxRoomIdLength = 128;
 const RetiringSelectedPeerDrainMs = 2000;
+const ProtocolVersion = 1;
+const ProfilePacketType = 8;
 const AppId = "zigfall-trystero-v1";
 const PacketActionName = "pkt";
 const noop = () => {};
@@ -126,28 +128,39 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
     }
   }
 
-  function toOpaquePacketBytes(packet) {
+  function isProfilePacketView(view) {
+    return view.byteLength >= 2 && view[0] === ProtocolVersion && view[1] === ProfilePacketType;
+  }
+
+  function readOpaquePacketBytes(packet, { recordError = true, ignoreOversizedProfile = false } = {}) {
+    const fail = (code, message) => {
+      if (recordError) setError(code, message);
+      return { bytes: null, code };
+    };
+
     let view;
     if (packet instanceof ArrayBuffer) {
       view = new Uint8Array(packet);
     } else if (ArrayBuffer.isView(packet)) {
       view = new Uint8Array(packet.buffer, packet.byteOffset, packet.byteLength);
     } else {
-      setError(ErrorCode.sendFailed, "packet must be an ArrayBuffer or ArrayBuffer view");
-      return null;
+      return fail(ErrorCode.sendFailed, "packet must be an ArrayBuffer or ArrayBuffer view");
     }
 
     if (view.byteLength === 0) {
-      setError(ErrorCode.sendFailed, "packet is empty");
-      return null;
+      return fail(ErrorCode.sendFailed, "packet is empty");
     }
     if (view.byteLength > MaxPacketSize) {
-      setError(ErrorCode.packetTooLarge, `packet is ${view.byteLength} bytes; max is ${MaxPacketSize}`);
-      return null;
+      if (ignoreOversizedProfile && isProfilePacketView(view)) return { bytes: null, code: ErrorCode.none };
+      return fail(ErrorCode.packetTooLarge, `packet is ${view.byteLength} bytes; max is ${MaxPacketSize}`);
     }
 
     // Copy so async Trystero sends never retain a view into WASM memory or caller-owned buffers.
-    return new Uint8Array(view);
+    return { bytes: new Uint8Array(view), code: ErrorCode.none };
+  }
+
+  function toOpaquePacketBytes(packet, options = {}) {
+    return readOpaquePacketBytes(packet, options).bytes;
   }
 
   function isSelectedMessagePeer(peerId) {
@@ -167,12 +180,26 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
       return;
     }
 
-    const bytes = toOpaquePacketBytes(packet);
+    const bytes = toOpaquePacketBytes(packet, { ignoreOversizedProfile: true });
     if (!bytes) return;
 
+    if (isProfilePacketView(bytes)) {
+      const existingProfileIndex = incoming.findIndex(isProfilePacketView);
+      if (existingProfileIndex !== -1) {
+        incoming[existingProfileIndex] = bytes;
+        return;
+      }
+    }
+
     if (incoming.length >= MaxQueuedPackets) {
-      setError(ErrorCode.queueFull, `incoming queue full (${MaxQueuedPackets} packets)`);
-      return;
+      const existingProfileIndex = incoming.findIndex(isProfilePacketView);
+      if (existingProfileIndex !== -1) {
+        incoming.splice(existingProfileIndex, 1);
+      } else {
+        if (isProfilePacketView(bytes)) return;
+        setError(ErrorCode.queueFull, `incoming queue full (${MaxQueuedPackets} packets)`);
+        return;
+      }
     }
 
     incoming.push(bytes);
@@ -282,22 +309,38 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
     }
   }
 
-  function send(packet) {
-    const bytes = toOpaquePacketBytes(packet);
-    if (!bytes) return lastError;
+  function sendInternal(packet, { bestEffort = false } = {}) {
+    const { bytes, code } = readOpaquePacketBytes(packet, { recordError: !bestEffort });
+    if (!bytes) return code;
 
-    if (!room || !packetAction) return setError(ErrorCode.notConnected, "not connected to a room");
-    if (!hasSelectedPeer()) return setError(ErrorCode.noPeer, "no selected peer in room");
+    if (!room || !packetAction) {
+      return bestEffort ? ErrorCode.notConnected : setError(ErrorCode.notConnected, "not connected to a room");
+    }
+    if (!hasSelectedPeer()) {
+      return bestEffort ? ErrorCode.noPeer : setError(ErrorCode.noPeer, "no selected peer in room");
+    }
 
     const generation = connectionGeneration;
     const action = packetAction;
     const targetPeerId = selectedPeerId;
     action.send(bytes, { target: targetPeerId }).catch((err) => {
       if (generation !== connectionGeneration || packetAction !== action) return;
+      if (bestEffort) {
+        console.warn("[ZigfallTransport] best-effort send failed", err);
+        return;
+      }
       setError(ErrorCode.sendFailed, errorMessage(err));
       console.warn("[ZigfallTransport] send failed", err);
     });
     return ErrorCode.none;
+  }
+
+  function send(packet) {
+    return sendInternal(packet);
+  }
+
+  function sendBestEffort(packet) {
+    return sendInternal(packet, { bestEffort: true });
   }
 
   function poll() {
@@ -341,6 +384,7 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
     connect,
     disconnect,
     send,
+    sendBestEffort,
     poll,
     pollInto,
     statusCode,

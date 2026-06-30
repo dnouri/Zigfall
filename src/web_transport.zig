@@ -106,6 +106,15 @@ pub fn send(packet: []const u8) SendError!void {
     return mapSendResult(js.zigfall_transport_send(packet.ptr, packet.len));
 }
 
+/// Send optional display metadata without allowing asynchronous transport
+/// rejection to poison global transport health. Gameplay and lifecycle packets
+/// must continue to use `send`.
+pub fn sendBestEffort(packet: []const u8) SendError!void {
+    if (packet.len > MaxPacketSize) return error.PacketTooLarge;
+    if (comptime !is_web) return error.Unavailable;
+    return mapSendResult(js.zigfall_transport_send_best_effort(packet.ptr, packet.len));
+}
+
 pub fn poll(out: []u8) PollError!?[]const u8 {
     if (out.len < MaxPacketSize) return error.BufferTooSmall;
     if (comptime !is_web) return null;
@@ -192,6 +201,7 @@ const js = if (is_web) struct {
     extern fn zigfall_transport_connect(room_ptr: [*]const u8, room_len: usize) u8;
     extern fn zigfall_transport_disconnect() void;
     extern fn zigfall_transport_send(packet_ptr: [*]const u8, packet_len: usize) u8;
+    extern fn zigfall_transport_send_best_effort(packet_ptr: [*]const u8, packet_len: usize) u8;
     extern fn zigfall_transport_poll(out_ptr: [*]u8, out_cap: usize) i32;
     extern fn zigfall_transport_peer_count() u8;
     extern fn zigfall_transport_queued_packet_count() u16;
@@ -214,6 +224,7 @@ test "native transport stubs do not require browser JS" {
 
     var packet = [_]u8{0} ** MaxPacketSize;
     try std.testing.expectError(error.Unavailable, send(&packet));
+    try std.testing.expectError(error.Unavailable, sendBestEffort(&packet));
 
     var out = [_]u8{0} ** MaxPacketSize;
     try std.testing.expectEqual(@as(?[]const u8, null), try poll(&out));
@@ -231,6 +242,7 @@ test "transport validates room IDs before platform calls" {
 test "transport enforces max packet size before platform calls" {
     var packet = [_]u8{0} ** (MaxPacketSize + 1);
     try std.testing.expectError(error.PacketTooLarge, send(&packet));
+    try std.testing.expectError(error.PacketTooLarge, sendBestEffort(&packet));
 }
 
 test "poll requires a max-sized Zig-owned output buffer" {

@@ -71,7 +71,8 @@ Web online invite controls:
 - Gameplay uses one local control set: Left/Right/Down, Space hard drop, X or Up rotate clockwise, Z counter-clockwise, A 180, Left Shift hold.
 - P is deterministic pause/resume. R is a graceful no-op online because rematch/restart is not implemented yet.
 - If remote inputs stop arriving, a "Waiting for opponent input..." notice appears before the match resumes or disconnects.
-- Desyncs, disconnects, extra-peer busy rooms, and match results are displayed; a local result stays "verifying" until the peer's matching result validates, and disconnect/unverified results are not counted as wins/losses.
+- Each browser has a local-only profile card with nickname, random local player ID, Local rating, and W-L-D stats. The card is display-only and is exchanged during online matches.
+- Desyncs, disconnects, extra-peer busy rooms, and match results are displayed; a local result stays "verifying" until the peer's matching result validates. Only verified completed online matches update Local rating and W-L-D; disconnects/desyncs/unverified results are not counted.
 
 Native online networking is not supported; native versus play is local on one keyboard.
 
@@ -83,7 +84,7 @@ Native online networking is not supported; native versus play is local on one ke
 - SRS-style wall kicks for JLSTZ, I, and O pieces, plus a simple 180 kick set
 - T-spin full/mini detection, back-to-back, combo counter, perfect clear detection
 - Line-clear scoring with soft/hard drop points and line-output metadata for display
-- Pause, restart, game-over handling, local two-player versus, web invite-link P2P matches, and status panels for score, level, combo, B2B, last clear, garbage, and output
+- Pause, restart, game-over handling, local two-player versus, web invite-link P2P matches, local-only online profile cards/Local rating, and status panels for score, level, combo, B2B, last clear, garbage, and output
 
 ## Requirements
 
@@ -136,6 +137,7 @@ The generated web files are installed to `zig-out/web/`:
 - `zigfall.wasm`
 - `zigfall_transport.mjs`
 - `zigfall_invite.mjs`
+- `zigfall_profile.mjs`
 - `vendor/trystero-nostr.bundle.mjs` plus concise vendor license/readme files
 
 The web build uses a custom Zigfall shell with a GitHub link and a
@@ -144,10 +146,11 @@ Player 2's 180-rotate key) from scrolling the browser page or opening
 quick-find while the game is active, without blocking focused links or form
 controls.
 
-The web artifact also includes Trystero/Nostr transport and invite-link helpers
-for casual invite-link online matches. They are packaged as local static
-JavaScript copied by `build.zig`; the shell imports them during Emscripten
-`preRun` before WASM `main` starts. Production pages do not import Trystero from
+The web artifact also includes Trystero/Nostr transport, invite-link, and
+browser-local profile helpers for casual invite-link online matches. They are
+packaged as local static JavaScript copied by `build.zig`; the shell imports
+them during Emscripten `preRun` before WASM `main` starts. Production pages do
+not import Trystero from
 a runtime CDN, and native `zig build` does not require Node, npm, Trystero,
 browser APIs, or network access. Runtime online play still uses Trystero's
 default Nostr/public WebRTC signaling and ICE/STUN behavior, so browser network
@@ -169,16 +172,28 @@ Array.from(ZigfallTransport.poll() ?? [])
 For the playable UI flow, open one built web tab and press `3`, copy the link
 with `C`, then open that link in a second tab. The host is P1/setup authority,
 the join-link opener is P2, and both peers use fixed-delay conservative lockstep
-with periodic state hashes. Restart/rematch, matchmaking, accounts, profiles,
-ratings, and native networking are not implemented.
+with periodic state hashes. Restart/rematch, matchmaking, accounts, global
+leaderboards, and native networking are not implemented.
 
-The lower-level transport and invite seams are also available from the browser
-console:
+Profiles and Local rating are browser-local only. Nickname, player ID, Local
+rating, and W-L-D are exchanged as untrusted display metadata; they do not affect
+match seeds, slots, lockstep, state hashes, result authority, or local rating
+math. For now, verified-result rating updates use a fixed default opponent
+rating of 1000; the opponent's self-reported rating is display-only. Local
+rating starts at 1000, uses K=32, is clamped to 0..4000, and updates only once
+after a verified completed online match. If browser storage fails, the UI marks
+the profile/rating update as memory-only and not saved. Missing or malformed
+opponent profiles fall back to safe labels/defaults. Protocol v1 profile packet
+(type 8) compatibility with older in-development clients is not guaranteed.
+
+The lower-level transport, invite, and profile seams are also available from the
+browser console:
 
 ```js
 const room = ZigfallInvite.createHostRoom()
 ZigfallInvite.joinUrl(room)
 ZigfallInvite.readInitialJoinRoom()
+ZigfallProfile.card()
 ```
 
 These console helpers are mostly for debugging; normal online play should use

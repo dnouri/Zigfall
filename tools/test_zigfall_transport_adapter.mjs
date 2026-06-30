@@ -206,6 +206,40 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
   const { joinRoomImpl, rooms } = makeFakeJoinRoom();
   const transport = createZigfallTransport({ joinRoomImpl, selfIdValue: "self-test" });
 
+  assert.equal(transport.connect("profile-burst-test"), ErrorCode.none);
+  rooms[0].join("peer-a");
+  for (let i = 0; i < transport.MaxQueuedPackets; i += 1) {
+    rooms[0].action.emit(Uint8Array.from([1, 8, i & 0xff]), "peer-a");
+  }
+  assert.equal(transport.errorCode(), ErrorCode.none, "profile metadata bursts must not poison the shared gameplay queue");
+  assert.equal(transport.queuedPacketCount(), 1, "at most one optional profile packet should be pending");
+  rooms[0].action.emit(Uint8Array.from([2, 0]), "peer-a");
+  assert.equal(transport.errorCode(), ErrorCode.none, "gameplay packet after a profile burst should still be accepted");
+  assert.equal(transport.queuedPacketCount(), 2);
+}
+
+{
+  const { joinRoomImpl, rooms } = makeFakeJoinRoom();
+  const transport = createZigfallTransport({ joinRoomImpl, selfIdValue: "self-test" });
+
+  assert.equal(transport.connect("profile-eviction-test"), ErrorCode.none);
+  rooms[0].join("peer-a");
+  for (let i = 0; i < transport.MaxQueuedPackets - 1; i += 1) {
+    rooms[0].action.emit(Uint8Array.from([0x20, i & 0xff]), "peer-a");
+  }
+  rooms[0].action.emit(Uint8Array.from([1, 8, 0xaa]), "peer-a");
+  assert.equal(transport.queuedPacketCount(), transport.MaxQueuedPackets);
+  rooms[0].action.emit(Uint8Array.from([0x21]), "peer-a");
+  assert.equal(transport.errorCode(), ErrorCode.none, "optional profile should be evicted before reporting gameplay queue overflow");
+  assert.equal(transport.queuedPacketCount(), transport.MaxQueuedPackets);
+  rooms[0].action.emit(Uint8Array.from([0x22]), "peer-a");
+  assert.equal(transport.errorCode(), ErrorCode.queueFull, "overflow remains fatal when the full queue has no optional profile to evict");
+}
+
+{
+  const { joinRoomImpl, rooms } = makeFakeJoinRoom();
+  const transport = createZigfallTransport({ joinRoomImpl, selfIdValue: "self-test" });
+
   assert.equal(transport.MaxQueuedPackets, 256, "inbound queue should allow bounded burst drain headroom");
   assert.equal(transport.connect("queue-test"), ErrorCode.none);
   const room = rooms[0];
@@ -216,6 +250,9 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
     action.emit(Uint8Array.from([i & 0xff]), "peer-a");
   }
   assert.equal(transport.queuedPacketCount(), transport.MaxQueuedPackets);
+  action.emit(Uint8Array.from([1, 8]), "peer-a");
+  assert.equal(transport.errorCode(), ErrorCode.none, "optional profile metadata overflow must not poison gameplay health");
+  assert.equal(transport.queuedPacketCount(), transport.MaxQueuedPackets, "profile overflow should not grow the bounded queue");
   action.emit(Uint8Array.from([0xee]), "peer-a");
   assert.equal(transport.errorCode(), ErrorCode.queueFull);
   assert.equal(transport.queuedPacketCount(), transport.MaxQueuedPackets, "overflow should not grow the bounded queue");
@@ -229,8 +266,15 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
   const room = rooms[0];
   room.join("peer-a");
 
+  const oversizedProfile = new Uint8Array(transport.MaxPacketSize + 1);
+  oversizedProfile[0] = 1;
+  oversizedProfile[1] = 8;
+  room.action.emit(oversizedProfile, "peer-a");
+  assert.equal(transport.errorCode(), ErrorCode.none, "oversized profile metadata must be dropped without poisoning gameplay health");
+  assert.equal(transport.queuedPacketCount(), 0, "oversized profile metadata is not queued");
+
   room.action.emit(new Uint8Array(transport.MaxPacketSize + 1), "peer-a");
-  assert.equal(transport.errorCode(), ErrorCode.packetTooLarge, "oversized selected-peer packets must be terminal to Zig");
+  assert.equal(transport.errorCode(), ErrorCode.packetTooLarge, "oversized selected-peer gameplay/lifecycle packets must be terminal to Zig");
   assert.equal(transport.queuedPacketCount(), 0, "oversized packets are dropped rather than queued");
 }
 
@@ -271,4 +315,59 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
   }
 }
 
-console.log("ok: Zigfall transport adapter selects one peer, targets sends, drops extras, drains late final packets, bounds backlog, and scopes async send failures");
+{
+  let rejectMetadataSend;
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args);
+  try {
+    const { joinRoomImpl, rooms } = makeFakeJoinRoom({
+      makeActionImpl: () => makeFakeAction({
+        sendImpl: () => new Promise((_, reject) => {
+          rejectMetadataSend = reject;
+        }),
+      }),
+    });
+    const transport = createZigfallTransport({ joinRoomImpl, selfIdValue: "self-test" });
+
+    assert.equal(transport.connect("best-effort-send-room"), ErrorCode.none);
+    rooms[0].join("peer-a");
+    assert.equal(transport.sendBestEffort(Uint8Array.from([8, 8])), ErrorCode.none);
+    rejectMetadataSend(new Error("metadata send failed"));
+    await Promise.resolve();
+    assert.equal(transport.errorCode(), ErrorCode.none, "best-effort async rejection must not poison transport health");
+    assert.equal(transport.statusCode(), Status.connected);
+    assert.equal(warnings.length, 1, "best-effort async rejection should be logged only");
+  } finally {
+    console.warn = originalWarn;
+  }
+}
+
+{
+  let rejectGameplaySend;
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args);
+  try {
+    const { joinRoomImpl, rooms } = makeFakeJoinRoom({
+      makeActionImpl: () => makeFakeAction({
+        sendImpl: () => new Promise((_, reject) => {
+          rejectGameplaySend = reject;
+        }),
+      }),
+    });
+    const transport = createZigfallTransport({ joinRoomImpl, selfIdValue: "self-test" });
+
+    assert.equal(transport.connect("gameplay-send-room"), ErrorCode.none);
+    rooms[0].join("peer-a");
+    assert.equal(transport.send(Uint8Array.from([2, 3])), ErrorCode.none);
+    rejectGameplaySend(new Error("gameplay send failed"));
+    await Promise.resolve();
+    assert.equal(transport.errorCode(), ErrorCode.sendFailed, "gameplay async rejection remains fatal to Zig");
+    assert.equal(warnings.length, 1);
+  } finally {
+    console.warn = originalWarn;
+  }
+}
+
+console.log("ok: Zigfall transport adapter selects one peer, targets sends, drops extras, drains late final packets, bounds backlog, scopes async send failures, and keeps best-effort sends nonfatal");

@@ -222,7 +222,11 @@
             return globalThis.ZigfallInvite && typeof globalThis.ZigfallInvite.createHostRoom === "function";
           }
 
-          if (hasTransport() && hasInvite()) return;
+          function hasProfile() {
+            return globalThis.ZigfallProfile && typeof globalThis.ZigfallProfile.card === "function";
+          }
+
+          if (hasTransport() && hasInvite() && hasProfile()) return;
 
           var dependency = "zigfall_web_helpers";
           var imports = [];
@@ -248,6 +252,18 @@
             }).catch(function(err) {
               globalThis.ZigfallInviteLoadError = err;
               console.error("[ZigfallInvite] failed to load", err);
+              throw err;
+            }));
+          }
+
+          if (!hasProfile()) {
+            imports.push(import("./zigfall_profile.mjs").then(function() {
+              if (!hasProfile()) {
+                throw new Error("zigfall_profile.mjs did not install globalThis.ZigfallProfile");
+              }
+            }).catch(function(err) {
+              globalThis.ZigfallProfileLoadError = err;
+              console.error("[ZigfallProfile] failed to load", err);
               throw err;
             }));
           }
@@ -298,7 +314,7 @@
       };
     </script>
 
-    <!-- Module.preRun imports zigfall_transport.mjs and zigfall_invite.mjs before WASM main starts. -->
+    <!-- Module.preRun imports zigfall_transport.mjs, zigfall_invite.mjs, and zigfall_profile.mjs before WASM main starts. -->
 
     <!-- Emscripten replaces this token with the zigfall.js loader. -->
     {{{ SCRIPT }}}

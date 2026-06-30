@@ -13,18 +13,24 @@
 //! setup handshake with a fresh match id; do not reuse an old id for a new
 //! simulation. `frame_cursor` means the state after all frames `< frame_cursor`
 //! have been simulated. Never serialize raw Zig structs or rely on native memory
-//! layout. Phase 5 JS/Trystero code should move these packets as opaque bytes
-//! and queue asynchronous callbacks for Zig to poll; transport code must not
-//! inspect or reinterpret packet contents.
+//! layout. Profile packets carry bounded display-only metadata; callers must not
+//! feed profile contents into match seeds, slots, state hashes, result authority,
+//! or lockstep state. JS/Trystero code should move gameplay and lifecycle
+//! packets as opaque bytes and queue asynchronous callbacks for Zig to poll;
+//! the only transport-level packet peek is a minimal type check to drop
+//! oversized display-only profile metadata without poisoning gameplay health.
 
 const std = @import("std");
 const input = @import("input");
+const profile = @import("profile");
 
 pub const ProtocolVersion: u8 = 1;
 pub const MatchIdSize: usize = 8;
 pub const HeaderSize: usize = 2 + MatchIdSize;
 pub const MaxPacketSize: usize = 512;
 pub const MaxInputBatchCount: usize = 32;
+pub const MaxProfilePlayerIdBytes: usize = profile.MaxPlayerIdBytes;
+pub const MaxProfileNicknameBytes: usize = profile.MaxNicknameBytes;
 
 pub const InputMaskBits = struct {
     pub const left_down: u16 = 1 << 0;
@@ -54,6 +60,12 @@ pub const StateHashPacketSize: usize = HeaderSize + 1 + 8 + 8;
 pub const DesyncPacketSize: usize = HeaderSize + 1 + 1 + 8 + 8 + 8;
 pub const DisconnectPacketSize: usize = HeaderSize + 1 + 1 + 8;
 pub const ResultPacketSize: usize = HeaderSize + 1 + 1 + 8 + 8;
+pub const ProfilePacketPrefixSize: usize = HeaderSize + 1 + 1 + 1 + 2 + 4 + 4 + 4;
+pub const MaxProfilePacketSize: usize = ProfilePacketPrefixSize + MaxProfilePlayerIdBytes + MaxProfileNicknameBytes;
+
+comptime {
+    if (MaxProfilePacketSize > MaxPacketSize) @compileError("profile packet exceeds protocol packet cap");
+}
 
 pub const InputMaskError = error{
     InvalidInputMask,
@@ -63,12 +75,17 @@ pub const InputBatchInitError = error{
     TooManyInputs,
 };
 
+pub const ProfileInitError = error{
+    ProfilePayloadTooLarge,
+};
+
 pub const EncodeError = error{
     BufferTooSmall,
     PacketTooLarge,
     TooManyInputs,
     InvalidHoleChangeChance,
     InvalidInitialHole,
+    ProfilePayloadTooLarge,
 };
 
 pub const DecodeError = error{
@@ -84,6 +101,7 @@ pub const DecodeError = error{
     InvalidHoleChangeChance,
     InvalidInitialHole,
     InvalidPlayerSlot,
+    ProfilePayloadTooLarge,
 };
 
 pub const PacketType = enum(u8) {
@@ -94,6 +112,12 @@ pub const PacketType = enum(u8) {
     desync = 5,
     disconnect = 6,
     result = 7,
+    profile = 8,
+};
+
+pub const PacketEnvelope = struct {
+    packet_type: PacketType,
+    match_id: u64,
 };
 
 pub const Ruleset = enum(u8) {
@@ -189,6 +213,67 @@ pub const Result = struct {
     state_hash: u64,
 };
 
+pub const Profile = struct {
+    match_id: u64,
+    /// Display-only sender slot. It is decoded as raw metadata so malformed or
+    /// wrong-slot profile cards can be ignored by session logic without
+    /// terminating deterministic gameplay.
+    sender_slot: u8,
+    player_id_len: u8 = 0,
+    nickname_len: u8 = 0,
+    rating: u16 = profile.DefaultRating,
+    wins: u32 = 0,
+    losses: u32 = 0,
+    draws: u32 = 0,
+    player_id: [MaxProfilePlayerIdBytes]u8 = [_]u8{0} ** MaxProfilePlayerIdBytes,
+    nickname: [MaxProfileNicknameBytes]u8 = [_]u8{0} ** MaxProfileNicknameBytes,
+
+    pub fn init(
+        match_id: u64,
+        sender_slot: u8,
+        player_id_value: []const u8,
+        nickname_value: []const u8,
+        rating: u16,
+        wins: u32,
+        losses: u32,
+        draws: u32,
+    ) ProfileInitError!Profile {
+        if (player_id_value.len > MaxProfilePlayerIdBytes or nickname_value.len > MaxProfileNicknameBytes) {
+            return error.ProfilePayloadTooLarge;
+        }
+
+        var packet = Profile{
+            .match_id = match_id,
+            .sender_slot = sender_slot,
+            .player_id_len = @intCast(player_id_value.len),
+            .nickname_len = @intCast(nickname_value.len),
+            .rating = rating,
+            .wins = wins,
+            .losses = losses,
+            .draws = draws,
+        };
+        @memcpy(packet.player_id[0..player_id_value.len], player_id_value);
+        @memcpy(packet.nickname[0..nickname_value.len], nickname_value);
+        return packet;
+    }
+
+    pub fn playerId(self: *const Profile) []const u8 {
+        return self.player_id[0..self.playerIdLen()];
+    }
+
+    pub fn nicknameBytes(self: *const Profile) []const u8 {
+        return self.nickname[0..self.nicknameLen()];
+    }
+
+    fn playerIdLen(self: *const Profile) usize {
+        return @intCast(self.player_id_len);
+    }
+
+    fn nicknameLen(self: *const Profile) usize {
+        return @intCast(self.nickname_len);
+    }
+};
+
 pub const Packet = union(PacketType) {
     setup: Setup,
     input_batch: InputBatch,
@@ -197,6 +282,7 @@ pub const Packet = union(PacketType) {
     desync: Desync,
     disconnect: Disconnect,
     result: Result,
+    profile: Profile,
 };
 
 pub fn packetMatchId(packet: Packet) u64 {
@@ -208,6 +294,7 @@ pub fn packetMatchId(packet: Packet) u64 {
         .desync => |desync| desync.match_id,
         .disconnect => |disconnect| disconnect.match_id,
         .result => |result| result.match_id,
+        .profile => |profile_packet| profile_packet.match_id,
     };
 }
 
@@ -256,6 +343,7 @@ pub fn encode(packet: Packet, out: []u8) EncodeError!usize {
         .desync => |desync| encodeDesync(desync, out),
         .disconnect => |disconnect| encodeDisconnect(disconnect, out),
         .result => |result| encodeResult(result, out),
+        .profile => |profile_packet| encodeProfile(profile_packet, out),
     };
 }
 
@@ -277,7 +365,27 @@ pub fn decode(bytes: []const u8) DecodeError!Packet {
         .desync => .{ .desync = try decodeDesync(match_id, &reader) },
         .disconnect => .{ .disconnect = try decodeDisconnect(match_id, &reader) },
         .result => .{ .result = try decodeResult(match_id, &reader) },
+        .profile => .{ .profile = try decodeProfile(match_id, &reader) },
     };
+}
+
+/// Return the validated packet envelope without decoding the packet body.
+/// Profile packets are optional/display-only, so session code uses this to
+/// identify profile bytes before body decode errors can affect gameplay.
+pub fn peekEnvelope(bytes: []const u8) DecodeError!PacketEnvelope {
+    const packet_type = try peekPacketType(bytes);
+    if (bytes.len > MaxPacketSize) return error.PacketTooLarge;
+    if (bytes.len < HeaderSize) return error.TruncatedPacket;
+    return .{
+        .packet_type = packet_type,
+        .match_id = readMatchIdUnchecked(bytes),
+    };
+}
+
+pub fn peekPacketType(bytes: []const u8) DecodeError!PacketType {
+    if (bytes.len < 2) return error.TruncatedPacket;
+    if (bytes[0] != ProtocolVersion) return error.InvalidVersion;
+    return try decodePacketType(bytes[1]);
 }
 
 /// Return the envelope match id without decoding the packet body. Runtime
@@ -285,6 +393,10 @@ pub fn decode(bytes: []const u8) DecodeError!Packet {
 /// body validation can turn transport noise into a terminal same-match error.
 pub fn peekMatchId(bytes: []const u8) DecodeError!u64 {
     if (bytes.len < HeaderSize) return error.TruncatedPacket;
+    return readMatchIdUnchecked(bytes);
+}
+
+fn readMatchIdUnchecked(bytes: []const u8) u64 {
     var value: u64 = 0;
     inline for (0..8) |byte_index| {
         value |= @as(u64, bytes[2 + byte_index]) << (8 * byte_index);
@@ -365,6 +477,27 @@ fn encodeResult(result: Result, out: []u8) EncodeError!usize {
     putU8(out, &cursor, @intFromEnum(result.outcome));
     putU64(out, &cursor, result.frame_cursor);
     putU64(out, &cursor, result.state_hash);
+    return cursor;
+}
+
+fn encodeProfile(profile_packet: Profile, out: []u8) EncodeError!usize {
+    const player_id_len = profile_packet.playerIdLen();
+    const nickname_len = profile_packet.nicknameLen();
+    if (player_id_len > MaxProfilePlayerIdBytes or nickname_len > MaxProfileNicknameBytes) return error.ProfilePayloadTooLarge;
+
+    const total_len = ProfilePacketPrefixSize + player_id_len + nickname_len;
+    var cursor = try startPacket(out, .profile, profile_packet.match_id, total_len);
+    putU8(out, &cursor, profile_packet.sender_slot);
+    putU8(out, &cursor, profile_packet.player_id_len);
+    putU8(out, &cursor, profile_packet.nickname_len);
+    putU16(out, &cursor, profile_packet.rating);
+    putU32(out, &cursor, profile_packet.wins);
+    putU32(out, &cursor, profile_packet.losses);
+    putU32(out, &cursor, profile_packet.draws);
+    @memcpy(out[cursor .. cursor + player_id_len], profile_packet.playerId());
+    cursor += player_id_len;
+    @memcpy(out[cursor .. cursor + nickname_len], profile_packet.nicknameBytes());
+    cursor += nickname_len;
     return cursor;
 }
 
@@ -461,6 +594,28 @@ fn decodeResult(match_id: u64, reader: *Reader) DecodeError!Result {
     return result;
 }
 
+fn decodeProfile(match_id: u64, reader: *Reader) DecodeError!Profile {
+    var profile_packet = Profile{
+        .match_id = match_id,
+        .sender_slot = try reader.readU8(),
+        .player_id_len = try reader.readU8(),
+        .nickname_len = try reader.readU8(),
+        .rating = try reader.readU16(),
+        .wins = try reader.readU32(),
+        .losses = try reader.readU32(),
+        .draws = try reader.readU32(),
+    };
+
+    const player_id_len = profile_packet.playerIdLen();
+    const nickname_len = profile_packet.nicknameLen();
+    if (player_id_len > MaxProfilePlayerIdBytes or nickname_len > MaxProfileNicknameBytes) return error.ProfilePayloadTooLarge;
+
+    try reader.readBytes(profile_packet.player_id[0..player_id_len]);
+    try reader.readBytes(profile_packet.nickname[0..nickname_len]);
+    try reader.expectEnd();
+    return profile_packet;
+}
+
 fn startPacket(out: []u8, packet_type: PacketType, match_id: u64, total_len: usize) EncodeError!usize {
     if (total_len > MaxPacketSize) return error.PacketTooLarge;
     if (out.len < total_len) return error.BufferTooSmall;
@@ -482,6 +637,13 @@ fn putU16(out: []u8, cursor: *usize, value: u16) void {
     cursor.* += 2;
 }
 
+fn putU32(out: []u8, cursor: *usize, value: u32) void {
+    inline for (0..4) |byte_index| {
+        out[cursor.* + byte_index] = @as(u8, @truncate(value >> (8 * byte_index)));
+    }
+    cursor.* += 4;
+}
+
 fn putU64(out: []u8, cursor: *usize, value: u64) void {
     inline for (0..8) |byte_index| {
         out[cursor.* + byte_index] = @as(u8, @truncate(value >> (8 * byte_index)));
@@ -498,6 +660,7 @@ fn decodePacketType(value: u8) DecodeError!PacketType {
         @intFromEnum(PacketType.desync) => .desync,
         @intFromEnum(PacketType.disconnect) => .disconnect,
         @intFromEnum(PacketType.result) => .result,
+        @intFromEnum(PacketType.profile) => .profile,
         else => error.UnknownPacketType,
     };
 }
@@ -560,6 +723,18 @@ const Reader = struct {
             (@as(u16, self.bytes[start + 1]) << 8);
     }
 
+    fn readU32(self: *Reader) DecodeError!u32 {
+        if (self.cursor + 4 > self.bytes.len) return error.TruncatedPacket;
+        const start = self.cursor;
+        self.cursor += 4;
+
+        var value: u32 = 0;
+        inline for (0..4) |byte_index| {
+            value |= @as(u32, self.bytes[start + byte_index]) << (8 * byte_index);
+        }
+        return value;
+    }
+
     fn readU64(self: *Reader) DecodeError!u64 {
         if (self.cursor + 8 > self.bytes.len) return error.TruncatedPacket;
         const start = self.cursor;
@@ -570,6 +745,12 @@ const Reader = struct {
             value |= @as(u64, self.bytes[start + byte_index]) << (8 * byte_index);
         }
         return value;
+    }
+
+    fn readBytes(self: *Reader, out: []u8) DecodeError!void {
+        if (self.cursor + out.len > self.bytes.len) return error.TruncatedPacket;
+        @memcpy(out, self.bytes[self.cursor .. self.cursor + out.len]);
+        self.cursor += out.len;
     }
 
     fn expectEnd(self: *const Reader) DecodeError!void {
@@ -610,6 +791,19 @@ fn setupFixture() Packet {
         .initial_hole_p1 = 0,
         .initial_hole_p2 = null,
     } };
+}
+
+fn profileFixture() Packet {
+    return .{ .profile = Profile.init(
+        GoldenMatchId,
+        1,
+        "p_remote",
+        "Ada_2",
+        1234,
+        5,
+        6,
+        7,
+    ) catch unreachable };
 }
 
 test "input masks round-trip every frame input field" {
@@ -1006,9 +1200,124 @@ test "result packet has stable golden layout" {
     try expectGolden(packet, &expected);
 }
 
+test "profile packet round-trips" {
+    try expectRoundTrip(profileFixture());
+}
+
+test "profile packet has stable golden layout" {
+    const expected = [_]u8{
+        1,
+        8,
+        0xef,
+        0xcd,
+        0xab,
+        0x89,
+        0x67,
+        0x45,
+        0x23,
+        0x01,
+        1,
+        8,
+        5,
+        0xd2,
+        0x04,
+        5,
+        0,
+        0,
+        0,
+        6,
+        0,
+        0,
+        0,
+        7,
+        0,
+        0,
+        0,
+        'p',
+        '_',
+        'r',
+        'e',
+        'm',
+        'o',
+        't',
+        'e',
+        'A',
+        'd',
+        'a',
+        '_',
+        '2',
+    };
+    try std.testing.expectEqual(@as(usize, ProfilePacketPrefixSize + 8 + 5), expected.len);
+    try expectGolden(profileFixture(), &expected);
+}
+
+test "profile packet enforces bounded field lengths" {
+    var player_id = [_]u8{'p'} ** MaxProfilePlayerIdBytes;
+    var nickname = [_]u8{'n'} ** MaxProfileNicknameBytes;
+    const max_packet = Packet{ .profile = try Profile.init(GoldenMatchId, 1, &player_id, &nickname, profile.DefaultRating, 0, 0, 0) };
+    var bytes: [MaxPacketSize]u8 = undefined;
+    const len = try encode(max_packet, bytes[0..]);
+    try std.testing.expectEqual(@as(usize, MaxProfilePacketSize), len);
+    try std.testing.expectEqualDeep(max_packet, try decode(bytes[0..len]));
+
+    var too_long_player_id = [_]u8{'p'} ** (MaxProfilePlayerIdBytes + 1);
+    try std.testing.expectError(error.ProfilePayloadTooLarge, Profile.init(GoldenMatchId, 1, &too_long_player_id, "Player", profile.DefaultRating, 0, 0, 0));
+
+    bytes[HeaderSize + 1] = @as(u8, MaxProfilePlayerIdBytes + 1);
+    try std.testing.expectError(error.ProfilePayloadTooLarge, decode(bytes[0..len]));
+}
+
+test "profile packet leaves untrusted display contents to session sanitization" {
+    const packet = Packet{ .profile = try Profile.init(GoldenMatchId, 2, "bad id!", "\x00\xffAda", 65535, std.math.maxInt(u32), 8, 9) };
+    var bytes: [MaxPacketSize]u8 = undefined;
+    const len = try encode(packet, bytes[0..]);
+    const decoded = try decode(bytes[0..len]);
+    try std.testing.expectEqualDeep(packet, decoded);
+    switch (decoded) {
+        .profile => |profile_packet| {
+            try std.testing.expectEqual(@as(u8, 2), profile_packet.sender_slot);
+            try std.testing.expectEqual(@as(u16, 65535), profile_packet.rating);
+            try std.testing.expectEqualStrings("bad id!", profile_packet.playerId());
+            try std.testing.expectEqualSlices(u8, "\x00\xffAda", profile_packet.nicknameBytes());
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "profile packet rejects trailing bytes beyond declared field lengths" {
+    var bytes: [MaxPacketSize]u8 = undefined;
+    const len = try encode(profileFixture(), bytes[0..]);
+    bytes[len] = 0xaa;
+    try std.testing.expectError(error.TrailingBytes, decode(bytes[0 .. len + 1]));
+}
+
 test "decode rejects invalid version and packet type" {
     try std.testing.expectError(error.InvalidVersion, decode(&[_]u8{ 0, 3 }));
     try std.testing.expectError(error.UnknownPacketType, decode(&[_]u8{ 1, 0xff }));
+}
+
+test "packet envelope peek validates only the header" {
+    var bytes: [MaxPacketSize]u8 = undefined;
+    const len = try encode(profileFixture(), bytes[0..]);
+    const envelope = try peekEnvelope(bytes[0..len]);
+    try std.testing.expectEqual(PacketType.profile, envelope.packet_type);
+    try std.testing.expectEqual(GoldenMatchId, envelope.match_id);
+    try std.testing.expectEqual(PacketType.profile, try peekPacketType(bytes[0..len]));
+    try std.testing.expectEqual(PacketType.profile, try peekPacketType(&[_]u8{ ProtocolVersion, @intFromEnum(PacketType.profile) }));
+    try std.testing.expectEqual(GoldenMatchId, try peekMatchId(bytes[0..len]));
+
+    bytes[HeaderSize + 1] = MaxProfilePlayerIdBytes + 1;
+    try std.testing.expectError(error.ProfilePayloadTooLarge, decode(bytes[0..len]));
+    const malformed_envelope = try peekEnvelope(bytes[0..len]);
+    try std.testing.expectEqual(PacketType.profile, malformed_envelope.packet_type);
+    try std.testing.expectEqual(GoldenMatchId, malformed_envelope.match_id);
+
+    try std.testing.expectError(error.TruncatedPacket, peekEnvelope(bytes[0 .. HeaderSize - 1]));
+    bytes[0] = 0;
+    try std.testing.expectError(error.InvalidVersion, peekEnvelope(bytes[0..len]));
+    bytes[0] = ProtocolVersion;
+    bytes[1] = 0xff;
+    try std.testing.expectError(error.UnknownPacketType, peekEnvelope(bytes[0..len]));
 }
 
 test "fixed-size packets reject trailing bytes" {

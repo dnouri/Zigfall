@@ -9,8 +9,10 @@ const input = @import("input");
 const lockstep = @import("lockstep");
 const match_mod = @import("match");
 const online_session = @import("online_session");
+const profile = @import("profile");
 const protocol = @import("protocol");
 const web_invite = @import("web_invite");
+const web_profile = @import("web_profile");
 const web_transport = @import("web_transport");
 
 const emscripten = std.os.emscripten;
@@ -191,6 +193,8 @@ const OnlineState = struct {
     role: ?online_session.Role = null,
     session: ?online_session.Session = null,
     last_step_result: match_mod.MatchStepResult = .{},
+    local_profile: profile.ProfileCard = .{},
+    remote_profile: ?profile.ProfileCard = null,
     room_buf: [web_invite.MaxRoomIdLength]u8 = undefined,
     room_len: usize = 0,
     join_url_buf: [web_invite.MaxJoinUrlLength]u8 = undefined,
@@ -203,6 +207,7 @@ const OnlineState = struct {
     notice_frames_left: u16 = 0,
     sent_setup: bool = false,
     sent_ack: bool = false,
+    sent_profile: bool = false,
     sent_result: bool = false,
     sent_desync: bool = false,
     pending_remote_result: ?protocol.Result = null,
@@ -219,9 +224,16 @@ const OnlineState = struct {
     terminal_packet: online_session.TerminalPacketKind = .none,
     terminal_drain_frames_left: u16 = 0,
     terminal_disconnected: bool = false,
+    profile_result_recorded: bool = false,
+    profile_result_update_failed: bool = false,
+    profile_storage_status: web_profile.Status = .unavailable,
+    profile_rating_before: profile.Rating = profile.DefaultRating,
+    profile_rating_after: profile.Rating = profile.DefaultRating,
+    profile_rating_delta: i32 = 0,
 
     fn startHost(self: *OnlineState) void {
         self.* = .{};
+        self.loadLocalProfile();
         if (comptime builtin.os.tag != .emscripten) {
             self.markTerminal(.unsupported, "Online invites are web-only in this build.", .{});
             return;
@@ -252,6 +264,7 @@ const OnlineState = struct {
 
     fn startJoinRoom(self: *OnlineState, room_id: []const u8) void {
         self.* = .{};
+        self.loadLocalProfile();
         if (comptime builtin.os.tag != .emscripten) {
             self.markTerminal(.unsupported, "Online join links are web-only in this build.", .{});
             return;
@@ -298,6 +311,9 @@ const OnlineState = struct {
         self.driveHandshake();
         if (self.terminal != .none) return;
 
+        self.maybeSendProfile();
+        if (self.terminal != .none) return;
+
         self.driveLockstep(online_input.frame);
     }
 
@@ -307,6 +323,8 @@ const OnlineState = struct {
             const outcome_verified = self.hasVerifiedResult();
             drawVersusPlayer(.p1, &peer.match, self.last_step_result.players[0], outcome_verified);
             drawVersusPlayer(.p2, &peer.match, self.last_step_result.players[1], outcome_verified);
+            drawOnlineBoardProfile(self, .p1);
+            drawOnlineBoardProfile(self, .p2);
             drawOnlineControlsStrip(self);
             if (self.terminal == .none) drawOnlineMatchOverlay(self, &peer.match);
         } else {
@@ -321,6 +339,17 @@ const OnlineState = struct {
             drawOnlineWaitingOverlay(self);
         }
         if (self.notice_frames_left > 0 and self.notice_len > 0) drawOnlineNotice(self.notice());
+    }
+
+    fn loadLocalProfile(self: *OnlineState) void {
+        self.local_profile = web_profile.loadCard() catch |err| fallback: {
+            self.setNotice("Local profile unavailable; using defaults: {s}", .{@errorName(err)});
+            break :fallback profile.ProfileCard.default();
+        };
+        self.profile_storage_status = web_profile.status();
+        self.profile_rating_before = self.local_profile.rating;
+        self.profile_rating_after = self.local_profile.rating;
+        self.profile_rating_delta = 0;
     }
 
     fn handleShellActions(self: *OnlineState, online_input: app_controls.OnlineInput) void {
@@ -361,7 +390,7 @@ const OnlineState = struct {
             .fail_extra_peer => self.enterTerminal(.failed, .{ .disconnect = 2 }, "Extra peer joined this room; match stopped. Create a new invite.", .{}),
             .fail_missing_js => self.enterTerminal(.failed, .none, "Web transport helper is missing; reload the page.", .{}),
             .unsupported => self.enterTerminal(.unsupported, .none, "Online transport is unavailable in this build.", .{}),
-            .disconnected => self.enterTerminal(.disconnected, .none, "Opponent disconnected.", .{}),
+            .disconnected => self.enterTerminal(.disconnected, .none, "Opponent disconnected; this match is not counted.", .{}),
             .fail_packet_too_large => self.enterTerminal(.failed, .{ .disconnect = 3 }, "Network packet exceeded the protocol size limit; match stopped before hiding a lost packet.", .{}),
             .fail_queue_full => self.enterTerminal(.failed, .{ .disconnect = 3 }, "Network receive backlog overflowed; match stopped before hiding a lost packet.", .{}),
             .fail_send_failed => self.enterTerminal(.failed, .{ .disconnect = 3 }, "Transport send failed; match stopped.", .{}),
@@ -396,7 +425,7 @@ const OnlineState = struct {
             .disconnect_now => return false,
             .defer_disconnect => return true,
             .pending_result_timed_out => {
-                self.enterTerminal(.desynced, .desync, "Opponent result could not be validated after disconnect; match stopped.", .{});
+                self.enterTerminal(.desynced, .desync, "Opponent result could not be validated after disconnect; match stopped and is not counted.", .{});
                 return true;
             },
         }
@@ -432,13 +461,17 @@ const OnlineState = struct {
     }
 
     fn handlePacket(self: *OnlineState, bytes: []const u8) void {
-        const ignore_stale = online_session.shouldIgnorePacketForKnownMatch(self.currentMatchId(), bytes) catch |err| {
+        const decode_policy = online_session.packetDecodePolicyForKnownMatch(self.currentMatchId(), bytes) catch |err| {
             self.enterTerminal(.failed, .{ .disconnect = 8 }, "Malformed network packet header: {s}", .{@errorName(err)});
             return;
         };
-        if (ignore_stale) return;
+        if (decode_policy == .ignore_stale) return;
 
         const packet = protocol.decode(bytes) catch |err| {
+            if (decode_policy == .decode_optional_profile) {
+                self.setNotice("Ignoring malformed opponent profile card: {s}", .{@errorName(err)});
+                return;
+            }
             self.enterTerminal(.failed, .{ .disconnect = 9 }, "Malformed network packet: {s}", .{@errorName(err)});
             return;
         };
@@ -449,6 +482,7 @@ const OnlineState = struct {
             .input_batch, .state_hash, .desync => self.handleRuntimePacket(bytes),
             .disconnect => |disconnect| self.handleDisconnect(disconnect),
             .result => |result| self.handleResult(result),
+            .profile => |profile_packet| self.handleProfile(profile_packet),
         }
     }
 
@@ -523,7 +557,7 @@ const OnlineState = struct {
         self.peer_leave_observed = true;
         if (self.handlePeerLeaveObserved(true)) return;
         if (self.terminal != .none) return;
-        self.enterTerminal(.disconnected, .none, "Opponent disconnected at frame {}.", .{@as(u32, @truncate(disconnect.last_frame_cursor))});
+        self.enterTerminal(.disconnected, .none, "Opponent disconnected at frame {}; this match is not counted.", .{@as(u32, @truncate(disconnect.last_frame_cursor))});
     }
 
     fn handleResult(self: *OnlineState, result: protocol.Result) void {
@@ -555,6 +589,15 @@ const OnlineState = struct {
         }
     }
 
+    fn handleProfile(self: *OnlineState, profile_packet: protocol.Profile) void {
+        const role = self.role orelse return;
+        const match_id = self.currentMatchId() orelse return;
+        self.remote_profile = online_session.acceptRemoteProfile(role, match_id, profile_packet) catch |err| {
+            self.setNotice("Ignoring opponent profile card: {s}", .{@errorName(err)});
+            return;
+        };
+    }
+
     fn driveHandshake(self: *OnlineState) void {
         var session = self.sessionPtr() orelse return;
         if (self.role == .host and session.state == .waiting_for_ack and web_transport.status() == .connected and !self.sent_setup) {
@@ -566,6 +609,22 @@ const OnlineState = struct {
             self.sent_setup = true;
             self.setMessage("Setup sent. Waiting for P2 ack.", .{});
         }
+    }
+
+    fn maybeSendProfile(self: *OnlineState) void {
+        if (self.sent_profile or web_transport.status() != .connected) return;
+        const match_id = self.currentMatchId() orelse return;
+        const encoded = online_session.encodeProfilePacket(match_id, self.localProtocolSlot(), self.local_profile) catch |err| {
+            self.sent_profile = true;
+            self.setNotice("Local profile card could not be encoded: {s}", .{@errorName(err)});
+            return;
+        };
+        web_transport.sendBestEffort(encoded.slice()) catch |err| {
+            self.sent_profile = true;
+            self.setNotice("Local profile card was not sent: {s}", .{@errorName(err)});
+            return;
+        };
+        self.sent_profile = true;
     }
 
     fn driveLockstep(self: *OnlineState, frame_input: input.FrameInput) void {
@@ -688,7 +747,17 @@ const OnlineState = struct {
                 if (self.result_drain_frames_left > 0) self.result_drain_frames_left -= 1;
             },
             .finish_verified => {
-                self.enterTerminal(.finished, .none, "Match complete. Online rematch is not implemented yet.", .{});
+                self.recordVerifiedProfileResult();
+                if (self.profile_result_recorded and !self.profile_result_update_failed) {
+                    self.enterTerminal(.finished, .none, "Match complete. Local rating {s}{d} -> {}{s}. Online rematch is not implemented yet.", .{
+                        if (self.profile_rating_delta >= 0) "+" else "-",
+                        @abs(self.profile_rating_delta),
+                        self.profile_rating_after,
+                        self.localProfileResultPersistenceSuffix().ptr,
+                    });
+                } else {
+                    self.enterTerminal(.finished, .none, "Match complete and verified. Local rating was not updated.", .{});
+                }
             },
             .finish_unverified_disconnect => {
                 self.enterTerminal(.unverified_result, .none, "Opponent disconnected before result verification; this match is not counted as a win or loss.", .{});
@@ -709,6 +778,7 @@ const OnlineState = struct {
         }) {
             .accepted => {
                 self.verified_result = true;
+                self.recordVerifiedProfileResult();
                 return .validated;
             },
             .pending_local_result => return .pending_local_result,
@@ -720,10 +790,48 @@ const OnlineState = struct {
         return self.terminal == .none;
     }
 
+    fn recordVerifiedProfileResult(self: *OnlineState) void {
+        if (online_session.profileRatingRecordAction(.{
+            .verified_result = self.hasVerifiedResult(),
+            .has_local_outcome = self.hasLocalOutcome(),
+            .already_recorded = self.profile_result_recorded,
+        }) != .record) return;
+
+        self.profile_result_recorded = true;
+        const role = self.role orelse {
+            self.profile_result_update_failed = true;
+            return;
+        };
+        const peer = self.lockstepPeerConst() orelse {
+            self.profile_result_update_failed = true;
+            return;
+        };
+        const outcome = peer.match.outcome orelse {
+            self.profile_result_update_failed = true;
+            return;
+        };
+
+        self.profile_rating_before = self.local_profile.rating;
+        const result = online_session.profileResultForLocalRole(role, outcome);
+        const opponent_rating = online_session.opponentRatingForProfileUpdate(self.remote_profile);
+        const mutation = web_profile.applyVerifiedResultWithStatus(result, opponent_rating) catch {
+            self.profile_storage_status = web_profile.status();
+            self.profile_result_update_failed = true;
+            self.profile_rating_after = self.profile_rating_before;
+            self.profile_rating_delta = 0;
+            return;
+        };
+        self.local_profile = mutation.card;
+        self.profile_storage_status = mutation.status;
+        self.profile_rating_after = self.local_profile.rating;
+        self.profile_rating_delta = @as(i32, self.profile_rating_after) - @as(i32, self.profile_rating_before);
+        self.profile_result_update_failed = false;
+    }
+
     fn handleRemoteResultValidationError(self: *OnlineState, err: anyerror) void {
         switch (err) {
             error.ResultOutcomeMismatch, error.ResultFrameCursorMismatch, error.ResultStateHashMismatch => {
-                self.enterTerminal(.desynced, .desync, "Opponent result disagreed with local final state: {s}", .{@errorName(err)});
+                self.enterTerminal(.desynced, .desync, "Opponent result disagreed with local final state: {s}; not counted.", .{@errorName(err)});
             },
             error.InvalidResultSenderSlot => {
                 self.enterTerminal(.failed, .{ .disconnect = 12 }, "Opponent result sender rejected: {s}", .{@errorName(err)});
@@ -739,7 +847,7 @@ const OnlineState = struct {
         self.handlePeerStatus();
         if (self.terminal != .none) return;
         if (err == error.StateHashMismatch) {
-            self.enterTerminal(.desynced, .desync, "Desync detected; match stopped.", .{});
+            self.enterTerminal(.desynced, .desync, "Desync detected; match stopped and is not counted.", .{});
             return;
         }
         self.enterTerminal(.failed, .{ .disconnect = 4 }, "Lockstep error: {s}", .{@errorName(err)});
@@ -753,7 +861,7 @@ const OnlineState = struct {
                 self.enterTerminal(.failed, .{ .disconnect = 5 }, "Protocol error: {s}", .{protocolErrorText(reason).ptr});
             },
             .desync => {
-                self.enterTerminal(.desynced, .desync, "Desync detected; match stopped.", .{});
+                self.enterTerminal(.desynced, .desync, "Desync detected; match stopped and is not counted.", .{});
             },
         }
     }
@@ -968,8 +1076,42 @@ const OnlineState = struct {
         return state.sent_result or state.has_local_outcome or state.result_drain_active;
     }
 
+    fn localProfileChangesArePersistent(self: *const OnlineState) bool {
+        return switch (self.profile_storage_status) {
+            .ready => true,
+            .memory_only, .storage_error, .crypto_unavailable => false,
+            .unavailable, .missing_js => true,
+        };
+    }
+
+    fn localProfileStorageNote(self: *const OnlineState) [:0]const u8 {
+        return switch (self.profile_storage_status) {
+            .memory_only => "Local profile is memory-only; changes are not saved.",
+            .storage_error => "Local profile storage failed; changes are not saved.",
+            .crypto_unavailable => "Local profile is anonymous memory-only; changes are not saved.",
+            .ready, .unavailable, .missing_js => "",
+        };
+    }
+
+    fn localProfileResultPersistenceSuffix(self: *const OnlineState) [:0]const u8 {
+        return if (self.localProfileChangesArePersistent()) "" else " (memory-only; not saved)";
+    }
+
     fn localProtocolSlot(self: *const OnlineState) u8 {
         return online_session.localProtocolSlotForRole(self.role orelse .host);
+    }
+
+    fn localPlayerIndex(self: *const OnlineState) ?match_mod.PlayerIndex {
+        return switch (self.role orelse return null) {
+            .host => .p1,
+            .joiner => .p2,
+        };
+    }
+
+    fn profileForPlayer(self: *const OnlineState, player: match_mod.PlayerIndex) ?*const profile.ProfileCard {
+        const local_player = self.localPlayerIndex() orelse return null;
+        if (player == local_player) return &self.local_profile;
+        return if (self.remote_profile) |*remote| remote else null;
     }
 
     fn phaseText(self: *const OnlineState) [:0]const u8 {
@@ -1819,17 +1961,26 @@ fn drawOnlineWaitingPanel(online: *const OnlineState) void {
     const x: i32 = 250;
     const y: i32 = 160;
     const w: i32 = 600;
-    const h: i32 = 330;
+    const h: i32 = 390;
     drawPanel(x, y, w, h, "ONLINE INVITE");
     drawTextSlice(online.message(), x + 28, y + 56, 18, color_text);
     rl.drawText(rl.textFormat("Role: %s", .{online.roleText().ptr}), x + 28, y + 92, 16, color_text_dim);
     rl.drawText(rl.textFormat("Phase: %s", .{online.phaseText().ptr}), x + 28, y + 118, 16, color_text_dim);
+    drawOnlineProfileSummary("You", &online.local_profile, x + 28, y + 150, color_text);
+    if (online.remote_profile) |*remote| {
+        drawOnlineProfileSummary("Opponent", remote, x + 28, y + 174, color_text_dim);
+    } else {
+        rl.drawText("Opponent: Waiting for opponent profile...", x + 28, y + 174, 14, color_text_dim);
+    }
+    if (!online.localProfileChangesArePersistent()) {
+        rl.drawText(online.localProfileStorageNote(), x + 28, y + 198, 13, color_warning);
+    }
 
     if (online.room_len > 0) {
-        rl.drawText(rl.textFormat("Room: %.*s", .{ @as(i32, @intCast(online.roomId().len)), online.roomId().ptr }), x + 28, y + 158, 16, color_accent);
+        rl.drawText(rl.textFormat("Room: %.*s", .{ @as(i32, @intCast(online.roomId().len)), online.roomId().ptr }), x + 28, y + 220, 16, color_accent);
     }
     if (online.join_url_len > 0) {
-        rl.drawText("Join URL:", x + 28, y + 194, 15, color_text_dim);
+        rl.drawText("Join URL:", x + 28, y + 252, 15, color_text_dim);
         const url = online.joinUrl();
         const shown_len = @min(url.len, 88);
         const suffix: [:0]const u8 = if (shown_len < url.len) "..." else "";
@@ -1837,7 +1988,7 @@ fn drawOnlineWaitingPanel(online: *const OnlineState) void {
             @as(i32, @intCast(shown_len)),
             url.ptr,
             suffix.ptr,
-        }), x + 28, y + 218, 13, color_text);
+        }), x + 28, y + 274, 13, color_text);
     }
 
     rl.drawText("Press C to copy the invite link. Press 1/2 to leave, or 3 from another mode for a fresh invite.", x + 28, y + h - 54, 15, color_text_dim);
@@ -1846,6 +1997,36 @@ fn drawOnlineWaitingPanel(online: *const OnlineState) void {
         @as(i32, web_transport.peerCount()),
         web_transport.lastError().text().ptr,
     }), x + 28, y + h - 28, 13, color_text_dim);
+}
+
+fn drawOnlineProfileSummary(label: [:0]const u8, card: *const profile.ProfileCard, x: i32, y: i32, color: rl.Color) void {
+    rl.drawText(rl.textFormat("%s: %.*s | Local rating %u | %u-%u-%u", .{
+        label.ptr,
+        @as(i32, @intCast(card.nicknameText().len)),
+        card.nicknameText().ptr,
+        card.rating,
+        card.wins,
+        card.losses,
+        card.draws,
+    }), x, y, 14, color);
+}
+
+fn drawOnlineBoardProfile(online: *const OnlineState, player: match_mod.PlayerIndex) void {
+    const layout = versusBoardLayout(player);
+    const x = layout.x + 6;
+    const y = layout.y - 28;
+    if (online.profileForPlayer(player)) |card| {
+        const nickname = card.nicknameText();
+        rl.drawText(rl.textFormat("%.*s", .{ @as(i32, @intCast(nickname.len)), nickname.ptr }), x, y, 12, color_text);
+        rl.drawText(rl.textFormat("Local rating %u  W-L-D %u-%u-%u", .{
+            card.rating,
+            card.wins,
+            card.losses,
+            card.draws,
+        }), x, y + 15, 11, color_text_dim);
+    } else {
+        rl.drawText("Waiting for opponent profile...", x, y + 5, 11, color_text_dim);
+    }
 }
 
 fn drawOnlineWaitingOverlay(online: *const OnlineState) void {
