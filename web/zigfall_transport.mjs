@@ -3,9 +3,10 @@
 import { joinRoom, selfId } from "./vendor/trystero-nostr.bundle.mjs";
 
 const MaxPacketSize = 512;
-// Bounded inbound backlog for the Zig poll bridge. Online lockstep now batches
-// inputs, but brief browser scheduling stalls can still deliver bursts; keep the
-// cap finite while giving the app a few seconds at 60 Hz to drain gracefully.
+// Bounded inbound backlog for the Zig poll bridge. Zig may emit roughly one
+// small runtime packet per sampled frame; browser scheduling can dispatch
+// callbacks in bursts. Keep the cap finite while leaving several seconds of
+// 60 Hz drain headroom.
 const MaxQueuedPackets = 256;
 const MaxRoomIdLength = 128;
 const RetiringSelectedPeerDrainMs = 2000;

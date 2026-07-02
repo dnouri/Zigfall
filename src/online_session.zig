@@ -16,6 +16,9 @@ const profile = @import("profile");
 const protocol = @import("protocol");
 
 pub const DefaultInputDelayFrames: u16 = 8;
+/// Number of recent local input frames to include in each resend batch,
+/// counting the newest pending frame.
+pub const DefaultInputResendFrames: u8 = 8;
 
 pub const HostProtocolSlot: u8 = 0;
 pub const JoinerProtocolSlot: u8 = 1;
@@ -313,6 +316,11 @@ pub const InputBatcher = struct {
     count: u8 = 0,
     held_frames: u8 = 0,
     inputs: [protocol.MaxInputBatchCount]input.FrameInput = [_]input.FrameInput{.{}} ** protocol.MaxInputBatchCount,
+    history_match_id: u64 = 0,
+    history_player_slot: u8 = 0,
+    history_first_frame: u64 = 0,
+    history_count: u8 = 0,
+    history_inputs: [protocol.MaxInputBatchCount]input.FrameInput = [_]input.FrameInput{.{}} ** protocol.MaxInputBatchCount,
 
     pub fn hasPending(self: *const InputBatcher) bool {
         return self.count > 0;
@@ -324,6 +332,14 @@ pub const InputBatcher = struct {
 
     pub fn clear(self: *InputBatcher) void {
         self.* = .{};
+    }
+
+    /// Clear unsent inputs after a successful send while keeping resend history.
+    pub fn clearPending(self: *InputBatcher) void {
+        self.first_frame = 0;
+        self.count = 0;
+        self.held_frames = 0;
+        @memset(self.inputs[0..], .{});
     }
 
     pub fn noteFrameHeld(self: *InputBatcher) void {
@@ -345,6 +361,7 @@ pub const InputBatcher = struct {
         }
         self.inputs[self.count] = sample.frame_input;
         self.count += 1;
+        self.remember(sample);
     }
 
     pub fn shouldFlush(self: *const InputBatcher, target_count: u8, max_hold_frames: u8) bool {
@@ -358,6 +375,86 @@ pub const InputBatcher = struct {
         var encoded = EncodedPacket{};
         encoded.len = try protocol.encode(.{ .input_batch = batch }, encoded.bytes[0..]);
         return encoded;
+    }
+
+    /// Encode pending input plus a suffix of recent local input history.
+    /// Pending frames are always included, even when there are more of them
+    /// than the requested resend window.
+    pub fn encodeWithRecent(self: *const InputBatcher, resend_frames: u8) InputBatcherError!EncodedPacket {
+        if (!self.hasPending()) return error.InputBatchEmpty;
+        if (resend_frames <= 1) return self.encode();
+        try self.ensurePendingIsHistorySuffix();
+
+        const pending_count: usize = @intCast(self.count);
+        const requested_count = @min(@as(usize, resend_frames), protocol.MaxInputBatchCount);
+        const history_count: usize = @intCast(self.history_count);
+        const input_count = @min(@max(pending_count, requested_count), history_count);
+        return self.encodeHistorySuffix(self.match_id, self.player_slot, input_count);
+    }
+
+    /// Encode only remembered recent input. This is used after local sampling
+    /// stops but the peer may still need the tail of our input stream.
+    pub fn encodeRecent(self: *const InputBatcher, resend_frames: u8) InputBatcherError!EncodedPacket {
+        if (self.history_count == 0 or resend_frames == 0) return error.InputBatchEmpty;
+        const history_count: usize = @intCast(self.history_count);
+        const input_count = @min(@as(usize, resend_frames), history_count);
+        return self.encodeHistorySuffix(self.history_match_id, self.history_player_slot, input_count);
+    }
+
+    fn ensurePendingIsHistorySuffix(self: *const InputBatcher) InputBatcherError!void {
+        if (self.history_count == 0) return error.NonContiguousInputBatch;
+        if (self.match_id != self.history_match_id or self.player_slot != self.history_player_slot) return error.WrongInputBatchStream;
+        const history_end = std.math.add(u64, self.history_first_frame, @as(u64, self.history_count)) catch return error.NonContiguousInputBatch;
+        const pending_end = std.math.add(u64, self.first_frame, @as(u64, self.count)) catch return error.NonContiguousInputBatch;
+        if (self.first_frame < self.history_first_frame or pending_end != history_end) return error.NonContiguousInputBatch;
+    }
+
+    fn encodeHistorySuffix(self: *const InputBatcher, match_id: u64, player_slot: u8, input_count: usize) InputBatcherError!EncodedPacket {
+        const history_count: usize = @intCast(self.history_count);
+        if (input_count == 0) return error.InputBatchEmpty;
+        if (input_count > history_count) return error.NonContiguousInputBatch;
+
+        const first_history_index = history_count - input_count;
+        const first_frame = std.math.add(u64, self.history_first_frame, @as(u64, @intCast(first_history_index))) catch return error.NonContiguousInputBatch;
+        const batch = try protocol.InputBatch.init(match_id, player_slot, first_frame, self.history_inputs[first_history_index..history_count]);
+        var encoded = EncodedPacket{};
+        encoded.len = try protocol.encode(.{ .input_batch = batch }, encoded.bytes[0..]);
+        return encoded;
+    }
+
+    fn remember(self: *InputBatcher, sample: lockstep.LocalInputSample) void {
+        if (self.history_count == 0) {
+            self.resetHistory(sample);
+            return;
+        }
+
+        const expected_frame = std.math.add(u64, self.history_first_frame, @as(u64, self.history_count)) catch {
+            self.resetHistory(sample);
+            return;
+        };
+        if (sample.match_id != self.history_match_id or sample.player_slot != self.history_player_slot or sample.frame != expected_frame) {
+            self.resetHistory(sample);
+            return;
+        }
+
+        if (self.history_count < protocol.MaxInputBatchCount) {
+            self.history_inputs[self.history_count] = sample.frame_input;
+            self.history_count += 1;
+            return;
+        }
+
+        std.mem.copyForwards(input.FrameInput, self.history_inputs[0 .. protocol.MaxInputBatchCount - 1], self.history_inputs[1..protocol.MaxInputBatchCount]);
+        self.history_first_frame += 1;
+        self.history_inputs[protocol.MaxInputBatchCount - 1] = sample.frame_input;
+    }
+
+    fn resetHistory(self: *InputBatcher, sample: lockstep.LocalInputSample) void {
+        self.history_match_id = sample.match_id;
+        self.history_player_slot = sample.player_slot;
+        self.history_first_frame = sample.frame;
+        self.history_count = 1;
+        @memset(self.history_inputs[0..], .{});
+        self.history_inputs[0] = sample.frame_input;
     }
 };
 
@@ -731,6 +828,17 @@ fn testSettings() match_mod.MatchSettings {
 
 const TestMatchId: u64 = 0x0bad_f00d_cafe_babe;
 const OtherMatchId: u64 = 0xfeed_face_1234_5678;
+
+fn testFrameInput(index: usize) input.FrameInput {
+    return .{
+        .left_down = index & 1 != 0,
+        .right_down = index & 2 != 0,
+        .down_down = index & 4 != 0,
+        .rotate_cw_pressed = index & 8 != 0,
+        .rotate_ccw_pressed = index & 16 != 0,
+        .hold_pressed = index & 32 != 0,
+    };
+}
 
 fn testSetup() !protocol.Setup {
     return setupFromMatchSettings(TestMatchId, testSettings(), DefaultInputDelayFrames);
@@ -1479,13 +1587,14 @@ test "remote result waits for local terminal outcome then validates final state"
     try std.testing.expectError(error.ResultStateHashMismatch, validateRemoteResult(.host, peer, wrong_hash));
 }
 
-test "input batcher coalesces contiguous local samples and rejects gaps" {
+test "input batcher coalesces contiguous local samples, supports immediate flush, and rejects gaps" {
     var peer = try lockstep.Peer.init(testSettings(), HostPlayerIndex, 0, TestMatchId);
     var batcher = InputBatcher{};
 
     const first = try peer.sampleLocalInputFrame(.{ .left_down = true, .left_pressed = true });
     try batcher.append(first);
     try std.testing.expect(batcher.hasPending());
+    try std.testing.expect(batcher.shouldFlush(1, 0));
     try std.testing.expect(!batcher.shouldFlush(4, 3));
 
     batcher.noteFrameHeld();
@@ -1515,6 +1624,126 @@ test "input batcher coalesces contiguous local samples and rejects gaps" {
     batcher.clear();
     try std.testing.expect(!batcher.hasPending());
     try std.testing.expectError(error.InputBatchEmpty, batcher.encode());
+}
+
+test "input batcher rolling resend encodes recent contiguous samples" {
+    var peer = try lockstep.Peer.init(testSettings(), HostPlayerIndex, 0, TestMatchId);
+    var batcher = InputBatcher{};
+    const frames = [_]input.FrameInput{
+        .{ .left_down = true, .left_pressed = true },
+        .{ .right_down = true, .right_pressed = true },
+        .{ .rotate_cw_pressed = true },
+        .{ .rotate_ccw_pressed = true },
+        .{ .hold_pressed = true },
+        .{ .hard_drop_pressed = true },
+    };
+
+    var encoded = EncodedPacket{};
+    for (frames) |frame_input| {
+        try batcher.append(try peer.sampleLocalInputFrame(frame_input));
+        encoded = try batcher.encodeWithRecent(4);
+        batcher.clearPending();
+    }
+
+    switch (try protocol.decode(encoded.slice())) {
+        .input_batch => |batch| {
+            try std.testing.expectEqual(TestMatchId, batch.match_id);
+            try std.testing.expectEqual(HostProtocolSlot, batch.player_slot);
+            try std.testing.expectEqual(@as(u64, 2), batch.first_frame);
+            try std.testing.expectEqual(@as(u8, 4), batch.count);
+            try std.testing.expectEqualDeep(frames[2], batch.inputs[0]);
+            try std.testing.expectEqualDeep(frames[3], batch.inputs[1]);
+            try std.testing.expectEqualDeep(frames[4], batch.inputs[2]);
+            try std.testing.expectEqualDeep(frames[5], batch.inputs[3]);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "input batcher rolling resend keeps pending frames beyond requested window" {
+    var peer = try lockstep.Peer.init(testSettings(), HostPlayerIndex, 0, TestMatchId);
+    var batcher = InputBatcher{};
+
+    for (0..4) |frame_index| {
+        try batcher.append(try peer.sampleLocalInputFrame(testFrameInput(frame_index)));
+    }
+
+    const encoded = try batcher.encodeWithRecent(2);
+    switch (try protocol.decode(encoded.slice())) {
+        .input_batch => |batch| {
+            try std.testing.expectEqual(@as(u64, 0), batch.first_frame);
+            try std.testing.expectEqual(@as(u8, 4), batch.count);
+            for (0..4) |frame_index| {
+                try std.testing.expectEqualDeep(testFrameInput(frame_index), batch.inputs[frame_index]);
+            }
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "input batcher rolling resend history rolls forward" {
+    var peer = try lockstep.Peer.init(testSettings(), HostPlayerIndex, 0, TestMatchId);
+    var batcher = InputBatcher{};
+    var encoded = EncodedPacket{};
+    const resend_frames = 8;
+    const total_frames = protocol.MaxInputBatchCount + 2;
+
+    for (0..total_frames) |frame_index| {
+        try batcher.append(try peer.sampleLocalInputFrame(testFrameInput(frame_index)));
+        encoded = try batcher.encodeWithRecent(resend_frames);
+        batcher.clearPending();
+    }
+    encoded = try batcher.encodeRecent(resend_frames);
+
+    switch (try protocol.decode(encoded.slice())) {
+        .input_batch => |batch| {
+            const first_frame = total_frames - resend_frames;
+            try std.testing.expectEqual(@as(u64, @intCast(first_frame)), batch.first_frame);
+            try std.testing.expectEqual(@as(u8, resend_frames), batch.count);
+            for (0..resend_frames) |offset| {
+                try std.testing.expectEqualDeep(testFrameInput(first_frame + offset), batch.inputs[offset]);
+            }
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "rolling resend recovers a dropped middle input batch" {
+    var sender = try lockstep.Peer.init(testSettings(), HostPlayerIndex, 0, TestMatchId);
+    var receiver = try lockstep.Peer.init(testSettings(), JoinerPlayerIndex, 0, TestMatchId);
+    var batcher = InputBatcher{};
+
+    for (0..6) |frame_index| {
+        try batcher.append(try sender.sampleLocalInputFrame(testFrameInput(frame_index)));
+        const encoded = try batcher.encodeWithRecent(4);
+        if (frame_index != 2) try receiver.receiveBytes(encoded.slice());
+        batcher.clearPending();
+        _ = try receiver.sampleLocalInputFrame(.{});
+    }
+
+    try std.testing.expectEqual(@as(usize, 6), try receiver.stepAvailable());
+    try std.testing.expect(receiver.isOk());
+}
+
+test "rolling resend input batches are safe duplicate input for receiver" {
+    var sender = try lockstep.Peer.init(testSettings(), HostPlayerIndex, 0, TestMatchId);
+    var receiver = try lockstep.Peer.init(testSettings(), JoinerPlayerIndex, 0, TestMatchId);
+    var batcher = InputBatcher{};
+    var first_encoded = EncodedPacket{};
+
+    for (0..6) |frame| {
+        const frame_input = input.FrameInput{ .left_down = frame % 2 == 0, .right_down = frame % 2 == 1 };
+        try batcher.append(try sender.sampleLocalInputFrame(frame_input));
+        const encoded = try batcher.encodeWithRecent(4);
+        if (frame == 0) first_encoded = encoded;
+        try receiver.receiveBytes(encoded.slice());
+        try receiver.receiveBytes(encoded.slice());
+        batcher.clearPending();
+        _ = try receiver.sampleLocalInputFrame(.{});
+    }
+
+    try std.testing.expectEqual(@as(usize, 6), try receiver.stepAvailable());
+    try receiver.receiveBytes(first_encoded.slice());
 }
 
 test "small fake packet exchange through two peers keeps state hashes equal" {

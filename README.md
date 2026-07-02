@@ -91,7 +91,7 @@ Fetch dependencies, format, test, and build the native desktop app:
 
 ```sh
 zig build --fetch=needed
-zig fmt build.zig build.zig.zon src/*.zig
+zig fmt build.zig build.zig.zon src/*.zig tools/*.zig
 zig build test
 zig build
 zig build -Doptimize=ReleaseFast
@@ -120,8 +120,9 @@ Linux cross targets may also need a target sysroot or system libraries for rayli
 These mirror the checks that are useful before publishing a Pages build:
 
 ```sh
-zig fmt build.zig build.zig.zon src/*.zig --check
+zig fmt build.zig build.zig.zon src/*.zig tools/*.zig --check
 zig build test --summary all
+zig build bench-lockstep -- --scenario clean --frames 60 --expect-complete --json
 zig build --summary all
 zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseSmall --summary all
 for file in web/zigfall_transport.mjs web/zigfall_transport_emscripten.js \

@@ -151,6 +151,33 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const bench_lockstep_step = b.step("bench-lockstep", "Run the deterministic two-peer lockstep network benchmark");
+    if (!target.query.isNative()) {
+        bench_lockstep_step.dependOn(&b.addFail("bench-lockstep is a native host CLI tool; omit -Dtarget or use a native target").step);
+    } else {
+        const bench_lockstep_mod = b.createModule(.{
+            .root_source_file = b.path("tools/bench_lockstep_net.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "input", .module = input_mod },
+                .{ .name = "lockstep", .module = lockstep_mod },
+                .{ .name = "match", .module = match_mod },
+                .{ .name = "online_session", .module = online_session_mod },
+                .{ .name = "protocol", .module = protocol_mod },
+            },
+        });
+        const bench_lockstep_exe = b.addExecutable(.{
+            .name = "bench_lockstep_net",
+            .root_module = bench_lockstep_mod,
+        });
+        const bench_lockstep_cmd = b.addRunArtifact(bench_lockstep_exe);
+        if (b.args) |args| {
+            bench_lockstep_cmd.addArgs(args);
+        }
+        bench_lockstep_step.dependOn(&bench_lockstep_cmd.step);
+    }
+
     const run_step = b.step("run", "Run the app");
 
     if (target.result.os.tag == .emscripten) {

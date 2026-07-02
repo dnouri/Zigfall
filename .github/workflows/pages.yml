@@ -38,10 +38,13 @@ jobs:
             libxcursor-dev
 
       - name: Check formatting
-        run: zig fmt build.zig build.zig.zon src/*.zig --check
+        run: zig fmt build.zig build.zig.zon src/*.zig tools/*.zig --check
 
       - name: Run tests
         run: zig build test
+
+      - name: Run lockstep network benchmark smoke test
+        run: zig build bench-lockstep -- --scenario clean --frames 60 --expect-complete --json
 
       - name: Run web JavaScript transport tests
         run: |

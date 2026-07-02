@@ -51,8 +51,12 @@ const local_garbage_seed: u64 = 0x4C4F_4341_4C56_5333;
 const online_hash_seed: u64 = 0x4F4E_4C49_4E45_5036;
 const online_state_hash_interval_frames: u64 = 60;
 const online_max_steps_per_frame: usize = 4;
-const online_input_batch_target_count: u8 = 4;
-const online_input_batch_max_hold_frames: u8 = 3;
+// Flush each local input sample immediately. Encoded input batches include a
+// rolling window of recent local frames; receivers accept identical duplicates,
+// so repeated frames do not change deterministic simulation.
+const online_input_batch_target_count: u8 = 1;
+const online_input_batch_max_hold_frames: u8 = 0;
+const online_input_resend_frames: u8 = online_session.DefaultInputResendFrames;
 const online_result_drain_frames: u16 = 120;
 const online_terminal_packet_drain_frames: u16 = 30;
 const online_late_final_packet_peer_leave_grace_frames: u16 = 30;
@@ -737,23 +741,28 @@ const OnlineState = struct {
 
     fn sendPendingInputBatch(self: *OnlineState) bool {
         if (!self.pending_input_batch.hasPending()) return true;
-        const encoded = self.pending_input_batch.encode() catch |err| {
+        const encoded = self.pending_input_batch.encodeWithRecent(online_input_resend_frames) catch |err| {
             self.handleLockstepError(err);
             return false;
         };
         if (!self.sendPacketBytes(encoded.slice())) return false;
-        self.pending_input_batch.clear();
+        self.pending_input_batch.clearPending();
         return true;
     }
 
     fn flushPendingInputBestEffort(self: *OnlineState) void {
         if (!self.pending_input_batch.hasPending()) return;
-        const encoded = self.pending_input_batch.encode() catch {
+        const encoded = self.pending_input_batch.encodeWithRecent(online_input_resend_frames) catch {
             self.pending_input_batch.clear();
             return;
         };
         web_transport.send(encoded.slice()) catch {};
-        self.pending_input_batch.clear();
+        self.pending_input_batch.clearPending();
+    }
+
+    fn sendRecentInputBestEffort(self: *OnlineState) void {
+        const encoded = self.pending_input_batch.encodeRecent(online_input_resend_frames) catch return;
+        web_transport.send(encoded.slice()) catch {};
     }
 
     fn finishOnlineMatch(self: *OnlineState) void {
@@ -774,6 +783,7 @@ const OnlineState = struct {
             .no_local_outcome => {},
             .send_local_result => {
                 self.flushPendingInputBestEffort();
+                self.sendRecentInputBestEffort();
                 self.sendResultBestEffort();
                 if (remote_status == .validated) {
                     self.startVerifiedResultDrain();
@@ -784,6 +794,7 @@ const OnlineState = struct {
                 }
             },
             .wait_for_remote_result => {
+                self.sendRecentInputBestEffort();
                 if (self.remote_result_wait_frames_left > 0) self.remote_result_wait_frames_left -= 1;
             },
             .start_verified_drain => {
