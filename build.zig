@@ -151,6 +151,33 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const bench_lockstep_step = b.step("bench-lockstep", "Run the deterministic two-peer lockstep network benchmark");
+    if (!target.query.isNative()) {
+        bench_lockstep_step.dependOn(&b.addFail("bench-lockstep is a native host CLI tool; omit -Dtarget or use a native target").step);
+    } else {
+        const bench_lockstep_mod = b.createModule(.{
+            .root_source_file = b.path("tools/bench_lockstep_net.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "input", .module = input_mod },
+                .{ .name = "lockstep", .module = lockstep_mod },
+                .{ .name = "match", .module = match_mod },
+                .{ .name = "online_session", .module = online_session_mod },
+                .{ .name = "protocol", .module = protocol_mod },
+            },
+        });
+        const bench_lockstep_exe = b.addExecutable(.{
+            .name = "bench_lockstep_net",
+            .root_module = bench_lockstep_mod,
+        });
+        const bench_lockstep_cmd = b.addRunArtifact(bench_lockstep_exe);
+        if (b.args) |args| {
+            bench_lockstep_cmd.addArgs(args);
+        }
+        bench_lockstep_step.dependOn(&bench_lockstep_cmd.step);
+    }
+
     const run_step = b.step("run", "Run the app");
 
     if (target.result.os.tag == .emscripten) {
@@ -181,9 +208,12 @@ pub fn build(b: *std.Build) void {
         // state. Emscripten's small default stack can overflow while copying the
         // first web Session into place, especially with debug/sanitizer builds.
         emcc_flags.put("-sSTACK_SIZE=1048576", {}) catch unreachable;
-        const emcc_settings = emsdk.emccDefaultSettings(b.allocator, .{
+        var emcc_settings = emsdk.emccDefaultSettings(b.allocator, .{
             .optimize = optimize,
         });
+        // Preserve the default C/WASM entry points while exposing one read-only
+        // JSON snapshot function for the query-gated browser debug facade.
+        emcc_settings.put("EXPORTED_FUNCTIONS", "['_main','_malloc','_free','_zigfall_debug_snapshot_json']") catch unreachable;
         const emcc_step = emsdk.emccStep(b, raylib_artifact, web_lib, .{
             .optimize = optimize,
             .flags = emcc_flags,

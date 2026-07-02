@@ -38,10 +38,24 @@ jobs:
             libxcursor-dev
 
       - name: Check formatting
-        run: zig fmt build.zig build.zig.zon src/*.zig --check
+        run: zig fmt build.zig build.zig.zon src/*.zig tools/*.zig --check
 
       - name: Run tests
         run: zig build test
+
+      - name: Run lockstep network benchmark smoke test
+        run: zig build bench-lockstep -- --scenario clean --frames 60 --expect-complete --json
+
+      - name: Run lockstep start-skew benchmark smoke test
+        run: |
+          zig build bench-lockstep -- --frames 120 \
+            --start-policy guarded-start \
+            --ack-delay 6 \
+            --start-delay 6 \
+            --start-guard 8 \
+            --expect-complete \
+            --expect-zero-start-skew \
+            --json
 
       - name: Run web JavaScript transport tests
         run: |
@@ -55,6 +69,10 @@ jobs:
             web/zigfall_profile_emscripten.js
             web/vendor/patch-trystero-bundle.mjs
             web/vendor/trystero-nostr.bundle.mjs
+            playwright.config.mjs
+            tools/serve_web.mjs
+            tools/browser-tests/fake_transport.js
+            tools/browser-tests/zigfall_web.spec.mjs
             tools/test_trystero_pkt_limit.mjs
             tools/test_zigfall_transport_adapter.mjs
             tools/test_zigfall_invite.mjs
@@ -94,6 +112,15 @@ jobs:
         run: |
           rm -rf zig-out/web
           zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseSmall
+
+      - name: Install browser test dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser stack smoke tests
+        run: npm run test:browser
 
       - name: Prepare Pages artifact
         run: |

@@ -3,15 +3,16 @@
 import { joinRoom, selfId } from "./vendor/trystero-nostr.bundle.mjs";
 
 const MaxPacketSize = 512;
-// Bounded inbound backlog for the Zig poll bridge. Online lockstep now batches
-// inputs, but brief browser scheduling stalls can still deliver bursts; keep the
-// cap finite while giving the app a few seconds at 60 Hz to drain gracefully.
+// Bounded inbound backlog for the Zig poll bridge. Zig may emit roughly one
+// small runtime packet per sampled frame; browser scheduling can dispatch
+// callbacks in bursts. Keep the cap finite while leaving several seconds of
+// 60 Hz drain headroom.
 const MaxQueuedPackets = 256;
 const MaxRoomIdLength = 128;
 const RetiringSelectedPeerDrainMs = 2000;
-const ProtocolVersion = 2;
+const ProtocolVersion = 3;
 const ProfilePacketType = 8;
-const AppId = "zigfall-trystero-v2";
+const AppId = "zigfall-trystero-v3";
 const TrysteroRelayUrls = Object.freeze([
   "wss://nostr.sathoarder.com",
   "wss://nostr.vulpem.com",
@@ -21,6 +22,32 @@ const TrysteroRelayUrls = Object.freeze([
 ]);
 const PacketActionName = "pkt";
 const noop = () => {};
+
+function freshDebugStats() {
+  return {
+    incoming: {
+      enqueuedTotal: 0,
+      dequeuedTotal: 0,
+      droppedQueueFull: 0,
+      droppedNonSelected: 0,
+      droppedOversize: 0,
+      evictedProfiles: 0,
+      maxDepth: 0,
+    },
+    send: {
+      attempts: 0,
+      pending: 0,
+      pendingBytes: 0,
+      maxPending: 0,
+      resolved: 0,
+      rejected: 0,
+      bestEffortRejected: 0,
+      lastLatencyMs: null,
+      maxLatencyMs: 0,
+      lastFailureMessage: "",
+    },
+  };
+}
 
 const Status = Object.freeze({
   unavailable: 0,
@@ -67,6 +94,9 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
   let retiringSelectedPeer = null;
   let hasSelectedPeerOnce = false;
   let incoming = [];
+  let pendingSends = new Map();
+  let nextSendId = 1;
+  let debugStats = freshDebugStats();
   let currentStatus = Status.disconnected;
   let lastError = ErrorCode.none;
   let lastErrorMessage = "";
@@ -150,6 +180,26 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
     return Math.max(0, peers.size - (hasSelectedPeer() ? 1 : 0));
   }
 
+  function makeIncomingEntry(bytes, peerId) {
+    return {
+      bytes,
+      peerId: typeof peerId === "string" ? peerId : "",
+      queuedAt: nowMs(),
+    };
+  }
+
+  function isProfileEntry(entry) {
+    return isProfilePacketView(entry.bytes);
+  }
+
+  function noteIncomingDepth() {
+    debugStats.incoming.maxDepth = Math.max(debugStats.incoming.maxDepth, incoming.length);
+  }
+
+  function noteIncomingDequeued() {
+    debugStats.incoming.dequeuedTotal += 1;
+  }
+
   function updateConnectedStatus() {
     if (!room) {
       setStatus(Status.disconnected);
@@ -205,6 +255,7 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
     if (generation !== connectionGeneration) return;
 
     if (!isSelectedMessagePeer(peerId)) {
+      debugStats.incoming.droppedNonSelected += 1;
       if (selectedPeerId === null && peers.size === 0 && hasSelectedPeerOnce) {
         setError(ErrorCode.noPeer, peerId ? "dropped packet from departed peer" : "dropped packet without peer id after peer left");
       } else {
@@ -214,29 +265,39 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
       return;
     }
 
-    const bytes = toOpaquePacketBytes(packet, { ignoreOversizedProfile: true });
-    if (!bytes) return;
+    const { bytes, code } = readOpaquePacketBytes(packet, { ignoreOversizedProfile: true });
+    if (!bytes) {
+      if (code === ErrorCode.packetTooLarge || code === ErrorCode.none) debugStats.incoming.droppedOversize += 1;
+      return;
+    }
 
+    const entry = makeIncomingEntry(bytes, peerId);
     if (isProfilePacketView(bytes)) {
-      const existingProfileIndex = incoming.findIndex(isProfilePacketView);
+      const existingProfileIndex = incoming.findIndex(isProfileEntry);
       if (existingProfileIndex !== -1) {
-        incoming[existingProfileIndex] = bytes;
+        incoming[existingProfileIndex] = entry;
+        debugStats.incoming.enqueuedTotal += 1;
+        noteIncomingDepth();
         return;
       }
     }
 
     if (incoming.length >= MaxQueuedPackets) {
-      const existingProfileIndex = incoming.findIndex(isProfilePacketView);
+      const existingProfileIndex = incoming.findIndex(isProfileEntry);
       if (existingProfileIndex !== -1) {
         incoming.splice(existingProfileIndex, 1);
+        debugStats.incoming.evictedProfiles += 1;
       } else {
+        debugStats.incoming.droppedQueueFull += 1;
         if (isProfilePacketView(bytes)) return;
         setError(ErrorCode.queueFull, `incoming queue full (${MaxQueuedPackets} packets)`);
         return;
       }
     }
 
-    incoming.push(bytes);
+    incoming.push(entry);
+    debugStats.incoming.enqueuedTotal += 1;
+    noteIncomingDepth();
   }
 
   function disconnect() {
@@ -271,6 +332,9 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
     retiringSelectedPeer = null;
     hasSelectedPeerOnce = false;
     incoming = [];
+    pendingSends = new Map();
+    nextSendId = 1;
+    debugStats = freshDebugStats();
     setStatus(Status.disconnected);
     clearAllErrors();
   }
@@ -357,15 +421,63 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
     const generation = connectionGeneration;
     const action = packetAction;
     const targetPeerId = selectedPeerId;
-    action.send(bytes, { target: targetPeerId }).catch((err) => {
-      if (generation !== connectionGeneration || packetAction !== action) return;
+    const sendId = nextSendId++;
+    const startedAt = nowMs();
+
+    pendingSends.set(sendId, { startedAt, byteLength: bytes.byteLength });
+    debugStats.send.attempts += 1;
+    debugStats.send.pending += 1;
+    debugStats.send.pendingBytes += bytes.byteLength;
+    debugStats.send.maxPending = Math.max(debugStats.send.maxPending, debugStats.send.pending);
+
+    const finishSend = (ok, err = null) => {
+      if (generation !== connectionGeneration || packetAction !== action) return false;
+      const pending = pendingSends.get(sendId);
+      if (!pending) return false;
+      pendingSends.delete(sendId);
+      debugStats.send.pending = Math.max(0, debugStats.send.pending - 1);
+      debugStats.send.pendingBytes = Math.max(0, debugStats.send.pendingBytes - pending.byteLength);
+      const latency = Math.max(0, nowMs() - pending.startedAt);
+      debugStats.send.lastLatencyMs = latency;
+      debugStats.send.maxLatencyMs = Math.max(debugStats.send.maxLatencyMs, latency);
+      if (ok) {
+        debugStats.send.resolved += 1;
+      } else {
+        debugStats.send.rejected += 1;
+        if (bestEffort) debugStats.send.bestEffortRejected += 1;
+        debugStats.send.lastFailureMessage = String(errorMessage(err) || "send failed");
+      }
+      return true;
+    };
+
+    let sendPromise;
+    try {
+      sendPromise = action.send(bytes, { target: targetPeerId });
+    } catch (err) {
+      finishSend(false, err);
       if (bestEffort) {
         console.warn("[ZigfallTransport] best-effort send failed", err);
-        return;
+        return ErrorCode.none;
       }
       setError(ErrorCode.sendFailed, errorMessage(err));
       console.warn("[ZigfallTransport] send failed", err);
-    });
+      return ErrorCode.sendFailed;
+    }
+
+    Promise.resolve(sendPromise).then(
+      () => {
+        finishSend(true);
+      },
+      (err) => {
+        if (!finishSend(false, err)) return;
+        if (bestEffort) {
+          console.warn("[ZigfallTransport] best-effort send failed", err);
+          return;
+        }
+        setError(ErrorCode.sendFailed, errorMessage(err));
+        console.warn("[ZigfallTransport] send failed", err);
+      },
+    );
     return ErrorCode.none;
   }
 
@@ -378,12 +490,16 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
   }
 
   function poll() {
-    return incoming.shift() ?? null;
+    const entry = incoming.shift() ?? null;
+    if (!entry) return null;
+    noteIncomingDequeued();
+    return entry.bytes;
   }
 
   function pollInto(heapU8, ptr, capacity) {
-    const packet = incoming[0];
-    if (!packet) return 0;
+    const entry = incoming[0];
+    if (!entry) return 0;
+    const packet = entry.bytes;
     if (packet.byteLength > capacity) {
       setError(ErrorCode.bufferTooSmall, `poll buffer is ${capacity} bytes; packet is ${packet.byteLength} bytes`);
       return -ErrorCode.bufferTooSmall;
@@ -391,6 +507,7 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
 
     heapU8.set(packet, ptr);
     incoming.shift();
+    noteIncomingDequeued();
     return packet.byteLength;
   }
 
@@ -405,6 +522,108 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
 
   function errorName(code = lastError) {
     return Object.keys(ErrorCode).find((key) => ErrorCode[key] === code) ?? "unknown";
+  }
+
+  function ageMs(now, startedAt) {
+    return Math.max(0, now - startedAt);
+  }
+
+  function selectedPeerConnection() {
+    if (!room || typeof room.getPeers !== "function" || selectedPeerId === null) return null;
+    try {
+      const peerConnections = room.getPeers();
+      return peerConnections?.[selectedPeerId] ?? null;
+    } catch (_err) {
+      return null;
+    }
+  }
+
+  function selectedPeerSnapshot() {
+    const connection = selectedPeerConnection();
+    if (!connection) return null;
+    return {
+      connectionState: connection.connectionState ?? null,
+      iceConnectionState: connection.iceConnectionState ?? null,
+      iceGatheringState: connection.iceGatheringState ?? null,
+      signalingState: connection.signalingState ?? null,
+      sctpState: connection.sctp?.state ?? null,
+    };
+  }
+
+  function oldestPendingSendAgeMs(now) {
+    let oldest = null;
+    for (const pending of pendingSends.values()) {
+      const age = ageMs(now, pending.startedAt);
+      if (oldest === null || age > oldest) oldest = age;
+    }
+    return oldest;
+  }
+
+  function incomingAgeBounds(now) {
+    let oldest = null;
+    let newest = null;
+    for (const entry of incoming) {
+      const age = ageMs(now, entry.queuedAt);
+      if (oldest === null || age > oldest) oldest = age;
+      if (newest === null || age < newest) newest = age;
+    }
+    return { oldest, newest };
+  }
+
+  function debugSnapshot() {
+    const now = nowMs();
+    const status = statusCode();
+    const incomingAges = incomingAgeBounds(now);
+    return {
+      generation: connectionGeneration,
+      roomId,
+      status,
+      statusName: statusName(status),
+      error: {
+        code: lastError,
+        name: errorName(lastError),
+        message: lastErrorMessage,
+      },
+      health: {
+        code: healthError,
+        name: errorName(healthError),
+        message: healthErrorMessage,
+      },
+      peers: {
+        count: peers.size,
+        ids: Array.from(peers),
+        selectedPeerId,
+        extraPeerCount: extraPeerCount(),
+        hadSelectedPeer: hasSelectedPeerOnce,
+      },
+      incoming: {
+        depth: incoming.length,
+        capacity: MaxQueuedPackets,
+        enqueuedTotal: debugStats.incoming.enqueuedTotal,
+        dequeuedTotal: debugStats.incoming.dequeuedTotal,
+        droppedQueueFull: debugStats.incoming.droppedQueueFull,
+        droppedNonSelected: debugStats.incoming.droppedNonSelected,
+        droppedOversize: debugStats.incoming.droppedOversize,
+        evictedProfiles: debugStats.incoming.evictedProfiles,
+        maxDepth: debugStats.incoming.maxDepth,
+        oldestAgeMs: incomingAges.oldest,
+        newestAgeMs: incomingAges.newest,
+      },
+      send: {
+        attempts: debugStats.send.attempts,
+        pending: debugStats.send.pending,
+        pendingBytes: debugStats.send.pendingBytes,
+        maxPending: debugStats.send.maxPending,
+        resolved: debugStats.send.resolved,
+        rejected: debugStats.send.rejected,
+        bestEffortRejected: debugStats.send.bestEffortRejected,
+        oldestPendingAgeMs: oldestPendingSendAgeMs(now),
+        lastLatencyMs: debugStats.send.lastLatencyMs,
+        maxLatencyMs: debugStats.send.maxLatencyMs,
+        lastFailureMessage: debugStats.send.lastFailureMessage,
+      },
+      selectedPeer: selectedPeerSnapshot(),
+    };
   }
 
   return Object.freeze({
@@ -440,6 +659,7 @@ function createZigfallTransport({ joinRoomImpl = joinRoom, selfIdValue = selfId,
     extraPeerCount,
     queuedPacketCount: () => incoming.length,
     roomId: () => roomId,
+    debugSnapshot,
   });
 }
 

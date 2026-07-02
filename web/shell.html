@@ -312,6 +312,143 @@
           if (text) console.error("[post-exception status] " + text);
         };
       };
+
+      (function() {
+        try {
+          if (new URLSearchParams(window.location.search).get("zf_debug") !== "1") return;
+        } catch (_err) {
+          return;
+        }
+
+        function jsonClone(value) {
+          if (value === undefined) return null;
+          return JSON.parse(JSON.stringify(value, function(_key, nested) {
+            if (typeof nested === "number") return Number.isFinite(nested) ? nested : null;
+            if (typeof nested === "bigint") return nested.toString();
+            if (typeof nested === "function" || typeof nested === "symbol") return undefined;
+            return nested === undefined ? null : nested;
+          }));
+        }
+
+        function numberOrNull(value) {
+          return typeof value === "number" && Number.isFinite(value) ? value : null;
+        }
+
+        function stringOrNull(value) {
+          return typeof value === "string" ? value : null;
+        }
+
+        function readTransportSnapshot(warnings) {
+          var transport = globalThis.ZigfallTransport;
+          if (!transport || typeof transport.debugSnapshot !== "function") {
+            warnings.push("ZigfallTransport.debugSnapshot() is unavailable.");
+            return null;
+          }
+          try {
+            return jsonClone(transport.debugSnapshot());
+          } catch (err) {
+            warnings.push("ZigfallTransport.debugSnapshot() failed: " + (err && err.message ? err.message : String(err)));
+            return null;
+          }
+        }
+
+        function makeSummary(transport) {
+          var fake = transport && transport.fake === true;
+          var peers = transport && transport.peers ? transport.peers : {};
+          var send = transport && transport.send ? transport.send : {};
+          var incoming = transport && transport.incoming ? transport.incoming : {};
+          var health = transport && transport.health ? transport.health : {};
+          return {
+            kind: transport ? (fake ? "fake-broadcast-channel" : "trystero-webrtc") : "missing",
+            fake: !!fake,
+            room: transport ? stringOrNull(transport.roomId) : null,
+            status: transport ? stringOrNull(transport.statusName) : null,
+            statusCode: transport ? numberOrNull(transport.status) : null,
+            peer: {
+              count: numberOrNull(peers.count),
+              selectedPeerId: stringOrNull(peers.selectedPeerId),
+              extraPeerCount: numberOrNull(peers.extraPeerCount),
+              hadSelectedPeer: typeof peers.hadSelectedPeer === "boolean" ? peers.hadSelectedPeer : null
+            },
+            send: {
+              attempts: numberOrNull(send.attempts),
+              pending: numberOrNull(send.pending),
+              pendingBytes: numberOrNull(send.pendingBytes),
+              rejected: numberOrNull(send.rejected)
+            },
+            receive: {
+              depth: numberOrNull(incoming.depth),
+              capacity: numberOrNull(incoming.capacity),
+              enqueuedTotal: numberOrNull(incoming.enqueuedTotal),
+              dequeuedTotal: numberOrNull(incoming.dequeuedTotal),
+              droppedQueueFull: numberOrNull(incoming.droppedQueueFull)
+            },
+            depth: numberOrNull(incoming.depth),
+            health: {
+              code: numberOrNull(health.code),
+              name: stringOrNull(health.name),
+              message: stringOrNull(health.message)
+            }
+          };
+        }
+
+        function readAppSnapshot(warnings) {
+          if (!Module || Module.calledRun !== true) return null;
+          if (typeof Module.ccall !== "function") {
+            warnings.push("Zig app debug snapshot is unavailable because Module.ccall is missing.");
+            return null;
+          }
+          try {
+            return jsonClone(JSON.parse(Module.ccall("zigfall_debug_snapshot_json", "string", [], [])));
+          } catch (err) {
+            warnings.push("Zig app debug snapshot failed: " + (err && err.message ? err.message : String(err)));
+            return null;
+          }
+        }
+
+        function pageSnapshot() {
+          return {
+            modulePresent: typeof Module === "object" && Module !== null,
+            moduleCalledRun: !!(Module && Module.calledRun === true),
+            wasmReady: !!(Module && Module.calledRun === true),
+            statusText: statusElement ? statusElement.textContent || "" : "",
+            canvas: canvasElement ? {
+              width: canvasElement.width,
+              height: canvasElement.height,
+              clientWidth: canvasElement.clientWidth,
+              clientHeight: canvasElement.clientHeight
+            } : null
+          };
+        }
+
+        var facade = Object.freeze({
+          snapshot: function() {
+            var capturedAtMs = Date.now();
+            var warnings = [];
+            var transport = readTransportSnapshot(warnings);
+            if (transport && transport.fake === true) {
+              warnings.push("Fake BroadcastChannel transport is active; this browser-test/local shim is not live WebRTC/Trystero evidence.");
+            }
+            return jsonClone({
+              schemaVersion: 1,
+              capturedAtMs: capturedAtMs,
+              capturedAtIso: new Date(capturedAtMs).toISOString(),
+              page: pageSnapshot(),
+              transport: transport,
+              summary: makeSummary(transport),
+              warnings: warnings,
+              app: readAppSnapshot(warnings)
+            });
+          }
+        });
+
+        Object.defineProperty(window, "ZigfallDebug", {
+          value: facade,
+          writable: false,
+          enumerable: false,
+          configurable: false
+        });
+      })();
     </script>
 
     <!-- Module.preRun imports zigfall_transport.mjs, zigfall_invite.mjs, and zigfall_profile.mjs before WASM main starts. -->

@@ -3,8 +3,8 @@
 //! Binary protocol foundation for deterministic two-player lockstep.
 //!
 //! Wire packets are opaque byte slices with a fixed ten-byte envelope: byte 0
-//! must equal `ProtocolVersion`, byte 1 is a `PacketType` tag, and bytes 2..9
-//! are the little-endian `match_id`. Decoders reject unknown versions and packet
+//! must equal `ProtocolVersion`, byte 1 is a packet type tag, and bytes 2..9 are
+//! the little-endian `match_id`. Decoders reject unknown versions and packet
 //! types. All integer fields are fixed-width and little-endian. A packet is
 //! capped at `MaxPacketSize` bytes, and one `InputBatch` may contain at most
 //! `MaxInputBatchCount` contiguous frames from `first_frame`.
@@ -15,9 +15,10 @@
 //! have been simulated. Never serialize raw Zig structs or rely on native memory
 //! layout. Profile packets carry bounded display-only metadata; callers must not
 //! feed profile contents into match seeds, slots, state hashes, result authority,
-//! or lockstep state. Protocol v2 adds those profile packets and is paired with
-//! the web transport's v2 Trystero app namespace so mixed v1/v2 clients do not
-//! silently pair. JS/Trystero code should move gameplay and lifecycle packets
+//! or lockstep state. Protocol v2 added those profile packets. Protocol v3
+//! adds a guarded START packet, paired with the web transport's v3 Trystero app
+//! namespace so mixed-version clients do not silently pair. JS/Trystero code
+//! should move gameplay and lifecycle packets
 //! as opaque bytes and queue asynchronous callbacks for Zig to poll; the only
 //! transport-level packet peek is a minimal type check to drop oversized
 //! display-only profile metadata without poisoning gameplay health.
@@ -26,7 +27,7 @@ const std = @import("std");
 const input = @import("input");
 const profile = @import("profile");
 
-pub const ProtocolVersion: u8 = 2;
+pub const ProtocolVersion: u8 = 3;
 pub const MatchIdSize: usize = 8;
 pub const HeaderSize: usize = 2 + MatchIdSize;
 pub const MaxPacketSize: usize = 512;
@@ -49,13 +50,17 @@ pub const InputMaskBits = struct {
     pub const restart_pressed: u16 = 1 << 11;
 };
 
-/// Protocol v2 reserves bits 12..15; decoders reject them instead of ignoring
+/// The protocol reserves bits 12..15; decoders reject them instead of ignoring
 /// unknown future inputs.
 pub const KnownInputMask: u16 = 0x0fff;
 pub const NullInitialHole: u8 = 255;
 pub const MaxInitialHoleIndex: u8 = 9;
 
 pub const SetupPacketSize: usize = HeaderSize + 1 + 1 + 2 + 8 + 8 + 8 + 1 + 1 + 1 + 1;
+/// Raw v3 START packet type. It is kept separate from `PacketType`/`Packet`
+/// until session/runtime routing is allowed to handle the new union tag.
+pub const StartPacketType: u8 = 9;
+pub const StartPacketSize: usize = HeaderSize + 1 + 8;
 pub const InputBatchPrefixSize: usize = HeaderSize + 1 + 8 + 1;
 pub const AckPacketSize: usize = HeaderSize + 1 + 1 + 8;
 pub const StateHashPacketSize: usize = HeaderSize + 1 + 8 + 8;
@@ -144,6 +149,15 @@ pub const Setup = struct {
     hole_den: u8,
     initial_hole_p1: ?u8 = null,
     initial_hole_p2: ?u8 = null,
+};
+
+/// Host-authored guarded start announcement. Session/runtime integration must
+/// later validate that `sender_slot` is the remote host slot before acting on
+/// `start_epoch_ms`.
+pub const Start = struct {
+    match_id: u64,
+    sender_slot: u8,
+    start_epoch_ms: u64,
 };
 
 pub const InputBatch = struct {
@@ -349,6 +363,13 @@ pub fn encode(packet: Packet, out: []u8) EncodeError!usize {
     };
 }
 
+pub fn encodeStart(start: Start, out: []u8) EncodeError!usize {
+    var cursor = try startRawPacket(out, StartPacketType, start.match_id, StartPacketSize);
+    putU8(out, &cursor, start.sender_slot);
+    putU64(out, &cursor, start.start_epoch_ms);
+    return cursor;
+}
+
 pub fn decode(bytes: []const u8) DecodeError!Packet {
     if (bytes.len > MaxPacketSize) return error.PacketTooLarge;
 
@@ -369,6 +390,19 @@ pub fn decode(bytes: []const u8) DecodeError!Packet {
         .result => .{ .result = try decodeResult(match_id, &reader) },
         .profile => .{ .profile = try decodeProfile(match_id, &reader) },
     };
+}
+
+pub fn decodeStart(bytes: []const u8) DecodeError!Start {
+    if (bytes.len > MaxPacketSize) return error.PacketTooLarge;
+
+    var reader = Reader{ .bytes = bytes };
+    const version = try reader.readU8();
+    if (version != ProtocolVersion) return error.InvalidVersion;
+
+    const packet_type = try reader.readU8();
+    if (packet_type != StartPacketType) return error.UnknownPacketType;
+    const match_id = try reader.readU64();
+    return try decodeStartBody(match_id, &reader);
 }
 
 /// Return the validated packet envelope without decoding the packet body.
@@ -522,6 +556,16 @@ fn decodeSetup(match_id: u64, reader: *Reader) DecodeError!Setup {
     return setup;
 }
 
+fn decodeStartBody(match_id: u64, reader: *Reader) DecodeError!Start {
+    const start = Start{
+        .match_id = match_id,
+        .sender_slot = try decodePlayerSlot(try reader.readU8()),
+        .start_epoch_ms = try reader.readU64(),
+    };
+    try reader.expectEnd();
+    return start;
+}
+
 fn decodeInputBatch(match_id: u64, reader: *Reader) DecodeError!InputBatch {
     var batch = InputBatch{
         .match_id = match_id,
@@ -619,10 +663,14 @@ fn decodeProfile(match_id: u64, reader: *Reader) DecodeError!Profile {
 }
 
 fn startPacket(out: []u8, packet_type: PacketType, match_id: u64, total_len: usize) EncodeError!usize {
+    return startRawPacket(out, @intFromEnum(packet_type), match_id, total_len);
+}
+
+fn startRawPacket(out: []u8, packet_type: u8, match_id: u64, total_len: usize) EncodeError!usize {
     if (total_len > MaxPacketSize) return error.PacketTooLarge;
     if (out.len < total_len) return error.BufferTooSmall;
     out[0] = ProtocolVersion;
-    out[1] = @intFromEnum(packet_type);
+    out[1] = packet_type;
     var cursor: usize = 2;
     putU64(out, &cursor, match_id);
     return HeaderSize;
@@ -795,6 +843,14 @@ fn setupFixture() Packet {
     } };
 }
 
+fn startFixture() Start {
+    return .{
+        .match_id = GoldenMatchId,
+        .sender_slot = 0,
+        .start_epoch_ms = 0x1122_3344_5566_7788,
+    };
+}
+
 fn profileFixture() Packet {
     return .{ .profile = Profile.init(
         GoldenMatchId,
@@ -861,7 +917,7 @@ test "setup packet round-trips" {
 
 test "setup packet has stable golden layout" {
     const expected = [_]u8{
-        2,
+        ProtocolVersion,
         1,
         0xef,
         0xcd,
@@ -908,6 +964,66 @@ test "setup packet has stable golden layout" {
     try expectGolden(setupFixture(), &expected);
 }
 
+test "start packet round-trips" {
+    const packet = startFixture();
+    var bytes: [MaxPacketSize]u8 = undefined;
+    const len = try encodeStart(packet, bytes[0..]);
+    try std.testing.expectEqual(StartPacketSize, len);
+    try std.testing.expectEqualDeep(packet, try decodeStart(bytes[0..len]));
+}
+
+test "start packet has stable golden layout" {
+    const expected = [_]u8{
+        ProtocolVersion,
+        StartPacketType,
+        0xef,
+        0xcd,
+        0xab,
+        0x89,
+        0x67,
+        0x45,
+        0x23,
+        0x01,
+        0,
+        0x88,
+        0x77,
+        0x66,
+        0x55,
+        0x44,
+        0x33,
+        0x22,
+        0x11,
+    };
+    try std.testing.expectEqual(@as(usize, StartPacketSize), expected.len);
+
+    var bytes: [MaxPacketSize]u8 = undefined;
+    const len = try encodeStart(startFixture(), bytes[0..]);
+    try std.testing.expectEqual(expected.len, len);
+    try std.testing.expectEqualSlices(u8, &expected, bytes[0..len]);
+    try std.testing.expectEqualDeep(startFixture(), try decodeStart(&expected));
+}
+
+test "start packet rejects wrong version type truncated trailing and invalid slots" {
+    var bytes: [MaxPacketSize]u8 = undefined;
+    const len = try encodeStart(startFixture(), bytes[0..]);
+
+    bytes[0] = 2;
+    try std.testing.expectError(error.InvalidVersion, decodeStart(bytes[0..len]));
+    bytes[0] = ProtocolVersion;
+
+    bytes[1] = @intFromEnum(PacketType.setup);
+    try std.testing.expectError(error.UnknownPacketType, decodeStart(bytes[0..len]));
+    bytes[1] = StartPacketType;
+
+    try std.testing.expectError(error.TruncatedPacket, decodeStart(bytes[0 .. len - 1]));
+
+    bytes[len] = 0xaa;
+    try std.testing.expectError(error.TrailingBytes, decodeStart(bytes[0 .. len + 1]));
+
+    bytes[HeaderSize] = 2;
+    try std.testing.expectError(error.InvalidPlayerSlot, decodeStart(bytes[0..len]));
+}
+
 test "input batch packet round-trips" {
     const packet = Packet{ .input_batch = try InputBatch.init(GoldenMatchId, 0, 120, &[_]input.FrameInput{
         .{ .left_down = true, .left_pressed = true },
@@ -924,7 +1040,7 @@ test "input batch packet has stable golden layout" {
         .{ .down_down = true, .hard_drop_pressed = true, .pause_pressed = true },
     }) };
     const expected = [_]u8{
-        2,
+        ProtocolVersion,
         2,
         0xef,
         0xcd,
@@ -972,7 +1088,7 @@ test "ack packet has stable golden layout" {
         .next_needed_frame = 321,
     } };
     const expected = [_]u8{
-        2,
+        ProtocolVersion,
         3,
         0xef,
         0xcd,
@@ -1014,7 +1130,7 @@ test "state hash packet has stable golden layout" {
         .state_hash = 0x0123_4567_89ab_cdef,
     } };
     const expected = [_]u8{
-        2,
+        ProtocolVersion,
         4,
         0xef,
         0xcd,
@@ -1067,7 +1183,7 @@ test "desync packet has stable golden layout" {
         .peer_hash = 0x1111_2222_3333_4444,
     } };
     const expected = [_]u8{
-        2,
+        ProtocolVersion,
         5,
         0xef,
         0xcd,
@@ -1125,7 +1241,7 @@ test "disconnect packet has stable golden layout" {
         .last_frame_cursor = 999,
     } };
     const expected = [_]u8{
-        2,
+        ProtocolVersion,
         6,
         0xef,
         0xcd,
@@ -1169,7 +1285,7 @@ test "result packet has stable golden layout" {
         .state_hash = 0xfedc_ba98_7654_3210,
     } };
     const expected = [_]u8{
-        2,
+        ProtocolVersion,
         7,
         0xef,
         0xcd,
@@ -1208,7 +1324,7 @@ test "profile packet round-trips" {
 
 test "profile packet has stable golden layout" {
     const expected = [_]u8{
-        2,
+        ProtocolVersion,
         8,
         0xef,
         0xcd,
@@ -1294,6 +1410,8 @@ test "profile packet rejects trailing bytes beyond declared field lengths" {
 }
 
 test "decode rejects invalid version and packet type" {
+    try std.testing.expectEqual(@as(u8, 3), ProtocolVersion);
+    try std.testing.expectError(error.InvalidVersion, decode(&[_]u8{ 2, @intFromEnum(PacketType.setup) }));
     try std.testing.expectError(error.InvalidVersion, decode(&[_]u8{ 0, 3 }));
     try std.testing.expectError(error.UnknownPacketType, decode(&[_]u8{ ProtocolVersion, 0xff }));
 }
@@ -1347,7 +1465,7 @@ test "overlarge packets are rejected" {
 
 test "input batch rejects too many inputs" {
     const bytes = [_]u8{
-        2,
+        ProtocolVersion,
         2,
         0xef,
         0xcd,
@@ -1376,7 +1494,7 @@ test "input batch rejects too many inputs" {
 
 test "input batch rejects invalid input mask" {
     const bytes = [_]u8{
-        2,
+        ProtocolVersion,
         2,
         0xef,
         0xcd,

@@ -9,6 +9,9 @@ zig-out/
 # Local scratch/tool state
 tmp/
 .playwright-cli/
+node_modules/
+test-results/
+playwright-report/
 
 # Editor and OS noise
 .DS_Store

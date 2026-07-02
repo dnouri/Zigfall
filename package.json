@@ -1,0 +1,12 @@
+{
+  "name": "zigfall",
+  "private": true,
+  "description": "Browser test harness for Zigfall's WebAssembly build.",
+  "license": "GPL-3.0-or-later",
+  "scripts": {
+    "test:browser": "playwright test --config=playwright.config.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1"
+  }
+}
