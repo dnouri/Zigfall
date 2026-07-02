@@ -16,6 +16,14 @@ const profile = @import("profile");
 const protocol = @import("protocol");
 
 pub const DefaultInputDelayFrames: u16 = 8;
+/// Default wall-clock delay between the host accepting ACK and both peers
+/// opening the local start gate.
+pub const DefaultStartLeadMs: u64 = 3_000;
+/// Reject START packets with too little remaining wall-clock lead instead of
+/// starting immediately on a packet that arrived late or nearly late.
+pub const StartMinLeadMs: u64 = 100;
+/// Reject START packets scheduled implausibly far in the future.
+pub const StartMaxLeadMs: u64 = 10_000;
 /// Number of recent local input frames to include in each resend batch,
 /// counting the newest pending frame.
 pub const DefaultInputResendFrames: u8 = 8;
@@ -37,7 +45,11 @@ pub const State = enum {
     waiting_for_ack,
     /// Joiner accepted setup and can encode/send its ack.
     setup_received,
-    /// Local lifecycle handshake is complete for this peer.
+    /// ACK is complete, but no validated START epoch is stored yet.
+    waiting_for_start,
+    /// A validated START epoch is stored; wait for local time to reach it.
+    start_scheduled,
+    /// Local start gate has opened for this peer.
     playing,
 };
 
@@ -45,6 +57,7 @@ pub const LifecycleError = error{
     InvalidSetupSenderSlot,
     InvalidAckSenderSlot,
     InvalidAckedSlot,
+    InvalidStartSenderSlot,
     InvalidInputDelay,
     InvalidLifecycleSenderSlot,
     InvalidResultSenderSlot,
@@ -53,10 +66,15 @@ pub const LifecycleError = error{
     WrongRole,
     UnexpectedSetup,
     UnexpectedAck,
+    UnexpectedStart,
     UnexpectedPacketType,
     SetupUnavailable,
+    StartUnavailable,
     MatchUnavailable,
     PeerUnavailable,
+    ConflictingStart,
+    StartLeadTooShort,
+    StartLeadTooLong,
 };
 
 pub const ResultValidationError = error{
@@ -464,6 +482,7 @@ pub const Session = struct {
     match_id: ?u64 = null,
     input_delay_frames: u16 = DefaultInputDelayFrames,
     setup: ?protocol.Setup = null,
+    start: ?protocol.Start = null,
     settings: ?match_mod.MatchSettings = null,
     peer: ?lockstep.Peer = null,
 
@@ -532,7 +551,10 @@ pub const Session = struct {
 
     pub fn buildJoinerAck(self: *const Session) OnlineSessionError!protocol.Ack {
         if (self.role != .joiner) return error.WrongRole;
-        if (self.state != .setup_received and self.state != .playing) return error.UnexpectedAck;
+        switch (self.state) {
+            .setup_received, .waiting_for_start, .start_scheduled, .playing => {},
+            .waiting_for_setup, .waiting_for_ack => return error.UnexpectedAck,
+        }
         const match_id = self.match_id orelse return error.MatchUnavailable;
         const peer = if (self.peer) |*peer| peer else return error.PeerUnavailable;
         return .{
@@ -544,7 +566,8 @@ pub const Session = struct {
     }
 
     /// Encode the joiner ack without mutating session state; callers should
-    /// mark the joiner playing only after the transport accepts the ack send.
+    /// mark the joiner as waiting for START only after the transport accepts the
+    /// ack send.
     pub fn encodeJoinerAck(self: *const Session) OnlineSessionError!EncodedPacket {
         const ack = try self.buildJoinerAck();
         return try encodeAckPacket(ack);
@@ -553,9 +576,9 @@ pub const Session = struct {
     pub fn markJoinerAckSent(self: *Session) OnlineSessionError!void {
         if (self.role != .joiner) return error.WrongRole;
         switch (self.state) {
-            .setup_received => self.state = .playing,
-            .playing => {},
-            .waiting_for_setup, .waiting_for_ack => return error.UnexpectedAck,
+            .setup_received => self.state = .waiting_for_start,
+            .waiting_for_start, .playing => {},
+            .waiting_for_setup, .waiting_for_ack, .start_scheduled => return error.UnexpectedAck,
         }
     }
 
@@ -568,11 +591,92 @@ pub const Session = struct {
         if (ack.acked_slot != HostProtocolSlot) return error.InvalidAckedSlot;
 
         try self.ensureHostPeer();
-        self.state = .playing;
+        self.state = .waiting_for_start;
     }
 
     pub fn acceptAckBytes(self: *Session, bytes: []const u8) OnlineSessionError!void {
         try self.acceptAck(try decodeAckPacket(bytes));
+    }
+
+    pub fn acceptAckAndScheduleStart(self: *Session, ack: protocol.Ack, start_epoch_ms: u64, now_ms: u64) OnlineSessionError!protocol.Start {
+        try validateStartLead(start_epoch_ms, now_ms);
+        try self.acceptAck(ack);
+        return try self.scheduleStart(start_epoch_ms, now_ms);
+    }
+
+    pub fn scheduleStart(self: *Session, start_epoch_ms: u64, now_ms: u64) OnlineSessionError!protocol.Start {
+        if (self.role != .host) return error.WrongRole;
+        const match_id = self.match_id orelse return error.MatchUnavailable;
+        const start = protocol.Start{
+            .match_id = match_id,
+            .sender_slot = HostProtocolSlot,
+            .start_epoch_ms = start_epoch_ms,
+        };
+
+        switch (self.state) {
+            .waiting_for_start => {
+                try validateStartLead(start_epoch_ms, now_ms);
+                self.start = start;
+                self.state = .start_scheduled;
+                return start;
+            },
+            .start_scheduled => {
+                const existing = self.start orelse return error.StartUnavailable;
+                if (!std.meta.eql(existing, start)) return error.ConflictingStart;
+                return existing;
+            },
+            .waiting_for_setup, .waiting_for_ack, .setup_received, .playing => return error.UnexpectedStart,
+        }
+    }
+
+    pub fn startPacket(self: *const Session) OnlineSessionError!protocol.Start {
+        if (self.role != .host) return error.WrongRole;
+        return self.start orelse return error.StartUnavailable;
+    }
+
+    pub fn encodeStartPacket(self: *const Session) OnlineSessionError!EncodedPacket {
+        var encoded = EncodedPacket{};
+        encoded.len = try protocol.encodeStart(try self.startPacket(), encoded.bytes[0..]);
+        return encoded;
+    }
+
+    pub fn acceptStart(self: *Session, start: protocol.Start, now_ms: u64) OnlineSessionError!void {
+        if (self.role != .joiner) return error.WrongRole;
+        switch (self.state) {
+            .waiting_for_start, .start_scheduled, .playing => {},
+            .waiting_for_setup, .waiting_for_ack, .setup_received => return error.UnexpectedStart,
+        }
+
+        const match_id = self.match_id orelse return error.MatchUnavailable;
+        if (start.match_id != match_id) return error.WrongMatchId;
+        if (start.sender_slot != HostProtocolSlot) return error.InvalidStartSenderSlot;
+
+        if (self.state == .start_scheduled or self.state == .playing) {
+            const existing = self.start orelse return error.StartUnavailable;
+            if (!std.meta.eql(existing, start)) return error.ConflictingStart;
+            return;
+        }
+
+        try validateStartLead(start.start_epoch_ms, now_ms);
+        self.start = start;
+        self.state = .start_scheduled;
+    }
+
+    pub fn acceptStartBytes(self: *Session, bytes: []const u8, now_ms: u64) OnlineSessionError!void {
+        try self.acceptStart(try decodeStartPacket(bytes), now_ms);
+    }
+
+    pub fn advanceStartGate(self: *Session, now_ms: u64) OnlineSessionError!bool {
+        switch (self.state) {
+            .start_scheduled => {
+                const start = self.start orelse return error.StartUnavailable;
+                if (now_ms < start.start_epoch_ms) return false;
+                self.state = .playing;
+                return true;
+            },
+            .playing => return true,
+            .waiting_for_setup, .waiting_for_ack, .setup_received, .waiting_for_start => return false,
+        }
     }
 
     fn ensureHostPeer(self: *Session) OnlineSessionError!void {
@@ -628,12 +732,25 @@ pub fn validateInputDelayFrames(input_delay_frames: u16) LifecycleError!void {
     if (@as(usize, input_delay_frames) >= lockstep.MaxBufferedFrames) return error.InvalidInputDelay;
 }
 
+pub fn validateStartLead(start_epoch_ms: u64, now_ms: u64) LifecycleError!void {
+    if (start_epoch_ms < now_ms) return error.StartLeadTooShort;
+    const lead_ms = start_epoch_ms - now_ms;
+    if (lead_ms < StartMinLeadMs) return error.StartLeadTooShort;
+    if (lead_ms > StartMaxLeadMs) return error.StartLeadTooLong;
+}
+
 pub fn encodeSetupPacket(setup: protocol.Setup) OnlineSessionError!EncodedPacket {
     return encodePacket(.{ .setup = setup });
 }
 
 pub fn encodeAckPacket(ack: protocol.Ack) OnlineSessionError!EncodedPacket {
     return encodePacket(.{ .ack = ack });
+}
+
+pub fn encodeStartPacket(start: protocol.Start) OnlineSessionError!EncodedPacket {
+    var encoded = EncodedPacket{};
+    encoded.len = try protocol.encodeStart(start, encoded.bytes[0..]);
+    return encoded;
 }
 
 pub fn decodeSetupPacket(bytes: []const u8) OnlineSessionError!protocol.Setup {
@@ -647,6 +764,13 @@ pub fn decodeAckPacket(bytes: []const u8) OnlineSessionError!protocol.Ack {
     return switch (try protocol.decode(bytes)) {
         .ack => |ack| ack,
         else => error.UnexpectedPacketType,
+    };
+}
+
+pub fn decodeStartPacket(bytes: []const u8) OnlineSessionError!protocol.Start {
+    return protocol.decodeStart(bytes) catch |err| switch (err) {
+        error.UnknownPacketType => error.UnexpectedPacketType,
+        else => err,
     };
 }
 
@@ -828,6 +952,25 @@ fn testSettings() match_mod.MatchSettings {
 
 const TestMatchId: u64 = 0x0bad_f00d_cafe_babe;
 const OtherMatchId: u64 = 0xfeed_face_1234_5678;
+const TestNowMs: u64 = 1_700_000_000_000;
+const TestStartEpochMs: u64 = TestNowMs + DefaultStartLeadMs;
+
+fn testAck() protocol.Ack {
+    return .{
+        .match_id = TestMatchId,
+        .sender_slot = JoinerProtocolSlot,
+        .acked_slot = HostProtocolSlot,
+        .next_needed_frame = 0,
+    };
+}
+
+fn testStart() protocol.Start {
+    return .{
+        .match_id = TestMatchId,
+        .sender_slot = HostProtocolSlot,
+        .start_epoch_ms = TestStartEpochMs,
+    };
+}
 
 fn testFrameInput(index: usize) input.FrameInput {
     return .{
@@ -906,7 +1049,7 @@ test "joiner accepts setup and creates P2 lockstep peer with identical settings 
     try std.testing.expectEqualDeep(testSettings(), peer.match.settings);
 }
 
-test "joiner sends valid ack" {
+test "joiner sends valid ack and waits for start" {
     var joiner = Session.initJoiner();
     try joiner.acceptSetup(try testSetup());
 
@@ -922,26 +1065,32 @@ test "joiner sends valid ack" {
     try std.testing.expectEqualDeep(ack, try decodeAckPacket(encoded.slice()));
 
     try joiner.markJoinerAckSent();
-    try expectSessionState(&joiner, .playing);
+    try expectSessionState(&joiner, .waiting_for_start);
+    try std.testing.expect(!try joiner.advanceStartGate(TestStartEpochMs));
+
+    const resend_ack = try joiner.buildJoinerAck();
+    try std.testing.expectEqualDeep(ack, resend_ack);
 }
 
-test "host accepts correct ack and rejects wrong-slot and wrong-match ack" {
-    const valid_ack = protocol.Ack{
-        .match_id = TestMatchId,
-        .sender_slot = JoinerProtocolSlot,
-        .acked_slot = HostProtocolSlot,
-        .next_needed_frame = 0,
-    };
+test "host accepts ack, schedules start, and rejects wrong-slot and wrong-match ack" {
+    const valid_ack = testAck();
 
     var host = try Session.initHostWithInputDelay(TestMatchId, testSettings(), DefaultInputDelayFrames);
-    try host.acceptAck(valid_ack);
-    try expectSessionState(&host, .playing);
+    const start = try host.acceptAckAndScheduleStart(valid_ack, TestStartEpochMs, TestNowMs);
+    try expectSessionState(&host, .start_scheduled);
+    try std.testing.expectEqualDeep(testStart(), start);
+    try std.testing.expectEqualDeep(start, try host.startPacket());
     try std.testing.expect(host.peer != null);
+    try std.testing.expect(!try host.advanceStartGate(TestStartEpochMs - 1));
+    try expectSessionState(&host, .start_scheduled);
+
+    const encoded_start = try host.encodeStartPacket();
+    try std.testing.expectEqualDeep(start, try decodeStartPacket(encoded_start.slice()));
 
     var recreate_peer_host = try Session.initHostWithInputDelay(TestMatchId, testSettings(), DefaultInputDelayFrames);
     recreate_peer_host.peer = null;
     try recreate_peer_host.acceptAck(valid_ack);
-    try expectSessionState(&recreate_peer_host, .playing);
+    try expectSessionState(&recreate_peer_host, .waiting_for_start);
     const recreated_peer = if (recreate_peer_host.peer) |*peer| peer else return error.PeerUnavailable;
     try std.testing.expectEqual(match_mod.PlayerIndex.p1, recreated_peer.local_slot);
     try std.testing.expectEqual(TestMatchId, recreated_peer.match_id);
@@ -963,6 +1112,107 @@ test "host accepts correct ack and rejects wrong-slot and wrong-match ack" {
     match_ack.match_id = OtherMatchId;
     try std.testing.expectError(error.WrongMatchId, wrong_match.acceptAck(match_ack));
     try expectSessionState(&wrong_match, .waiting_for_ack);
+}
+
+test "joiner accepts valid start and waits until start epoch" {
+    var joiner = Session.initJoiner();
+    try joiner.acceptSetup(try testSetup());
+    try joiner.markJoinerAckSent();
+
+    try joiner.acceptStart(testStart(), TestNowMs);
+    try expectSessionState(&joiner, .start_scheduled);
+    try std.testing.expectEqualDeep(testStart(), joiner.start.?);
+    try std.testing.expect(!try joiner.advanceStartGate(TestStartEpochMs - 1));
+    try expectSessionState(&joiner, .start_scheduled);
+    try std.testing.expect(try joiner.advanceStartGate(TestStartEpochMs));
+    try expectSessionState(&joiner, .playing);
+}
+
+test "host and joiner transition to playing only after start gate opens" {
+    var host = try Session.initHostWithInputDelay(TestMatchId, testSettings(), DefaultInputDelayFrames);
+    var joiner = Session.initJoiner();
+
+    try joiner.acceptSetup(try testSetup());
+    try joiner.markJoinerAckSent();
+    const start = try host.acceptAckAndScheduleStart(testAck(), TestStartEpochMs, TestNowMs);
+    try joiner.acceptStart(start, TestNowMs);
+
+    try std.testing.expect(!try host.advanceStartGate(TestStartEpochMs - 1));
+    try std.testing.expect(!try joiner.advanceStartGate(TestStartEpochMs - 1));
+    try expectSessionState(&host, .start_scheduled);
+    try expectSessionState(&joiner, .start_scheduled);
+
+    try std.testing.expect(try host.advanceStartGate(TestStartEpochMs));
+    try std.testing.expect(try joiner.advanceStartGate(TestStartEpochMs));
+    try expectSessionState(&host, .playing);
+    try expectSessionState(&joiner, .playing);
+}
+
+test "duplicate start is idempotent and conflicting start is rejected" {
+    var joiner = Session.initJoiner();
+    try joiner.acceptSetup(try testSetup());
+    try joiner.markJoinerAckSent();
+    try joiner.acceptStart(testStart(), TestNowMs);
+
+    try joiner.acceptStart(testStart(), TestNowMs + DefaultStartLeadMs);
+    try expectSessionState(&joiner, .start_scheduled);
+    try std.testing.expectEqualDeep(testStart(), joiner.start.?);
+    try std.testing.expect(try joiner.advanceStartGate(TestStartEpochMs));
+    try joiner.acceptStart(testStart(), TestStartEpochMs + DefaultStartLeadMs);
+    try expectSessionState(&joiner, .playing);
+
+    var conflicting = testStart();
+    conflicting.start_epoch_ms += 1;
+    try std.testing.expectError(error.ConflictingStart, joiner.acceptStart(conflicting, TestNowMs));
+    try expectSessionState(&joiner, .playing);
+
+    var host = try Session.initHostWithInputDelay(TestMatchId, testSettings(), DefaultInputDelayFrames);
+    try host.acceptAck(testAck());
+    _ = try host.scheduleStart(TestStartEpochMs, TestNowMs);
+    _ = try host.scheduleStart(TestStartEpochMs, TestNowMs + DefaultStartLeadMs);
+    try std.testing.expectError(error.ConflictingStart, host.scheduleStart(TestStartEpochMs + 1, TestNowMs));
+}
+
+test "joiner rejects wrong sender wrong match and unusable start lead" {
+    var wrong_sender_joiner = Session.initJoiner();
+    try wrong_sender_joiner.acceptSetup(try testSetup());
+    try wrong_sender_joiner.markJoinerAckSent();
+    var wrong_sender = testStart();
+    wrong_sender.sender_slot = JoinerProtocolSlot;
+    try std.testing.expectError(error.InvalidStartSenderSlot, wrong_sender_joiner.acceptStart(wrong_sender, TestNowMs));
+    try expectSessionState(&wrong_sender_joiner, .waiting_for_start);
+
+    var wrong_match_joiner = Session.initJoiner();
+    try wrong_match_joiner.acceptSetup(try testSetup());
+    try wrong_match_joiner.markJoinerAckSent();
+    var wrong_match = testStart();
+    wrong_match.match_id = OtherMatchId;
+    try std.testing.expectError(error.WrongMatchId, wrong_match_joiner.acceptStart(wrong_match, TestNowMs));
+    try expectSessionState(&wrong_match_joiner, .waiting_for_start);
+
+    var late_joiner = Session.initJoiner();
+    try late_joiner.acceptSetup(try testSetup());
+    try late_joiner.markJoinerAckSent();
+    var late_start = testStart();
+    late_start.start_epoch_ms = TestNowMs - 1;
+    try std.testing.expectError(error.StartLeadTooShort, late_joiner.acceptStart(late_start, TestNowMs));
+    try expectSessionState(&late_joiner, .waiting_for_start);
+
+    var too_soon_joiner = Session.initJoiner();
+    try too_soon_joiner.acceptSetup(try testSetup());
+    try too_soon_joiner.markJoinerAckSent();
+    var too_soon_start = testStart();
+    too_soon_start.start_epoch_ms = TestNowMs + StartMinLeadMs - 1;
+    try std.testing.expectError(error.StartLeadTooShort, too_soon_joiner.acceptStart(too_soon_start, TestNowMs));
+    try expectSessionState(&too_soon_joiner, .waiting_for_start);
+
+    var too_far_joiner = Session.initJoiner();
+    try too_far_joiner.acceptSetup(try testSetup());
+    try too_far_joiner.markJoinerAckSent();
+    var too_far_start = testStart();
+    too_far_start.start_epoch_ms = TestNowMs + StartMaxLeadMs + 1;
+    try std.testing.expectError(error.StartLeadTooLong, too_far_joiner.acceptStart(too_far_start, TestNowMs));
+    try expectSessionState(&too_far_joiner, .waiting_for_start);
 }
 
 test "joiner with expected match rejects stale setup before creating peer" {
@@ -1025,15 +1275,10 @@ test "invalid hole and garbage settings are rejected" {
     try expectSessionState(&joiner_hole, .waiting_for_setup);
 }
 
-test "duplicate and wrong lifecycle packets do not silently move to playing" {
+test "duplicate and wrong lifecycle packets do not silently move state" {
     const setup = try testSetup();
     const setup_bytes = try encodeSetupPacket(setup);
-    const ack = protocol.Ack{
-        .match_id = TestMatchId,
-        .sender_slot = JoinerProtocolSlot,
-        .acked_slot = HostProtocolSlot,
-        .next_needed_frame = 0,
-    };
+    const ack = testAck();
     const ack_bytes = try encodeAckPacket(ack);
 
     var joiner = Session.initJoiner();
@@ -1054,9 +1299,9 @@ test "duplicate and wrong lifecycle packets do not silently move to playing" {
     try expectSessionState(&packet_joiner, .waiting_for_setup);
 
     try host.acceptAck(ack);
-    try expectSessionState(&host, .playing);
+    try expectSessionState(&host, .waiting_for_start);
     try std.testing.expectError(error.UnexpectedAck, host.acceptAck(ack));
-    try expectSessionState(&host, .playing);
+    try expectSessionState(&host, .waiting_for_start);
 }
 
 test "known-match stale filter drops wrong-match malformed lifecycle before body decode" {
@@ -1101,6 +1346,8 @@ test "pre-playing phase gate ignores runtime and result bodies before full decod
     const truncated_result = encoded_result.bytes[0 .. protocol.ResultPacketSize - 1];
     try std.testing.expectError(error.TruncatedPacket, protocol.decode(truncated_result));
     try std.testing.expectEqual(PacketDecodePolicy.ignore_stale, try packetDecodePolicyForSessionState(TestMatchId, .waiting_for_ack, truncated_result));
+    try std.testing.expectEqual(PacketDecodePolicy.ignore_stale, try packetDecodePolicyForSessionState(TestMatchId, .waiting_for_start, truncated_result));
+    try std.testing.expectEqual(PacketDecodePolicy.ignore_stale, try packetDecodePolicyForSessionState(TestMatchId, .start_scheduled, truncated_result));
     try std.testing.expectEqual(PacketDecodePolicy.decode_required, try packetDecodePolicyForSessionState(TestMatchId, .playing, truncated_result));
 
     const input_batch = try protocol.InputBatch.init(TestMatchId, JoinerProtocolSlot, 0, &[_]input.FrameInput{.{}});
@@ -1755,6 +2002,15 @@ test "small fake packet exchange through two peers keeps state hashes equal" {
     const ack_bytes = try joiner.encodeJoinerAck();
     try joiner.markJoinerAckSent();
     try host.acceptAckBytes(ack_bytes.slice());
+    const start = try host.scheduleStart(TestStartEpochMs, TestNowMs);
+    const start_bytes = try encodeStartPacket(start);
+    try joiner.acceptStartBytes(start_bytes.slice(), TestNowMs);
+    try std.testing.expectEqual(State.start_scheduled, host.state);
+    try std.testing.expectEqual(State.start_scheduled, joiner.state);
+    try std.testing.expect(!try host.advanceStartGate(TestStartEpochMs - 1));
+    try std.testing.expect(!try joiner.advanceStartGate(TestStartEpochMs - 1));
+    try std.testing.expect(try host.advanceStartGate(TestStartEpochMs));
+    try std.testing.expect(try joiner.advanceStartGate(TestStartEpochMs));
 
     const p1 = if (host.peer) |*peer| peer else return error.PeerUnavailable;
     const p2 = if (joiner.peer) |*peer| peer else return error.PeerUnavailable;

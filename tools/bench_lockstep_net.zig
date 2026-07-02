@@ -30,14 +30,20 @@ const StartPolicy = enum {
     current_ack,
     immediate_start,
     guarded_start,
+    session_start,
 };
 
 const StartTicks = struct {
     p1: u64 = 0,
     p2: u64 = 0,
+    p1_started: bool = true,
+    p2_started: bool = true,
 
     fn max(self: StartTicks) u64 {
-        return @max(self.p1, self.p2);
+        var result: u64 = 0;
+        if (self.p1_started) result = @max(result, self.p1);
+        if (self.p2_started) result = @max(result, self.p2);
+        return result;
     }
 };
 
@@ -64,6 +70,26 @@ const SampleSkewStats = struct {
     fn isZero(self: SampleSkewStats) bool {
         return self.paired > 0 and self.min == 0 and self.max == 0;
     }
+};
+
+const StartGateReport = struct {
+    session_driven: bool = false,
+    effective_start_guard_ticks: u64 = 0,
+    effective_start_guard_ms: u64 = 0,
+    ack_arrival_tick: u64 = 0,
+    host_schedule_tick: u64 = 0,
+    host_schedule_ms: u64 = 0,
+    start_arrival_tick: u64 = 0,
+    start_arrival_ms: u64 = 0,
+    start_epoch_ms: u64 = 0,
+    delivery_margin_ticks: i64 = 0,
+    delivery_margin_ms: i64 = 0,
+    accept_margin_ms: i64 = 0,
+    guard_miss: bool = false,
+    host_opened: bool = true,
+    joiner_opened: bool = true,
+    error_stage: []const u8 = "",
+    error_name: []const u8 = "",
 };
 
 const Params = struct {
@@ -279,6 +305,8 @@ const Network = struct {
 const PeerDriver = struct {
     peer: lockstep.Peer,
     batcher: online_session.InputBatcher = .{},
+    start_tick: u64 = 0,
+    start_opened: bool = true,
 };
 
 const PlayerResult = struct {
@@ -295,12 +323,20 @@ const BenchResult = struct {
     players: [2]PlayerResult,
     directions: [2]DirectionStats,
     start_ticks: StartTicks,
+    start_gate: StartGateReport,
     sample_start_skew: SampleSkewStats,
     expected_samples: u64,
     expected_cursor: u64,
     drain_ticks: u64,
     complete: bool,
     hashes_match: bool,
+};
+
+const StartPlan = struct {
+    p1_peer: lockstep.Peer,
+    p2_peer: lockstep.Peer,
+    start_ticks: StartTicks,
+    start_gate: StartGateReport,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -334,7 +370,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
     if (params.expect_zero_start_skew and !result.sample_start_skew.isZero()) {
-        try stderr.print("bench-lockstep observed nonzero start skew: min={} max={}\n", .{ result.sample_start_skew.min, result.sample_start_skew.max });
+        try stderr.print("bench-lockstep observed nonzero start skew: paired={} min={} max={}\n", .{ result.sample_start_skew.paired, result.sample_start_skew.min, result.sample_start_skew.max });
         try stderr.flush();
         std.process.exit(3);
     }
@@ -443,6 +479,7 @@ fn parseStartPolicy(name: []const u8) ?StartPolicy {
     if (std.mem.eql(u8, name, "current-ack")) return .current_ack;
     if (std.mem.eql(u8, name, "immediate-start")) return .immediate_start;
     if (std.mem.eql(u8, name, "guarded-start")) return .guarded_start;
+    if (std.mem.eql(u8, name, "session-start")) return .session_start;
     return null;
 }
 
@@ -498,6 +535,7 @@ fn startPolicyName(policy: StartPolicy) []const u8 {
         .current_ack => "current-ack",
         .immediate_start => "immediate-start",
         .guarded_start => "guarded-start",
+        .session_start => "session-start",
     };
 }
 
@@ -524,6 +562,11 @@ fn computeStartTicks(params: Params) !StartTicks {
                 .p1 = host_start,
                 .p2 = if (params.start_delay <= params.start_guard) host_start else joiner_receives_start,
             };
+        },
+        .session_start => session: {
+            const guard_ticks = try effectiveSessionStartGuardTicks(params);
+            const host_start = try addTicks(params.ack_delay, guard_ticks);
+            break :session .{ .p1 = host_start, .p2 = host_start };
         },
     };
 }
@@ -558,10 +601,10 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  --delay-p2-p1 N     extra deterministic packet delay P2->P1 in app ticks (default 0)
         \\  --jitter N          deterministic extra packet delay in [0,N] app ticks (default 0)
         \\  --drop-every N      drop every Nth packet per direction; 0 disables (default 0)
-        \\  --start-policy NAME simultaneous, current-ack, immediate-start, guarded-start (default simultaneous)
+        \\  --start-policy NAME simultaneous, current-ack, immediate-start, guarded-start, session-start (default simultaneous)
         \\  --ack-delay N       ACK transit delay for start-policy modeling (default 0)
         \\  --start-delay N     START transit delay for start-policy modeling (default 0)
-        \\  --start-guard N     future start guard for guarded-start modeling (default 0)
+        \\  --start-guard N     future START guard in app ticks; session-start uses production default when 0
         \\  --expect-complete   exit nonzero unless all measured samples complete
         \\  --expect-zero-start-skew exit nonzero unless paired sample start skew is exactly zero
         \\  --json              emit JSON
@@ -570,8 +613,135 @@ fn printUsage(writer: *std.Io.Writer) !void {
     , .{});
 }
 
-fn runBench(allocator: std.mem.Allocator, params: Params) !BenchResult {
+fn prepareStartPlan(params: Params) !StartPlan {
+    const settings = benchSettings();
+    if (params.start_policy == .session_start) {
+        return prepareSessionStartPlan(settings, params);
+    }
+
     const start_ticks = try computeStartTicks(params);
+    return .{
+        .p1_peer = try lockstep.Peer.init(settings, .p1, params.input_delay, bench_match_id),
+        .p2_peer = try lockstep.Peer.init(settings, .p2, params.input_delay, bench_match_id),
+        .start_ticks = start_ticks,
+        .start_gate = try modeledStartGateReport(params, start_ticks),
+    };
+}
+
+fn prepareSessionStartPlan(settings: match_mod.MatchSettings, params: Params) !StartPlan {
+    var host = try online_session.Session.initHostWithInputDelay(bench_match_id, settings, params.input_delay);
+    var joiner = online_session.Session.initJoinerForMatch(bench_match_id);
+
+    const setup_bytes = try host.encodeSetupPacket();
+    try joiner.acceptSetupBytes(setup_bytes.slice());
+    const ack_bytes = try joiner.encodeJoinerAck();
+    try joiner.markJoinerAckSent();
+    const ack = try online_session.decodeAckPacket(ack_bytes.slice());
+
+    const guard_ticks = try effectiveSessionStartGuardTicks(params);
+    const guard_ms = try ticksToWallMs(guard_ticks);
+    const ack_tick = params.ack_delay;
+    const start_arrival_tick = try addTicks(ack_tick, params.start_delay);
+
+    var report = StartGateReport{
+        .session_driven = true,
+        .effective_start_guard_ticks = guard_ticks,
+        .effective_start_guard_ms = guard_ms,
+        .ack_arrival_tick = ack_tick,
+        .host_schedule_tick = ack_tick,
+        .start_arrival_tick = start_arrival_tick,
+        .host_opened = false,
+        .joiner_opened = false,
+    };
+
+    var host_open_tick: ?u64 = null;
+    var joiner_open_tick: ?u64 = null;
+
+    const ack_now_ms = try ticksToWallMs(ack_tick);
+    report.host_schedule_ms = ack_now_ms;
+    report.effective_start_guard_ms = guard_ms;
+    report.start_epoch_ms = try addTicks(ack_now_ms, guard_ms);
+    report.start_arrival_ms = try ticksToWallMs(start_arrival_tick);
+    report.delivery_margin_ticks = try signedTickDelta(try addTicks(ack_tick, guard_ticks), start_arrival_tick);
+    report.delivery_margin_ms = try signedTickDelta(report.start_epoch_ms, report.start_arrival_ms);
+    report.accept_margin_ms = try signedSubtractU64(report.delivery_margin_ms, online_session.StartMinLeadMs);
+    report.guard_miss = report.accept_margin_ms < 0;
+
+    const scheduled_start: ?protocol.Start = host.acceptAckAndScheduleStart(ack, report.start_epoch_ms, ack_now_ms) catch |err| switch (err) {
+        error.StartLeadTooShort, error.StartLeadTooLong => failed: {
+            report.error_stage = "host-schedule";
+            report.error_name = @errorName(err);
+            report.guard_miss = err == error.StartLeadTooShort;
+            break :failed null;
+        },
+        else => return err,
+    };
+
+    if (scheduled_start != null) {
+        _ = try host.advanceStartGate(ack_now_ms);
+        const start_packet = try host.encodeStartPacket();
+        joiner.acceptStartBytes(start_packet.slice(), report.start_arrival_ms) catch |err| switch (err) {
+            error.StartLeadTooShort, error.StartLeadTooLong => {
+                report.error_stage = "joiner-start";
+                report.error_name = @errorName(err);
+                report.guard_miss = err == error.StartLeadTooShort;
+            },
+            else => return err,
+        };
+        if (report.error_name.len == 0) _ = try joiner.advanceStartGate(report.start_arrival_ms);
+
+        const scheduled_open_tick = try msToCeilTicks(report.start_epoch_ms);
+        const scheduled_open_ms = try ticksToWallMs(scheduled_open_tick);
+        if (try host.advanceStartGate(scheduled_open_ms)) host_open_tick = scheduled_open_tick;
+        if (report.error_name.len == 0 and try joiner.advanceStartGate(scheduled_open_ms)) joiner_open_tick = scheduled_open_tick;
+    }
+
+    const host_peer = if (host.peer) |peer| peer else return error.PeerUnavailable;
+    const joiner_peer = if (joiner.peer) |peer| peer else return error.PeerUnavailable;
+    const host_started = host_open_tick != null;
+    const joiner_started = joiner_open_tick != null;
+    report.host_opened = host_started;
+    report.joiner_opened = joiner_started;
+
+    return .{
+        .p1_peer = host_peer,
+        .p2_peer = joiner_peer,
+        .start_ticks = .{
+            .p1 = host_open_tick orelse 0,
+            .p2 = joiner_open_tick orelse 0,
+            .p1_started = host_started,
+            .p2_started = joiner_started,
+        },
+        .start_gate = report,
+    };
+}
+
+fn modeledStartGateReport(params: Params, start_ticks: StartTicks) !StartGateReport {
+    const start_arrival_tick = try addTicks(params.ack_delay, params.start_delay);
+    const effective_guard = switch (params.start_policy) {
+        .guarded_start => params.start_guard,
+        else => 0,
+    };
+    var report = StartGateReport{
+        .effective_start_guard_ticks = effective_guard,
+        .effective_start_guard_ms = try ticksToWallMs(effective_guard),
+        .ack_arrival_tick = params.ack_delay,
+        .host_schedule_tick = params.ack_delay,
+        .start_arrival_tick = start_arrival_tick,
+        .start_arrival_ms = try ticksToWallMs(start_arrival_tick),
+        .host_opened = start_ticks.p1_started,
+        .joiner_opened = start_ticks.p2_started,
+    };
+    if (params.start_policy == .guarded_start) {
+        report.delivery_margin_ticks = try signedTickDelta(try addTicks(params.ack_delay, params.start_guard), start_arrival_tick);
+        report.guard_miss = report.delivery_margin_ticks < 0;
+    }
+    return report;
+}
+
+fn runBench(allocator: std.mem.Allocator, params: Params) !BenchResult {
+    const start_plan = try prepareStartPlan(params);
+    const start_ticks = start_plan.start_ticks;
     const end_tick = try addTicks(@intCast(params.frames), start_ticks.max());
     const queue_capacity = params.frames * 2 + protocol.MaxInputBatchCount * 2 + 8;
     var network = Network{
@@ -592,17 +762,24 @@ fn runBench(allocator: std.mem.Allocator, params: Params) !BenchResult {
     };
     var step_metrics = [2]PeerStepMetrics{ .{}, .{} };
 
-    const settings = benchSettings();
-    var p1 = PeerDriver{ .peer = try lockstep.Peer.init(settings, .p1, params.input_delay, bench_match_id) };
-    var p2 = PeerDriver{ .peer = try lockstep.Peer.init(settings, .p2, params.input_delay, bench_match_id) };
+    var p1 = PeerDriver{
+        .peer = start_plan.p1_peer,
+        .start_tick = start_ticks.p1,
+        .start_opened = start_ticks.p1_started,
+    };
+    var p2 = PeerDriver{
+        .peer = start_plan.p2_peer,
+        .start_tick = start_ticks.p2,
+        .start_opened = start_ticks.p2_started,
+    };
 
     const end_tick_usize: usize = @intCast(end_tick);
     var last_app_advanced = [2]usize{ 0, 0 };
     for (0..end_tick_usize) |tick_index| {
         const tick: u64 = @intCast(tick_index);
         _ = try network.deliverDue(tick, &p1.peer, &p2.peer);
-        last_app_advanced[0] = try drivePeerWindow(.p1, &p1, start_ticks.p1, scriptedInput(.p1, tick), tick, params, &network, &samples, &step_metrics[0]);
-        last_app_advanced[1] = try drivePeerWindow(.p2, &p2, start_ticks.p2, scriptedInput(.p2, tick), tick, params, &network, &samples, &step_metrics[1]);
+        last_app_advanced[0] = try drivePeerWindow(.p1, &p1, scriptedInput(.p1, tick), tick, params, &network, &samples, &step_metrics[0]);
+        last_app_advanced[1] = try drivePeerWindow(.p2, &p2, scriptedInput(.p2, tick), tick, params, &network, &samples, &step_metrics[1]);
     }
 
     const flush_tick: u64 = end_tick;
@@ -644,6 +821,7 @@ fn runBench(allocator: std.mem.Allocator, params: Params) !BenchResult {
         .players = players,
         .directions = network.stats,
         .start_ticks = start_ticks,
+        .start_gate = start_plan.start_gate,
         .sample_start_skew = try computeSampleStartSkew(samples[0].records[0..samples[0].count], samples[1].records[0..samples[1].count]),
         .expected_samples = @intCast(params.frames),
         .expected_cursor = expected_cursor,
@@ -656,7 +834,6 @@ fn runBench(allocator: std.mem.Allocator, params: Params) !BenchResult {
 fn drivePeerWindow(
     side: PlayerSide,
     driver: *PeerDriver,
-    start_tick: u64,
     frame_input: input.FrameInput,
     tick: u64,
     params: Params,
@@ -664,7 +841,7 @@ fn drivePeerWindow(
     samples: *[2]PlayerSamples,
     metrics: *PeerStepMetrics,
 ) !usize {
-    if (tick < start_tick) return 0;
+    if (!driver.start_opened or tick < driver.start_tick) return 0;
     if (samples[playerIndex(side)].count >= params.frames) {
         return stepPeerOnly(side, driver, tick, params, samples);
     }
@@ -823,6 +1000,7 @@ fn signedTickDelta(a: u64, b: u64) !i64 {
 }
 
 fn stepPeerOnly(side: PlayerSide, driver: *PeerDriver, tick: u64, params: Params, samples: *[2]PlayerSamples) !usize {
+    if (!driver.start_opened or tick < driver.start_tick) return 0;
     if (driver.peer.match.outcome != null or !driver.peer.isOk()) return 0;
     const before = driver.peer.frameCursor();
     const advanced = try driver.peer.stepAvailableMax(params.max_steps);
@@ -893,8 +1071,12 @@ fn printHuman(writer: *std.Io.Writer, params: Params, result: BenchResult) !void
         .{ result.directions[0].sent, result.directions[0].input_frames_sent, result.directions[0].dropped, result.directions[0].delivered, result.directions[1].sent, result.directions[1].input_frames_sent, result.directions[1].dropped, result.directions[1].delivered },
     );
     try writer.print(
-        "start: p1_tick={} p2_tick={} paired_sample_skew_ticks={} first={} last={} min={} max={} zero={}\n",
-        .{ result.start_ticks.p1, result.start_ticks.p2, result.sample_start_skew.paired, result.sample_start_skew.first, result.sample_start_skew.last, result.sample_start_skew.min, result.sample_start_skew.max, result.sample_start_skew.isZero() },
+        "start: p1_tick={} p1_started={} p2_tick={} p2_started={} paired_sample_skew_ticks={} first_sample_skew={} last={} min={} max={} zero={}\n",
+        .{ result.start_ticks.p1, result.start_ticks.p1_started, result.start_ticks.p2, result.start_ticks.p2_started, result.sample_start_skew.paired, result.sample_start_skew.first, result.sample_start_skew.last, result.sample_start_skew.min, result.sample_start_skew.max, result.sample_start_skew.isZero() },
+    );
+    try writer.print(
+        "start-gate: session_driven={} effective_lead_ticks={} effective_lead_ms={} ack_tick={} start_arrival_tick={} start_epoch_ms={} delivery_margin_ticks={} delivery_margin_ms={} accept_margin_ms={} guard_miss={} host_opened={} joiner_opened={} error_stage={s} error_name={s}\n",
+        .{ result.start_gate.session_driven, result.start_gate.effective_start_guard_ticks, result.start_gate.effective_start_guard_ms, result.start_gate.ack_arrival_tick, result.start_gate.start_arrival_tick, result.start_gate.start_epoch_ms, result.start_gate.delivery_margin_ticks, result.start_gate.delivery_margin_ms, result.start_gate.accept_margin_ms, result.start_gate.guard_miss, result.start_gate.host_opened, result.start_gate.joiner_opened, result.start_gate.error_stage, result.start_gate.error_name },
     );
     try writer.print(
         "completion: complete={} expected_samples={} expected_cursor={}\n",
@@ -930,6 +1112,26 @@ fn ticksToMs(ticks: u64) f64 {
     return @as(f64, @floatFromInt(ticks)) * tick_ms;
 }
 
+fn ticksToWallMs(ticks: u64) !u64 {
+    const product = std.math.mul(u64, ticks, 1000) catch return error.TickOverflow;
+    return product / 60;
+}
+
+fn msToCeilTicks(ms: u64) !u64 {
+    const product = std.math.mul(u64, ms, 60) catch return error.TickOverflow;
+    return (try addTicks(product, 999)) / 1000;
+}
+
+fn effectiveSessionStartGuardTicks(params: Params) !u64 {
+    if (params.start_guard != 0) return params.start_guard;
+    return msToCeilTicks(online_session.DefaultStartLeadMs);
+}
+
+fn signedSubtractU64(value: i64, amount: u64) !i64 {
+    if (amount > std.math.maxInt(i64)) return error.TickOverflow;
+    return std.math.sub(i64, value, @intCast(amount)) catch error.TickOverflow;
+}
+
 fn printJson(writer: *std.Io.Writer, params: Params, result: BenchResult) !void {
     try writer.print("{{\n", .{});
     try writer.print(
@@ -943,8 +1145,8 @@ fn printJson(writer: *std.Io.Writer, params: Params, result: BenchResult) !void 
         .{ result.directions[0].sent, result.directions[0].input_frames_sent, result.directions[0].dropped, result.directions[0].delivered, result.directions[1].sent, result.directions[1].input_frames_sent, result.directions[1].dropped, result.directions[1].delivered },
     );
     try writer.print(
-        "  \"start\": {{\"p1_tick\":{},\"p2_tick\":{},\"sample_skew\":{{\"paired\":{},\"first\":{},\"last\":{},\"min\":{},\"max\":{},\"zero\":{}}}}},\n",
-        .{ result.start_ticks.p1, result.start_ticks.p2, result.sample_start_skew.paired, result.sample_start_skew.first, result.sample_start_skew.last, result.sample_start_skew.min, result.sample_start_skew.max, result.sample_start_skew.isZero() },
+        "  \"start\": {{\"p1_tick\":{},\"p1_started\":{},\"p2_tick\":{},\"p2_started\":{},\"sample_skew\":{{\"paired\":{},\"first\":{},\"last\":{},\"min\":{},\"max\":{},\"zero\":{}}},\"gate\":{{\"session_driven\":{},\"effective_lead_ticks\":{},\"effective_lead_ms\":{},\"ack_tick\":{},\"host_schedule_tick\":{},\"host_schedule_ms\":{},\"start_arrival_tick\":{},\"start_arrival_ms\":{},\"start_epoch_ms\":{},\"delivery_margin_ticks\":{},\"delivery_margin_ms\":{},\"accept_margin_ms\":{},\"guard_miss\":{},\"host_opened\":{},\"joiner_opened\":{},\"error_stage\":\"{s}\",\"error_name\":\"{s}\"}}}},\n",
+        .{ result.start_ticks.p1, result.start_ticks.p1_started, result.start_ticks.p2, result.start_ticks.p2_started, result.sample_start_skew.paired, result.sample_start_skew.first, result.sample_start_skew.last, result.sample_start_skew.min, result.sample_start_skew.max, result.sample_start_skew.isZero(), result.start_gate.session_driven, result.start_gate.effective_start_guard_ticks, result.start_gate.effective_start_guard_ms, result.start_gate.ack_arrival_tick, result.start_gate.host_schedule_tick, result.start_gate.host_schedule_ms, result.start_gate.start_arrival_tick, result.start_gate.start_arrival_ms, result.start_gate.start_epoch_ms, result.start_gate.delivery_margin_ticks, result.start_gate.delivery_margin_ms, result.start_gate.accept_margin_ms, result.start_gate.guard_miss, result.start_gate.host_opened, result.start_gate.joiner_opened, result.start_gate.error_stage, result.start_gate.error_name },
     );
     try writer.print(
         "  \"completion\": {{\"complete\":{},\"expected_samples\":{},\"expected_cursor\":{}}},\n",

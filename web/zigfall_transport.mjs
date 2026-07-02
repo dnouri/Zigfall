@@ -10,9 +10,9 @@ const MaxPacketSize = 512;
 const MaxQueuedPackets = 256;
 const MaxRoomIdLength = 128;
 const RetiringSelectedPeerDrainMs = 2000;
-const ProtocolVersion = 2;
+const ProtocolVersion = 3;
 const ProfilePacketType = 8;
-const AppId = "zigfall-trystero-v2";
+const AppId = "zigfall-trystero-v3";
 const TrysteroRelayUrls = Object.freeze([
   "wss://nostr.sathoarder.com",
   "wss://nostr.vulpem.com",

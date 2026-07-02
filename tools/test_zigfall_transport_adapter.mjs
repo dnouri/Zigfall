@@ -66,7 +66,7 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
   assert.equal(transport.connect("adapter-test"), ErrorCode.none);
   const room = rooms[0];
   const action = room.action;
-  assert.equal(room.config.appId, "zigfall-trystero-v2", "transport app namespace must isolate protocol v2 clients");
+  assert.equal(room.config.appId, "zigfall-trystero-v3", "transport app namespace must isolate protocol v3 clients");
   assert.equal(room.config.relayConfig.urls, TrysteroRelayUrls, "transport must pass the curated Nostr relay list to Trystero");
   assert.deepEqual(TrysteroRelayUrls, [
     "wss://nostr.sathoarder.com",
@@ -76,7 +76,7 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
     "wss://strfry.shock.network",
   ]);
   assert.equal(Object.isFrozen(TrysteroRelayUrls), true, "relay list should remain centralized and immutable");
-  assert.equal(transport.ProtocolVersion, 2, "transport profile fast-path must track the Zig wire protocol version");
+  assert.equal(transport.ProtocolVersion, 3, "transport profile fast-path must track the Zig wire protocol version");
 
   room.join("peer-a");
   assert.equal(transport.statusCode(), Status.connected);

@@ -23,6 +23,7 @@ const emscripten = std.os.emscripten;
 pub const panic = std.debug.FullPanic(appPanic);
 
 extern fn emscripten_console_error(utf8String: [*:0]const u8) void;
+extern fn emscripten_date_now() f64;
 
 fn appPanic(message: []const u8, first_trace_addr: ?usize) noreturn {
     if (comptime builtin.os.tag == .emscripten) {
@@ -57,6 +58,7 @@ const online_max_steps_per_frame: usize = 4;
 const online_input_batch_target_count: u8 = 1;
 const online_input_batch_max_hold_frames: u8 = 0;
 const online_input_resend_frames: u8 = online_session.DefaultInputResendFrames;
+const online_start_lead_ms: u64 = online_session.DefaultStartLeadMs;
 const online_result_drain_frames: u16 = 120;
 const online_terminal_packet_drain_frames: u16 = 30;
 const online_late_final_packet_peer_leave_grace_frames: u16 = 30;
@@ -307,6 +309,11 @@ const OnlineState = struct {
             return;
         }
 
+        // Open due scheduled starts before polling queued runtime packets; the
+        // decode policy treats runtime packets as pre-playing until .playing.
+        self.advanceStartGate();
+        if (self.terminal != .none) return;
+
         self.pollTransport();
         if (self.terminal != .none) return;
 
@@ -315,6 +322,9 @@ const OnlineState = struct {
         if (self.isLateFinalPacketPeerLeaveGraceActive()) return;
 
         self.driveHandshake();
+        if (self.terminal != .none) return;
+
+        self.advanceStartGate();
         if (self.terminal != .none) return;
 
         self.maybeSendProfile();
@@ -487,6 +497,10 @@ const OnlineState = struct {
                 return;
             };
             const bytes = maybe_packet orelse break;
+            // Drain-time guard: if START and runtime packets are queued together,
+            // accepting START lets the next runtime packet see .playing once due.
+            self.advanceStartGate();
+            if (self.terminal != .none) return;
             self.handlePacket(bytes);
             if (self.terminal != .none) return;
         }
@@ -495,6 +509,8 @@ const OnlineState = struct {
     }
 
     fn handlePacket(self: *OnlineState, bytes: []const u8) void {
+        if (self.handleStartPacket(bytes)) return;
+
         const decode_policy = online_session.packetDecodePolicyForSessionState(self.currentMatchId(), if (self.sessionConst()) |session| session.state else null, bytes) catch |err| {
             self.enterTerminal(.failed, .{ .disconnect = 8 }, "Malformed network packet header: {s}", .{@errorName(err)});
             return;
@@ -528,7 +544,7 @@ const OnlineState = struct {
         var session = self.sessionPtr() orelse return;
         switch (session.state) {
             .waiting_for_setup => {},
-            .setup_received, .playing => return,
+            .setup_received, .waiting_for_start, .start_scheduled, .playing => return,
             .waiting_for_ack => {
                 self.enterTerminal(.failed, .{ .disconnect = 15 }, "Joiner received setup while waiting for ack.", .{});
                 return;
@@ -550,7 +566,7 @@ const OnlineState = struct {
         };
         self.sent_ack = true;
         self.next_hash_frame = online_state_hash_interval_frames;
-        self.setMessage("Setup accepted. Online match started as P2.", .{});
+        self.setMessage("Setup accepted. Waiting for host start.", .{});
     }
 
     fn handleAck(self: *OnlineState, ack: protocol.Ack) void {
@@ -558,18 +574,57 @@ const OnlineState = struct {
         var session = self.sessionPtr() orelse return;
         switch (session.state) {
             .waiting_for_ack => {},
-            .playing => return,
+            .waiting_for_start, .start_scheduled, .playing => return,
             else => {
                 self.enterTerminal(.failed, .{ .disconnect = 18 }, "Host received ack before setup was ready.", .{});
                 return;
             },
         }
-        session.acceptAck(ack) catch |err| {
-            self.enterTerminal(.failed, .{ .disconnect = 19 }, "Join ack rejected: {s}", .{@errorName(err)});
+
+        const now_ms = onlineWallClockMs();
+        const start_epoch_ms = onlineStartEpochMs(now_ms);
+        _ = session.acceptAckAndScheduleStart(ack, start_epoch_ms, now_ms) catch |err| {
+            self.enterTerminal(.failed, .{ .disconnect = 19 }, "Join ack/start rejected: {s}", .{@errorName(err)});
+            return;
+        };
+        const start_packet = session.encodeStartPacket() catch |err| {
+            self.enterTerminal(.failed, .{ .disconnect = 21 }, "Could not encode start packet: {s}", .{@errorName(err)});
+            return;
+        };
+        if (!self.sendPacketBytes(start_packet.slice())) return;
+
+        self.next_hash_frame = online_state_hash_interval_frames;
+        self.setMessage("Joiner acknowledged setup. Start scheduled.", .{});
+    }
+
+    fn handleStartPacket(self: *OnlineState, bytes: []const u8) bool {
+        if (bytes.len < 2 or bytes[0] != protocol.ProtocolVersion or bytes[1] != protocol.StartPacketType) return false;
+        if (self.currentMatchId()) |match_id| {
+            if (bytes.len >= protocol.HeaderSize) {
+                const packet_match_id = protocol.peekMatchId(bytes) catch |err| {
+                    self.enterTerminal(.failed, .{ .disconnect = 22 }, "Malformed start packet header: {s}", .{@errorName(err)});
+                    return true;
+                };
+                if (packet_match_id != match_id) return true;
+            }
+        }
+        self.handleStartBytes(bytes);
+        return true;
+    }
+
+    fn handleStartBytes(self: *OnlineState, bytes: []const u8) void {
+        if (self.role != .joiner) {
+            self.enterTerminal(.failed, .{ .disconnect = 23 }, "Unexpected start packet from peer.", .{});
+            return;
+        }
+        var session = self.sessionPtr() orelse return;
+        const was_playing = session.state == .playing;
+        session.acceptStartBytes(bytes, onlineWallClockMs()) catch |err| {
+            self.enterTerminal(.failed, .{ .disconnect = 24 }, "Host start rejected: {s}", .{@errorName(err)});
             return;
         };
         self.next_hash_frame = online_state_hash_interval_frames;
-        self.setMessage("Joiner acknowledged setup. Online match started as P1.", .{});
+        if (!was_playing and session.state == .start_scheduled) self.setMessage("Start received. Match begins shortly.", .{});
     }
 
     fn handleRuntimePacket(self: *OnlineState, bytes: []const u8) void {
@@ -648,6 +703,19 @@ const OnlineState = struct {
             if (!self.sendPacketBytes(setup.slice())) return;
             self.sent_setup = true;
             self.setMessage("Setup sent. Waiting for P2 ack.", .{});
+        }
+    }
+
+    fn advanceStartGate(self: *OnlineState) void {
+        var session = self.sessionPtr() orelse return;
+        const was_playing = session.state == .playing;
+        const opened = session.advanceStartGate(onlineWallClockMs()) catch |err| {
+            self.enterTerminal(.failed, .{ .disconnect = 25 }, "Start gate failed: {s}", .{@errorName(err)});
+            return;
+        };
+        if (opened and !was_playing) {
+            self.next_hash_frame = online_state_hash_interval_frames;
+            self.setMessage("Online match started as {s}.", .{self.roleText()});
         }
     }
 
@@ -1197,6 +1265,8 @@ const OnlineState = struct {
                 .waiting_for_setup => "waiting for host setup",
                 .waiting_for_ack => "waiting for join ack",
                 .setup_received => "sending join ack",
+                .waiting_for_start => "waiting for start",
+                .start_scheduled => "start scheduled",
                 .playing => if (self.sent_result) "checking result" else "playing",
             } else "starting online",
         };
@@ -1214,6 +1284,8 @@ const OnlineState = struct {
                 .waiting_for_setup => "setup",
                 .waiting_for_ack => "waiting",
                 .setup_received => "acking",
+                .waiting_for_start => "start",
+                .start_scheduled => "scheduled",
                 .playing => if (self.sent_result) "checking" else "playing",
             } else "starting",
         };
@@ -1268,6 +1340,22 @@ fn terminalPacketKind(packet: OnlineTerminalPacket) online_session.TerminalPacke
         .desync => .desync,
         .disconnect => .disconnect,
     };
+}
+
+fn onlineWallClockMs() u64 {
+    if (comptime builtin.os.tag == .emscripten) return millisFloatToU64(emscripten_date_now());
+    return 0;
+}
+
+fn millisFloatToU64(ms: f64) u64 {
+    if (!std.math.isFinite(ms) or ms <= 0) return 0;
+    const max_ms: f64 = @floatFromInt(std.math.maxInt(u64));
+    if (ms >= max_ms) return std.math.maxInt(u64);
+    return @intFromFloat(@floor(ms));
+}
+
+fn onlineStartEpochMs(now_ms: u64) u64 {
+    return std.math.add(u64, now_ms, online_start_lead_ms) catch std.math.maxInt(u64);
 }
 
 fn onlineTransportStatus(status: web_transport.Status) online_session.TransportStatus {
@@ -1522,6 +1610,8 @@ fn onlineSessionStateDebugJson(session: ?*const online_session.Session) []const 
         .waiting_for_setup => "\"waiting_for_setup\"",
         .waiting_for_ack => "\"waiting_for_ack\"",
         .setup_received => "\"setup_received\"",
+        .waiting_for_start => "\"waiting_for_start\"",
+        .start_scheduled => "\"start_scheduled\"",
         .playing => "\"playing\"",
     };
 }

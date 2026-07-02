@@ -52,10 +52,33 @@ async function browserDebugSnapshot(page) {
   return page.evaluate(() => globalThis.ZigfallDebug.snapshot());
 }
 
+const startGatePhaseBySessionState = new Map([
+  ["waiting_for_start", "waiting for start"],
+  ["start_scheduled", "start scheduled"],
+]);
+
 async function waitForFakeConnected(page) {
   await expect.poll(async () => (await transportSnapshot(page)).statusName, {
     timeout: 10_000,
   }).toBe("connected");
+}
+
+async function waitForStartGateBeforePlaying(page, label) {
+  let observed = null;
+  await expect.poll(async () => {
+    const online = (await browserDebugSnapshot(page)).app?.online ?? null;
+    const state = online?.sessionState ?? null;
+    if (startGatePhaseBySessionState.has(state)) {
+      observed = { sessionState: state, phase: online.phase };
+      return state;
+    }
+    if (state === "playing") return "playing_before_start_gate_observed";
+    return state ?? "no_online_session";
+  }, {
+    message: `${label} debug app snapshot should expose a start gate state before playing`,
+    timeout: 10_000,
+  }).toMatch(/^(waiting_for_start|start_scheduled)$/);
+  return observed;
 }
 
 test("does not expose the browser debug facade without the query flag", async ({ page }) => {
@@ -179,6 +202,13 @@ test("two browser pages exchange Zigfall online packets through the WASM bridge"
 
     await waitForFakeConnected(host);
     await waitForFakeConnected(joiner);
+
+    const [hostStartGate, joinerStartGate] = await Promise.all([
+      waitForStartGateBeforePlaying(host, "host"),
+      waitForStartGateBeforePlaying(joiner, "joiner"),
+    ]);
+    expect(hostStartGate.phase).toBe(startGatePhaseBySessionState.get(hostStartGate.sessionState));
+    expect(joinerStartGate.phase).toBe(startGatePhaseBySessionState.get(joinerStartGate.sessionState));
 
     await expect.poll(async () => (await transportSnapshot(host)).send.attempts, {
       message: "host should send setup/profile/input packets through the fake browser transport",
