@@ -208,9 +208,12 @@ pub fn build(b: *std.Build) void {
         // state. Emscripten's small default stack can overflow while copying the
         // first web Session into place, especially with debug/sanitizer builds.
         emcc_flags.put("-sSTACK_SIZE=1048576", {}) catch unreachable;
-        const emcc_settings = emsdk.emccDefaultSettings(b.allocator, .{
+        var emcc_settings = emsdk.emccDefaultSettings(b.allocator, .{
             .optimize = optimize,
         });
+        // Preserve the default C/WASM entry points while exposing one read-only
+        // JSON snapshot function for the query-gated browser debug facade.
+        emcc_settings.put("EXPORTED_FUNCTIONS", "['_main','_malloc','_free','_zigfall_debug_snapshot_json']") catch unreachable;
         const emcc_step = emsdk.emccStep(b, raylib_artifact, web_lib, .{
             .optimize = optimize,
             .flags = emcc_flags,

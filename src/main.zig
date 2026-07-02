@@ -1300,6 +1300,7 @@ fn onlineTransportError(err: web_transport.ErrorCode) online_session.TransportEr
 
 const App = struct {
     mode: Mode,
+    local_app_tick: u64 = 0,
 
     fn init() App {
         var app = App{ .mode = .{ .single = SinglePlayerState.init() } };
@@ -1325,6 +1326,8 @@ const App = struct {
     }
 
     fn updateAndDraw(self: *App) void {
+        self.local_app_tick +|= 1;
+
         const changed_mode = switch (modeHotkeyTransition(self.currentMode())) {
             .unchanged => false,
             .changed_mode => |selected_mode| changed: {
@@ -1423,12 +1426,15 @@ const App = struct {
 };
 
 var web_app: App = undefined;
+var web_app_ready = false;
+var debug_snapshot_json_buffer: [1536:0]u8 = [_:0]u8{0} ** 1536;
 
 pub fn main() void {
     rl.initWindow(screen_width, screen_height, "Zigfall");
 
     if (builtin.os.tag == .emscripten) {
         web_app = App.init();
+        web_app_ready = true;
         emscripten.emscripten_set_main_loop(updateDrawFrame, 0, 1);
     } else {
         defer rl.closeWindow();
@@ -1444,6 +1450,80 @@ pub fn main() void {
 
 fn updateDrawFrame() callconv(.c) void {
     web_app.updateAndDraw();
+}
+
+export fn zigfall_debug_snapshot_json() [*:0]const u8 {
+    const snapshot = if (web_app_ready)
+        writeAppDebugSnapshot(&web_app)
+    else
+        writeAppDebugNotReadySnapshot();
+    return snapshot.ptr;
+}
+
+fn writeAppDebugSnapshot(app: *const App) [:0]const u8 {
+    return switch (app.mode) {
+        .single => writeNonOnlineAppDebugSnapshot(app.local_app_tick, "single"),
+        .local_versus => writeNonOnlineAppDebugSnapshot(app.local_app_tick, "local_versus"),
+        .online => |*online| writeOnlineAppDebugSnapshot(app.local_app_tick, online),
+    };
+}
+
+fn writeDebugSnapshotFallback() [:0]const u8 {
+    const fallback = "{\"ready\":false,\"mode\":null,\"localAppTick\":null,\"online\":null}";
+    @memcpy(debug_snapshot_json_buffer[0..fallback.len], fallback);
+    debug_snapshot_json_buffer[fallback.len] = 0;
+    return debug_snapshot_json_buffer[0..fallback.len :0];
+}
+
+fn writeAppDebugNotReadySnapshot() [:0]const u8 {
+    return writeDebugSnapshotFallback();
+}
+
+fn writeNonOnlineAppDebugSnapshot(local_app_tick: u64, mode: []const u8) [:0]const u8 {
+    return std.fmt.bufPrintZ(
+        &debug_snapshot_json_buffer,
+        "{{\"ready\":true,\"mode\":\"{s}\",\"localAppTick\":{},\"online\":null}}",
+        .{ mode, local_app_tick },
+    ) catch writeDebugSnapshotFallback();
+}
+
+fn writeOnlineAppDebugSnapshot(local_app_tick: u64, online: *const OnlineState) [:0]const u8 {
+    const role_json = onlineRoleDebugJson(online.role);
+    const session_state_json = onlineSessionStateDebugJson(online.sessionConst());
+    const phase = online.phaseText();
+    const room = online.roomId();
+    const terminal = @tagName(online.terminal);
+
+    if (online.lockstepPeerConst()) |peer| {
+        return std.fmt.bufPrintZ(
+            &debug_snapshot_json_buffer,
+            "{{\"ready\":true,\"mode\":\"online\",\"localAppTick\":{},\"online\":{{\"role\":{s},\"sessionState\":{s},\"phase\":\"{s}\",\"frameCursor\":{},\"room\":\"{s}\",\"terminal\":\"{s}\",\"sentResult\":{},\"verifiedResult\":{}}}}}",
+            .{ local_app_tick, role_json, session_state_json, phase, peer.frameCursor(), room, terminal, online.sent_result, online.verified_result },
+        ) catch writeDebugSnapshotFallback();
+    }
+
+    return std.fmt.bufPrintZ(
+        &debug_snapshot_json_buffer,
+        "{{\"ready\":true,\"mode\":\"online\",\"localAppTick\":{},\"online\":{{\"role\":{s},\"sessionState\":{s},\"phase\":\"{s}\",\"frameCursor\":null,\"room\":\"{s}\",\"terminal\":\"{s}\",\"sentResult\":{},\"verifiedResult\":{}}}}}",
+        .{ local_app_tick, role_json, session_state_json, phase, room, terminal, online.sent_result, online.verified_result },
+    ) catch writeDebugSnapshotFallback();
+}
+
+fn onlineRoleDebugJson(role: ?online_session.Role) []const u8 {
+    return switch (role orelse return "null") {
+        .host => "\"host\"",
+        .joiner => "\"joiner\"",
+    };
+}
+
+fn onlineSessionStateDebugJson(session: ?*const online_session.Session) []const u8 {
+    const state = if (session) |value| value.state else return "null";
+    return switch (state) {
+        .waiting_for_setup => "\"waiting_for_setup\"",
+        .waiting_for_ack => "\"waiting_for_ack\"",
+        .setup_received => "\"setup_received\"",
+        .playing => "\"playing\"",
+    };
 }
 
 const InitialOnline = union(enum) {
