@@ -24,7 +24,7 @@ function makeFakeAction({ sendImpl = null } = {}) {
   };
 }
 
-function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl = () => makeFakeAction() } = {}) {
+function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl = () => makeFakeAction(), getPeersImpl = () => ({}) } = {}) {
   const rooms = [];
   const joinRoomImpl = (config, roomId) => {
     const action = makeActionImpl({ index: rooms.length, roomId });
@@ -38,6 +38,9 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
       makeAction(name) {
         assert.equal(name, "pkt");
         return action;
+      },
+      getPeers() {
+        return getPeersImpl(this);
       },
       leave() {
         this.leaveCalls += 1;
@@ -286,6 +289,7 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
   room.action.emit(oversizedProfile, "peer-a");
   assert.equal(transport.errorCode(), ErrorCode.none, "oversized profile metadata must be dropped without poisoning gameplay health");
   assert.equal(transport.queuedPacketCount(), 0, "oversized profile metadata is not queued");
+  assert.equal(transport.debugSnapshot().incoming.droppedOversize, 1, "debug counters should still report ignored oversized profile packets");
 
   room.action.emit(new Uint8Array(transport.MaxPacketSize + 1), "peer-a");
   assert.equal(transport.errorCode(), ErrorCode.packetTooLarge, "oversized selected-peer gameplay/lifecycle packets must be terminal to Zig");
@@ -405,4 +409,118 @@ function makeFakeJoinRoom({ leaveImpl = () => Promise.resolve(), makeActionImpl 
   }
 }
 
-console.log("ok: Zigfall transport adapter selects one peer, targets sends, drops extras, drains late final packets, bounds backlog, prioritizes receive health, scopes async send failures, and keeps best-effort sends nonfatal");
+{
+  let now = 10_000;
+  const { joinRoomImpl, rooms } = makeFakeJoinRoom();
+  const transport = createZigfallTransport({ joinRoomImpl, selfIdValue: "self-test", nowImpl: () => now });
+
+  assert.equal(transport.connect("debug-incoming-room"), ErrorCode.none);
+  rooms[0].join("peer-a");
+  rooms[0].join("peer-b");
+
+  rooms[0].action.emit(Uint8Array.from([0x01]), "peer-b");
+  assert.equal(transport.debugSnapshot().incoming.droppedNonSelected, 1, "debug snapshot should count rejected extra-peer packets");
+
+  rooms[0].action.emit(Uint8Array.from([0x02]), "peer-a");
+  now += 25;
+  rooms[0].action.emit(Uint8Array.from([0x03, 0x04]), "peer-a");
+  let snapshot = transport.debugSnapshot();
+  assert.equal(snapshot.incoming.depth, 2);
+  assert.equal(snapshot.incoming.enqueuedTotal, 2);
+  assert.equal(snapshot.incoming.dequeuedTotal, 0);
+  assert.equal(snapshot.incoming.maxDepth, 2);
+  assert.equal(snapshot.incoming.oldestAgeMs, 25);
+  assert.equal(snapshot.incoming.newestAgeMs, 0);
+
+  assert.deepEqual(Array.from(transport.poll()), [0x02]);
+  snapshot = transport.debugSnapshot();
+  assert.equal(snapshot.incoming.depth, 1);
+  assert.equal(snapshot.incoming.dequeuedTotal, 1);
+  assert.equal(snapshot.incoming.oldestAgeMs, 0);
+}
+
+{
+  let now = 20_000;
+  const pending = [];
+  const { joinRoomImpl, rooms } = makeFakeJoinRoom({
+    makeActionImpl: () => makeFakeAction({
+      sendImpl: () => {
+        let resolve;
+        let reject;
+        const promise = new Promise((res, rej) => {
+          resolve = res;
+          reject = rej;
+        });
+        pending.push({ resolve, reject });
+        return promise;
+      },
+    }),
+  });
+  const transport = createZigfallTransport({ joinRoomImpl, selfIdValue: "self-test", nowImpl: () => now });
+
+  assert.equal(transport.connect("debug-send-room"), ErrorCode.none);
+  rooms[0].join("peer-a");
+  assert.equal(transport.send(Uint8Array.from([0x10, 0x11, 0x12])), ErrorCode.none);
+  now += 40;
+  let snapshot = transport.debugSnapshot();
+  assert.equal(snapshot.send.attempts, 1);
+  assert.equal(snapshot.send.pending, 1);
+  assert.equal(snapshot.send.pendingBytes, 3);
+  assert.equal(snapshot.send.maxPending, 1);
+  assert.equal(snapshot.send.oldestPendingAgeMs, 40);
+
+  pending[0].resolve();
+  await Promise.resolve();
+  snapshot = transport.debugSnapshot();
+  assert.equal(snapshot.send.pending, 0);
+  assert.equal(snapshot.send.resolved, 1);
+  assert.equal(snapshot.send.lastLatencyMs, 40);
+  assert.equal(snapshot.send.maxLatencyMs, 40);
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args);
+  try {
+    assert.equal(transport.sendBestEffort(Uint8Array.from([0x20])), ErrorCode.none);
+    now += 7;
+    pending[1].reject(new Error("backpressure timeout"));
+    await Promise.resolve();
+  } finally {
+    console.warn = originalWarn;
+  }
+  snapshot = transport.debugSnapshot();
+  assert.equal(snapshot.send.pending, 0);
+  assert.equal(snapshot.send.rejected, 1);
+  assert.equal(snapshot.send.bestEffortRejected, 1);
+  assert.equal(snapshot.send.lastLatencyMs, 7);
+  assert.equal(snapshot.send.lastFailureMessage, "backpressure timeout");
+  assert.equal(warnings.length, 1);
+}
+
+{
+  const fakeConnection = {
+    connectionState: "connected",
+    iceConnectionState: "completed",
+    iceGatheringState: "complete",
+    signalingState: "stable",
+    sctp: { state: "connected" },
+  };
+  const { joinRoomImpl, rooms } = makeFakeJoinRoom({
+    getPeersImpl: () => ({ "peer-a": fakeConnection }),
+  });
+  const transport = createZigfallTransport({ joinRoomImpl, selfIdValue: "self-test" });
+
+  assert.equal(transport.connect("debug-peer-room"), ErrorCode.none);
+  rooms[0].join("peer-a");
+  const snapshot = transport.debugSnapshot();
+  assert.equal(snapshot.peers.selectedPeerId, "peer-a");
+  assert.deepEqual(snapshot.selectedPeer, {
+    connectionState: "connected",
+    iceConnectionState: "completed",
+    iceGatheringState: "complete",
+    signalingState: "stable",
+    sctpState: "connected",
+  });
+}
+
+console.log("ok: Zigfall transport adapter selects one peer, targets sends, drops extras, drains late final packets, bounds backlog, instruments queues and sends, prioritizes receive health, scopes async send failures, and keeps best-effort sends nonfatal");

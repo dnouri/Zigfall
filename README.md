@@ -81,9 +81,9 @@ For online duels, the host is setup authority for the room and seed, then both b
 - Zig 0.16.0
 - Network access for the first pinned dependency fetch; dependencies are recorded in `build.zig.zon`
 - The first wasm build may also fetch and cache the Emscripten SDK/toolchain through the pinned Zig/Emscripten dependency flow
-- Optional Node.js for JavaScript checks or intentional vendor-bundle regeneration
+- Optional Node.js for JavaScript checks, browser-stack smoke tests, or intentional vendor-bundle regeneration
 
-No local raylib-zig checkout is required. Normal Zig native/web builds and deploys do not run npm; native builds also do not need Trystero or browser APIs.
+No local raylib-zig checkout is required. Native builds do not need Trystero, browser APIs, or npm. The Playwright browser smoke tests use npm because they launch the built WebAssembly artifact in Chromium.
 
 ## Build, run, and test
 
@@ -123,12 +123,17 @@ These mirror the checks that are useful before publishing a Pages build:
 zig fmt build.zig build.zig.zon src/*.zig tools/*.zig --check
 zig build test --summary all
 zig build bench-lockstep -- --scenario clean --frames 60 --expect-complete --json
+zig build bench-lockstep -- --frames 120 --start-policy guarded-start \
+  --ack-delay 6 --start-delay 6 --start-guard 8 \
+  --expect-complete --expect-zero-start-skew --json
 zig build --summary all
 zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseSmall --summary all
 for file in web/zigfall_transport.mjs web/zigfall_transport_emscripten.js \
   web/zigfall_invite.mjs web/zigfall_invite_emscripten.js \
   web/zigfall_profile.mjs web/zigfall_profile_emscripten.js \
   web/vendor/patch-trystero-bundle.mjs web/vendor/trystero-nostr.bundle.mjs \
+  playwright.config.mjs tools/serve_web.mjs \
+  tools/browser-tests/fake_transport.js tools/browser-tests/zigfall_web.spec.mjs \
   tools/test_trystero_pkt_limit.mjs tools/test_zigfall_transport_adapter.mjs \
   tools/test_zigfall_invite.mjs tools/test_zigfall_profile.mjs \
   tools/test_emscripten_shims.mjs; do
@@ -139,6 +144,9 @@ node tools/test_zigfall_transport_adapter.mjs
 node tools/test_zigfall_invite.mjs
 node tools/test_zigfall_profile.mjs
 node tools/test_emscripten_shims.mjs
+npm ci
+npx playwright install --with-deps chromium
+npm run test:browser
 (cd web/vendor && sha256sum -c trystero-nostr.bundle.mjs.sha256)
 ```
 
@@ -160,6 +168,16 @@ zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseSmall run
 ```
 
 The generated web files are installed to `zig-out/web/`. The runtime pieces are `zigfall.html`, `zigfall.js`, `zigfall.wasm`, the three `zigfall_*.mjs` helpers, and the vendored Trystero bundle. The bundle checksum and vendor notices are copied with it. The same legal bundle is copied there too.
+
+To run the deterministic browser-stack smoke tests after building `zig-out/web`:
+
+```sh
+npm ci
+npx playwright install --with-deps chromium
+npm run test:browser
+```
+
+Those tests serve the real WebAssembly artifact and drive Chromium through the Emscripten bridge and online state machine. They use a deterministic in-browser fake transport, so they are stable enough for CI, but they intentionally do not claim to prove public-relay/WebRTC/ICE behavior.
 
 The GitHub Pages workflow prepares `zig-out/web` for upload. It creates `index.html`, adds `.nojekyll`, verifies the Trystero bundle checksum, and checks the runtime/legal file manifest.
 

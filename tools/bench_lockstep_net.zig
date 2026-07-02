@@ -25,6 +25,47 @@ const Scenario = enum {
     bad,
 };
 
+const StartPolicy = enum {
+    simultaneous,
+    current_ack,
+    immediate_start,
+    guarded_start,
+};
+
+const StartTicks = struct {
+    p1: u64 = 0,
+    p2: u64 = 0,
+
+    fn max(self: StartTicks) u64 {
+        return @max(self.p1, self.p2);
+    }
+};
+
+const SampleSkewStats = struct {
+    paired: u64 = 0,
+    first: i64 = 0,
+    last: i64 = 0,
+    min: i64 = 0,
+    max: i64 = 0,
+
+    fn add(self: *SampleSkewStats, skew: i64) void {
+        if (self.paired == 0) {
+            self.first = skew;
+            self.min = skew;
+            self.max = skew;
+        } else {
+            self.min = @min(self.min, skew);
+            self.max = @max(self.max, skew);
+        }
+        self.last = skew;
+        self.paired += 1;
+    }
+
+    fn isZero(self: SampleSkewStats) bool {
+        return self.paired > 0 and self.min == 0 and self.max == 0;
+    }
+};
+
 const Params = struct {
     scenario: Scenario = .custom,
     frames: usize = default_frames,
@@ -37,8 +78,13 @@ const Params = struct {
     delay_p2_p1: u64 = 0,
     jitter: u64 = 0,
     drop_every: u64 = 0,
+    start_policy: StartPolicy = .simultaneous,
+    ack_delay: u64 = 0,
+    start_delay: u64 = 0,
+    start_guard: u64 = 0,
     json: bool = false,
     expect_complete: bool = false,
+    expect_zero_start_skew: bool = false,
 };
 
 const PlayerSide = enum {
@@ -248,6 +294,8 @@ const PlayerResult = struct {
 const BenchResult = struct {
     players: [2]PlayerResult,
     directions: [2]DirectionStats,
+    start_ticks: StartTicks,
+    sample_start_skew: SampleSkewStats,
     expected_samples: u64,
     expected_cursor: u64,
     drain_ticks: u64,
@@ -284,6 +332,11 @@ pub fn main(init: std.process.Init) !void {
         try stderr.print("bench-lockstep did not complete all measured samples\n", .{});
         try stderr.flush();
         std.process.exit(2);
+    }
+    if (params.expect_zero_start_skew and !result.sample_start_skew.isZero()) {
+        try stderr.print("bench-lockstep observed nonzero start skew: min={} max={}\n", .{ result.sample_start_skew.min, result.sample_start_skew.max });
+        try stderr.flush();
+        std.process.exit(3);
     }
 }
 
@@ -329,10 +382,24 @@ fn parseArgs(args: []const [:0]const u8, stdout: *std.Io.Writer, stderr: *std.Io
             const value = nextArg(args, &index, stderr, arg);
             params.drop_every = std.fmt.parseUnsigned(u64, value, 10) catch failCli(stderr, "invalid --drop-every value: {s}", .{value});
             params.scenario = .custom;
+        } else if (std.mem.eql(u8, arg, "--start-policy")) {
+            const value = nextArg(args, &index, stderr, arg);
+            params.start_policy = parseStartPolicy(value) orelse failCli(stderr, "invalid --start-policy value: {s}", .{value});
+        } else if (std.mem.eql(u8, arg, "--ack-delay")) {
+            const value = nextArg(args, &index, stderr, arg);
+            params.ack_delay = std.fmt.parseUnsigned(u64, value, 10) catch failCli(stderr, "invalid --ack-delay value: {s}", .{value});
+        } else if (std.mem.eql(u8, arg, "--start-delay")) {
+            const value = nextArg(args, &index, stderr, arg);
+            params.start_delay = std.fmt.parseUnsigned(u64, value, 10) catch failCli(stderr, "invalid --start-delay value: {s}", .{value});
+        } else if (std.mem.eql(u8, arg, "--start-guard")) {
+            const value = nextArg(args, &index, stderr, arg);
+            params.start_guard = std.fmt.parseUnsigned(u64, value, 10) catch failCli(stderr, "invalid --start-guard value: {s}", .{value});
         } else if (std.mem.eql(u8, arg, "--json")) {
             params.json = true;
         } else if (std.mem.eql(u8, arg, "--expect-complete")) {
             params.expect_complete = true;
+        } else if (std.mem.eql(u8, arg, "--expect-zero-start-skew")) {
+            params.expect_zero_start_skew = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try printUsage(stdout);
             try stdout.flush();
@@ -351,6 +418,13 @@ fn parseArgs(args: []const [:0]const u8, stdout: *std.Io.Writer, stderr: *std.Io
     if (params.frames > (std.math.maxInt(usize) - 8) / 2) {
         failCli(stderr, "--frames is too large", .{});
     }
+    const starts = computeStartTicks(params) catch failCli(stderr, "start-policy tick values are too large", .{});
+    if (params.frames > std.math.maxInt(u64) - starts.max()) {
+        failCli(stderr, "--frames plus start delay is too large", .{});
+    }
+    if (starts.max() > @as(u64, @intCast(std.math.maxInt(usize) - params.frames))) {
+        failCli(stderr, "--frames plus start delay is too large for this host", .{});
+    }
 
     return params;
 }
@@ -361,6 +435,14 @@ fn parseScenario(name: []const u8) ?Scenario {
     if (std.mem.eql(u8, name, "wifi")) return .wifi;
     if (std.mem.eql(u8, name, "regional")) return .regional;
     if (std.mem.eql(u8, name, "bad")) return .bad;
+    return null;
+}
+
+fn parseStartPolicy(name: []const u8) ?StartPolicy {
+    if (std.mem.eql(u8, name, "simultaneous")) return .simultaneous;
+    if (std.mem.eql(u8, name, "current-ack")) return .current_ack;
+    if (std.mem.eql(u8, name, "immediate-start")) return .immediate_start;
+    if (std.mem.eql(u8, name, "guarded-start")) return .guarded_start;
     return null;
 }
 
@@ -410,6 +492,42 @@ fn scenarioName(scenario: Scenario) []const u8 {
     };
 }
 
+fn startPolicyName(policy: StartPolicy) []const u8 {
+    return switch (policy) {
+        .simultaneous => "simultaneous",
+        .current_ack => "current-ack",
+        .immediate_start => "immediate-start",
+        .guarded_start => "guarded-start",
+    };
+}
+
+fn computeStartTicks(params: Params) !StartTicks {
+    return switch (params.start_policy) {
+        .simultaneous => .{},
+        // Current runtime behavior: the joiner begins sampling after it sends
+        // ACK, while the host waits for that ACK to arrive.
+        .current_ack => .{ .p1 = params.ack_delay, .p2 = 0 },
+        // Naive START behavior: the host begins when ACK arrives and the
+        // joiner begins when the host's START reaches it. This can merely move
+        // persistent skew from one player to the other.
+        .immediate_start => .{
+            .p1 = params.ack_delay,
+            .p2 = try addTicks(params.ack_delay, params.start_delay),
+        },
+        // Idealized guarded START behavior in a shared wall-clock model. If the
+        // guard covers host->joiner delivery, both peers begin together; if not,
+        // the joiner misses the deadline and residual skew remains.
+        .guarded_start => guarded: {
+            const host_start = try addTicks(params.ack_delay, params.start_guard);
+            const joiner_receives_start = try addTicks(params.ack_delay, params.start_delay);
+            break :guarded .{
+                .p1 = host_start,
+                .p2 = if (params.start_delay <= params.start_guard) host_start else joiner_receives_start,
+            };
+        },
+    };
+}
+
 fn nextArg(args: []const [:0]const u8, index: *usize, stderr: *std.Io.Writer, flag: []const u8) []const u8 {
     index.* += 1;
     if (index.* >= args.len) failCli(stderr, "missing value for {s}", .{flag});
@@ -440,7 +558,12 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  --delay-p2-p1 N     extra deterministic packet delay P2->P1 in app ticks (default 0)
         \\  --jitter N          deterministic extra packet delay in [0,N] app ticks (default 0)
         \\  --drop-every N      drop every Nth packet per direction; 0 disables (default 0)
+        \\  --start-policy NAME simultaneous, current-ack, immediate-start, guarded-start (default simultaneous)
+        \\  --ack-delay N       ACK transit delay for start-policy modeling (default 0)
+        \\  --start-delay N     START transit delay for start-policy modeling (default 0)
+        \\  --start-guard N     future start guard for guarded-start modeling (default 0)
         \\  --expect-complete   exit nonzero unless all measured samples complete
+        \\  --expect-zero-start-skew exit nonzero unless paired sample start skew is exactly zero
         \\  --json              emit JSON
         \\  -h, --help          show this help
         \\
@@ -448,6 +571,8 @@ fn printUsage(writer: *std.Io.Writer) !void {
 }
 
 fn runBench(allocator: std.mem.Allocator, params: Params) !BenchResult {
+    const start_ticks = try computeStartTicks(params);
+    const end_tick = try addTicks(@intCast(params.frames), start_ticks.max());
     const queue_capacity = params.frames * 2 + protocol.MaxInputBatchCount * 2 + 8;
     var network = Network{
         .queue = try allocator.alloc(QueuedPacket, queue_capacity),
@@ -471,15 +596,16 @@ fn runBench(allocator: std.mem.Allocator, params: Params) !BenchResult {
     var p1 = PeerDriver{ .peer = try lockstep.Peer.init(settings, .p1, params.input_delay, bench_match_id) };
     var p2 = PeerDriver{ .peer = try lockstep.Peer.init(settings, .p2, params.input_delay, bench_match_id) };
 
+    const end_tick_usize: usize = @intCast(end_tick);
     var last_app_advanced = [2]usize{ 0, 0 };
-    for (0..params.frames) |tick_index| {
+    for (0..end_tick_usize) |tick_index| {
         const tick: u64 = @intCast(tick_index);
         _ = try network.deliverDue(tick, &p1.peer, &p2.peer);
-        last_app_advanced[0] = try drivePeer(.p1, &p1, scriptedInput(.p1, tick), tick, params, &network, &samples, &step_metrics[0]);
-        last_app_advanced[1] = try drivePeer(.p2, &p2, scriptedInput(.p2, tick), tick, params, &network, &samples, &step_metrics[1]);
+        last_app_advanced[0] = try drivePeerWindow(.p1, &p1, start_ticks.p1, scriptedInput(.p1, tick), tick, params, &network, &samples, &step_metrics[0]);
+        last_app_advanced[1] = try drivePeerWindow(.p2, &p2, start_ticks.p2, scriptedInput(.p2, tick), tick, params, &network, &samples, &step_metrics[1]);
     }
 
-    const flush_tick: u64 = @intCast(params.frames);
+    const flush_tick: u64 = end_tick;
     const boundary_delivered = try network.deliverDue(flush_tick, &p1.peer, &p2.peer);
     var boundary_advanced = [2]usize{ 0, 0 };
     const boundary_should_step = boundary_delivered > 0 or needsMoreStep(params, last_app_advanced);
@@ -517,12 +643,32 @@ fn runBench(allocator: std.mem.Allocator, params: Params) !BenchResult {
     return .{
         .players = players,
         .directions = network.stats,
+        .start_ticks = start_ticks,
+        .sample_start_skew = try computeSampleStartSkew(samples[0].records[0..samples[0].count], samples[1].records[0..samples[1].count]),
         .expected_samples = @intCast(params.frames),
         .expected_cursor = expected_cursor,
         .drain_ticks = drain_ticks,
         .complete = benchComplete(players, @intCast(params.frames), expected_cursor, hashes_match),
         .hashes_match = hashes_match,
     };
+}
+
+fn drivePeerWindow(
+    side: PlayerSide,
+    driver: *PeerDriver,
+    start_tick: u64,
+    frame_input: input.FrameInput,
+    tick: u64,
+    params: Params,
+    network: *Network,
+    samples: *[2]PlayerSamples,
+    metrics: *PeerStepMetrics,
+) !usize {
+    if (tick < start_tick) return 0;
+    if (samples[playerIndex(side)].count >= params.frames) {
+        return stepPeerOnly(side, driver, tick, params, samples);
+    }
+    return drivePeer(side, driver, frame_input, tick, params, network, samples, metrics);
 }
 
 fn drivePeer(
@@ -645,6 +791,37 @@ fn benchComplete(players: [2]PlayerResult, expected_samples: u64, expected_curso
     return true;
 }
 
+fn computeSampleStartSkew(p1: []const SampleRecord, p2: []const SampleRecord) !SampleSkewStats {
+    var stats = SampleSkewStats{};
+    var p1_index: usize = 0;
+    var p2_index: usize = 0;
+    while (p1_index < p1.len and p2_index < p2.len) {
+        const p1_sample = p1[p1_index];
+        const p2_sample = p2[p2_index];
+        if (p1_sample.target_frame == p2_sample.target_frame) {
+            stats.add(try signedTickDelta(p2_sample.sample_tick, p1_sample.sample_tick));
+            p1_index += 1;
+            p2_index += 1;
+        } else if (p1_sample.target_frame < p2_sample.target_frame) {
+            p1_index += 1;
+        } else {
+            p2_index += 1;
+        }
+    }
+    return stats;
+}
+
+fn signedTickDelta(a: u64, b: u64) !i64 {
+    if (a >= b) {
+        const delta = a - b;
+        if (delta > std.math.maxInt(i64)) return error.TickOverflow;
+        return @intCast(delta);
+    }
+    const delta = b - a;
+    if (delta > std.math.maxInt(i64)) return error.TickOverflow;
+    return -@as(i64, @intCast(delta));
+}
+
 fn stepPeerOnly(side: PlayerSide, driver: *PeerDriver, tick: u64, params: Params, samples: *[2]PlayerSamples) !usize {
     if (driver.peer.match.outcome != null or !driver.peer.isOk()) return 0;
     const before = driver.peer.frameCursor();
@@ -706,14 +883,18 @@ fn benchSettings() match_mod.MatchSettings {
 
 fn printHuman(writer: *std.Io.Writer, params: Params, result: BenchResult) !void {
     try writer.print(
-        "lockstep net bench: scenario={s} frames={} tick_ms~={d:.2} input_delay={} batch_target={} batch_hold={} resend_window={} max_steps={} delay_p1_p2={} delay_p2_p1={} jitter={} drop_every={}\n",
-        .{ scenarioName(params.scenario), params.frames, tick_ms, params.input_delay, params.batch_target, params.batch_hold, params.resend_window, params.max_steps, params.delay_p1_p2, params.delay_p2_p1, params.jitter, params.drop_every },
+        "lockstep net bench: scenario={s} frames={} tick_ms~={d:.2} input_delay={} batch_target={} batch_hold={} resend_window={} max_steps={} delay_p1_p2={} delay_p2_p1={} jitter={} drop_every={} start_policy={s} ack_delay={} start_delay={} start_guard={}\n",
+        .{ scenarioName(params.scenario), params.frames, tick_ms, params.input_delay, params.batch_target, params.batch_hold, params.resend_window, params.max_steps, params.delay_p1_p2, params.delay_p2_p1, params.jitter, params.drop_every, startPolicyName(params.start_policy), params.ack_delay, params.start_delay, params.start_guard },
     );
     try printPlayerHuman(writer, "P1 host", result.players[0]);
     try printPlayerHuman(writer, "P2 joiner", result.players[1]);
     try writer.print(
         "packets: P1->P2 sent={} input_frames={} dropped={} delivered={}; P2->P1 sent={} input_frames={} dropped={} delivered={}\n",
         .{ result.directions[0].sent, result.directions[0].input_frames_sent, result.directions[0].dropped, result.directions[0].delivered, result.directions[1].sent, result.directions[1].input_frames_sent, result.directions[1].dropped, result.directions[1].delivered },
+    );
+    try writer.print(
+        "start: p1_tick={} p2_tick={} paired_sample_skew_ticks={} first={} last={} min={} max={} zero={}\n",
+        .{ result.start_ticks.p1, result.start_ticks.p2, result.sample_start_skew.paired, result.sample_start_skew.first, result.sample_start_skew.last, result.sample_start_skew.min, result.sample_start_skew.max, result.sample_start_skew.isZero() },
     );
     try writer.print(
         "completion: complete={} expected_samples={} expected_cursor={}\n",
@@ -752,14 +933,18 @@ fn ticksToMs(ticks: u64) f64 {
 fn printJson(writer: *std.Io.Writer, params: Params, result: BenchResult) !void {
     try writer.print("{{\n", .{});
     try writer.print(
-        "  \"params\": {{\"scenario\":\"{s}\",\"frames\":{},\"tick_ms\":{d:.4},\"input_delay\":{},\"batch_target\":{},\"batch_hold\":{},\"resend_window\":{},\"max_steps\":{},\"delay_p1_p2\":{},\"delay_p2_p1\":{},\"jitter\":{},\"drop_every\":{},\"expect_complete\":{}}},\n",
-        .{ scenarioName(params.scenario), params.frames, tick_ms, params.input_delay, params.batch_target, params.batch_hold, params.resend_window, params.max_steps, params.delay_p1_p2, params.delay_p2_p1, params.jitter, params.drop_every, params.expect_complete },
+        "  \"params\": {{\"scenario\":\"{s}\",\"frames\":{},\"tick_ms\":{d:.4},\"input_delay\":{},\"batch_target\":{},\"batch_hold\":{},\"resend_window\":{},\"max_steps\":{},\"delay_p1_p2\":{},\"delay_p2_p1\":{},\"jitter\":{},\"drop_every\":{},\"start_policy\":\"{s}\",\"ack_delay\":{},\"start_delay\":{},\"start_guard\":{},\"expect_complete\":{},\"expect_zero_start_skew\":{}}},\n",
+        .{ scenarioName(params.scenario), params.frames, tick_ms, params.input_delay, params.batch_target, params.batch_hold, params.resend_window, params.max_steps, params.delay_p1_p2, params.delay_p2_p1, params.jitter, params.drop_every, startPolicyName(params.start_policy), params.ack_delay, params.start_delay, params.start_guard, params.expect_complete, params.expect_zero_start_skew },
     );
     try printPlayerJson(writer, "p1", result.players[0], true);
     try printPlayerJson(writer, "p2", result.players[1], true);
     try writer.print(
         "  \"packets\": {{\"p1_to_p2\":{{\"sent\":{},\"input_frames_sent\":{},\"dropped\":{},\"delivered\":{}}},\"p2_to_p1\":{{\"sent\":{},\"input_frames_sent\":{},\"dropped\":{},\"delivered\":{}}}}},\n",
         .{ result.directions[0].sent, result.directions[0].input_frames_sent, result.directions[0].dropped, result.directions[0].delivered, result.directions[1].sent, result.directions[1].input_frames_sent, result.directions[1].dropped, result.directions[1].delivered },
+    );
+    try writer.print(
+        "  \"start\": {{\"p1_tick\":{},\"p2_tick\":{},\"sample_skew\":{{\"paired\":{},\"first\":{},\"last\":{},\"min\":{},\"max\":{},\"zero\":{}}}}},\n",
+        .{ result.start_ticks.p1, result.start_ticks.p2, result.sample_start_skew.paired, result.sample_start_skew.first, result.sample_start_skew.last, result.sample_start_skew.min, result.sample_start_skew.max, result.sample_start_skew.isZero() },
     );
     try writer.print(
         "  \"completion\": {{\"complete\":{},\"expected_samples\":{},\"expected_cursor\":{}}},\n",
